@@ -310,6 +310,13 @@ bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
     return uncompressed;
 }
 
+bool KeysHoldOneState(std::uint64_t metaAddress, std::uint64_t surfaceBytes) {
+    const auto count = DccKeyBytes(surfaceBytes);
+    if (count == 0) return true;
+    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    return AllKeysEqual(keys + 1, count - 1, keys[0]);
+}
+
 bool CpuKeysOnly() {
     static const bool cpuKeys = std::getenv("APS5_CPU_DCC_KEYS") != nullptr;
     return cpuKeys;
@@ -521,7 +528,7 @@ void MarkDccUncompressed(std::uint64_t metaAddress, std::uint64_t surfaceBytes, 
     // GuestMemory::GpuMutex); otherwise the store runs and waits through the flush hook. A pending
     // GPU store of the driver's own is no reason to skip: a title kernel recorded into the same
     // batch after it may write clear keys, and the memo cannot order inside a batch.
-    if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && AlreadyUncompressed(metaAddress, count)) return;
+    if (!Recorder::SnapshotWriteOverlaps(metaAddress, count) && (AlreadyUncompressed(metaAddress, count) || !KeysHoldOneState(metaAddress, surfaceBytes))) return;
     StoreUncompressedOnCpu(metaAddress, count);
 }
 
@@ -540,7 +547,7 @@ void MarkDccUncompressed(const Context& context, std::uint64_t metaAddress, std:
     // after it may write clear keys, and nothing orders inside a batch, so a fresh fill is recorded
     // (idempotent, no wait) rather than trusting the earlier one.
     const bool pending = recorder != nullptr && recorder->PendingWriteOverlaps(metaAddress, count);
-    if (!pending && AlreadyUncompressed(metaAddress, count)) return;
+    if (!pending && (AlreadyUncompressed(metaAddress, count) || !KeysHoldOneState(metaAddress, surfaceBytes))) return;
     if (recorder != nullptr && StoreUncompressedOnGpu(context, *recorder, metaAddress, count)) return;
     StoreUncompressedOnCpu(metaAddress, count);
 }

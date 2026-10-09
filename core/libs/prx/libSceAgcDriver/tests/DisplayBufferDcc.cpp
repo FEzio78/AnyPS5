@@ -6,6 +6,7 @@
 #include <bit>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -210,6 +211,28 @@ void RetileTests() {
     ReleaseKeys(small, reserved);
 }
 
+void ReusedMetadataTests() {
+    constexpr std::uint32_t width = 1920;
+    constexpr std::uint32_t height = 1080;
+    const auto surfaceBytes = TiledBytes(width, height);
+    const auto driverKeys = static_cast<std::size_t>(surfaceBytes / 256);
+    std::vector<std::uint8_t> keys(49152, 0x00);
+    const auto surface = Surface(width, height, reinterpret_cast<std::uint64_t>(keys.data()), true);
+    const auto count = AgcDriver::Graphics::DccKeyCount(surface, surfaceBytes);
+    const std::uint64_t links[2] = {0x0000000219040010ull, 0x0000000219030010ull};
+    std::memcpy(keys.data(), links, sizeof(links));
+    const auto reused = keys;
+    const auto mixed = Rejection([&] { AgcDriver::Graphics::MarkDccUncompressed(surface.dccAddress, surfaceBytes, count); });
+    Expect(mixed.empty() && keys == reused, "a key store over metadata the title reused (mixed bytes) changed them: " + mixed);
+    std::fill(keys.begin(), keys.end(), 0x00);
+    const auto clear = Rejection([&] { AgcDriver::Graphics::MarkDccUncompressed(surface.dccAddress, surfaceBytes, count); });
+    Expect(clear.empty() && std::all_of(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(count), [](std::uint8_t key) { return key == 0xff; }), "a key store over 0000 keys did not mark them uncompressed: " + clear);
+    std::fill(keys.begin(), keys.end(), 0x00);
+    std::fill(keys.begin() + static_cast<std::ptrdiff_t>(driverKeys), keys.end(), 0x5a);
+    const auto padded = Rejection([&] { AgcDriver::Graphics::MarkDccUncompressed(surface.dccAddress, surfaceBytes, count); });
+    Expect(padded.empty() && std::all_of(keys.begin(), keys.begin() + static_cast<std::ptrdiff_t>(count), [](std::uint8_t key) { return key == 0xff; }), "a key store over 0000 keys with other bytes past one key per 256 bytes did not cover the console's extent: " + padded);
+}
+
 DccKeys ReadKeys(DisplayBuffer buffer, std::vector<std::uint8_t>& keys) {
     buffer.dccAddress = reinterpret_cast<std::uint64_t>(keys.data());
     return AgcDriver::DisplayBufferKeys(buffer);
@@ -283,6 +306,7 @@ int main() {
     Expect(AgcDriver::DisplayBufferSize(buffer) == 2 * 65536, "DCC metadata changed the display footprint");
     KeyCountTests();
     RetileTests();
+    ReusedMetadataTests();
     ExtentTests();
     if (failures != 0) return 1;
     std::puts("display buffer DCC tests passed");

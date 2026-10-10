@@ -98,6 +98,7 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
 void ClearCachedPipelines(VkDevice device);
 bool HasStencil(VkFormat format);
+bool BlendsDiffer(std::span<const VkPipelineColorBlendAttachmentState> blends);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);
 void ValidateDepthBounds(const Context& context, const State& state);

@@ -688,6 +688,21 @@ void OpaqueDestinationAlphaTests() {
     expectFailure([&] { AgcDriver::Graphics::DecodeState(queue); }, "destination alpha override");
 }
 
+void BlendsDifferTests() {
+    VkPipelineColorBlendAttachmentState opaque{};
+    opaque.colorWriteMask = 0xfu;
+    auto additive = opaque;
+    additive.blendEnable = VK_TRUE;
+    additive.srcColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    additive.dstColorBlendFactor = VK_BLEND_FACTOR_ONE;
+    auto masked = opaque;
+    masked.colorWriteMask = 0x7u;
+    Require(!AgcDriver::Graphics::BlendsDiffer(std::vector<VkPipelineColorBlendAttachmentState>{}), "no color targets were taken for different blend states");
+    Require(!AgcDriver::Graphics::BlendsDiffer(std::vector{opaque, opaque, opaque}), "identical blend states were taken for different ones");
+    Require(AgcDriver::Graphics::BlendsDiffer(std::vector{opaque, additive}), "a blended second target was not taken for an independent blend state");
+    Require(AgcDriver::Graphics::BlendsDiffer(std::vector{opaque, masked}), "a different write mask was not taken for an independent blend state");
+}
+
 void DisabledColorTests() {
     auto queue = makeState();
     queue.context[0x8e] = 0;
@@ -4025,6 +4040,7 @@ int main() {
         ProvokingVertexTests();
         ProvokingVertexRenderPassTests();
         ConservativeRasterizationTests();
+        BlendsDifferTests();
         DisabledColorTests();
         OpaqueDestinationAlphaTests();
         CompactedExportTests();

@@ -3,6 +3,7 @@
 #include <spirv-tools/optimizer.hpp>
 #include <spirv/unified1/spirv.hpp>
 #include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
@@ -76,6 +77,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     if (spirv.size() >= 5 && spirv[1] > spirvVersion) {
         throw std::runtime_error("SPIRV-Tools: module version exceeds requested SPIR-V target");
     }
+    const auto started = std::chrono::steady_clock::now();
     std::string diagnostics;
     const auto consumer = [&diagnostics](spv_message_level_t level, const char* source, const spv_position_t& position, const char* message) {
         if (!diagnostics.empty()) diagnostics += '\n';
@@ -162,16 +164,24 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     options.set_preserve_bindings(true);
     options.set_preserve_spec_constants(!specialize);
     options.set_validator_options(validatorOptions);
+    options.set_run_validator(false);
     std::vector<std::uint32_t> optimized;
     diagnostics.clear();
+    const auto optimizeStarted = std::chrono::steady_clock::now();
     if (!optimizer.Run(spirv.data(), spirv.size(), &optimized, options)) {
         throw std::runtime_error("SPIR-V optimization failed:\n" + diagnostics);
     }
+    const auto validateStarted = std::chrono::steady_clock::now();
     diagnostics.clear();
     if (!tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) std::fprintf(stderr, "[spirv] optimizer produced an invalid module; using it unoptimized: %s\n", diagnostics.substr(0, diagnostics.find('\n')).c_str());
         return std::vector<std::uint32_t>(spirv.begin(), spirv.end());
+    }
+    {
+        const auto now = std::chrono::steady_clock::now();
+        const auto seconds = [](auto from, auto to) { return std::chrono::duration<double>(to - from).count(); };
+        if (seconds(started, now) > 2.0) std::fprintf(stderr, "[spirv-time] %zu -> %zu words specialize=%d: validate %.1f s, optimize %.1f s, revalidate %.1f s\n", spirv.size(), optimized.size(), specialize ? 1 : 0, seconds(started, optimizeStarted), seconds(optimizeStarted, validateStarted), seconds(validateStarted, now));
     }
     return optimized;
 }

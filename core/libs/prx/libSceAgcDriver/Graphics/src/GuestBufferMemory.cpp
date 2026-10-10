@@ -57,6 +57,7 @@ struct ImageMirror {
     std::uint64_t bytes = 0;
     bool writable = false;
     bool heap = false;
+    bool sparse = false;
     std::vector<std::uint64_t> generations;
     std::weak_ptr<const GuestAllocations::Range> range;
     std::shared_ptr<Buffer> buffer;
@@ -830,7 +831,8 @@ bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
     const auto* guest = reinterpret_cast<const std::byte*>(block.address);
     if (block.mirror->heap) {
-        std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
+        if (block.mirror->sparse) GuestMemory::ReadCommitted(block.address, block.mirror->buffer->Bytes().subspan(offset, block.length));
+        else std::memcpy(block.mirror->buffer->Bytes().data() + offset, guest, block.length);
         block.mirror->generations[static_cast<std::size_t>(block.address / 65536 - block.mirror->base / 65536)] = block.generation;
         return true;
     }
@@ -1082,8 +1084,10 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         if (!heap && prepareRefresh(*mirror, range->address, range->bytes)) appendBlocks(blocks, *mirror, range->address, range->bytes);
         return mirror;
     }
-    if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap)) return nullptr;
+    const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(range->address), range->bytes, range->writable && !heap);
+    if (!accessible && !heap) return nullptr;
     mirror = std::make_shared<ImageMirror>();
+    mirror->sparse = !accessible;
     mirror->base = range->address;
     mirror->bytes = range->bytes;
     mirror->writable = range->writable;
@@ -1117,7 +1121,8 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
     // named for the [hooksync] attribution like the refresh's flush.
     {
         const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
-        GuestMemory::Read(range->address, mirror->buffer->Bytes());
+        if (mirror->sparse) GuestMemory::ReadCommitted(range->address, mirror->buffer->Bytes());
+        else GuestMemory::Read(range->address, mirror->buffer->Bytes());
     }
     if (range->writable && !heap) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
     std::lock_guard lock(state.mutex);

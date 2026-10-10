@@ -391,9 +391,157 @@ private:
     // A T# whose eight dwords are scalar reads of one V# (the table) at `entryOffset + key * 32`
     // with a wave-uniform runtime key: a bindless image table. The key stays an ordinary value
     // (the SPIR-V selects the bound slot from it); the eight reads become planning-only.
+    const MemoryInfo* ScalarAddressReadMemory(const IrValue& read, std::uint32_t& index) const {
+        if (read.Opcode() != IrOpcode::LoadAddressU32 || read.ArgumentCount() != 4u) {
+            return nullptr;
+        }
+        std::uint32_t immediate = 0;
+        if (!immediateU32(read.Argument(2), immediate) || immediate != 0u) {
+            return nullptr;
+        }
+        index = read.Flags<MemoryFlags>().index;
+        if (index >= m_program.Resources().memoryInfo.size()) {
+            return nullptr;
+        }
+        const auto& memory = m_program.Resources().memoryInfo[index];
+        return memory.kind == ResourceKind::ScalarAddress && memory.dataBits == 32u && memory.dataDwords == 1u ? &memory : nullptr;
+    }
+
+    // A counter `phi(0, counter + 1)` whose loop compares it against a runtime value.
+    bool MatchLoopBound(IrValue* key, IrValue*& bound, bool& countSigned) const {
+        if (!key->IsPhi() || key->ArgumentCount() != 2u) {
+            return false;
+        }
+        bool zeroIncoming = false;
+        bool stepIncoming = false;
+        for (std::size_t index = 0; index < key->ArgumentCount(); index++) {
+            IrValue* incoming = key->Argument(index)->Resolve();
+            std::uint32_t immediate = 0;
+            if (immediateU32(incoming, immediate) && immediate == 0u) {
+                zeroIncoming = true;
+                continue;
+            }
+            if (incoming->Opcode() == IrOpcode::IAdd32 && incoming->ArgumentCount() == 2u) {
+                const bool left = incoming->Argument(0)->Resolve() == key && immediateU32(incoming->Argument(1), immediate) && immediate == 1u;
+                const bool right = incoming->Argument(1)->Resolve() == key && immediateU32(incoming->Argument(0), immediate) && immediate == 1u;
+                stepIncoming = stepIncoming || left || right;
+            }
+        }
+        if (!zeroIncoming || !stepIncoming) {
+            return false;
+        }
+        constexpr SrtWalker walker;
+        bound = nullptr;
+        for (IrValue* user : key->Uses()) {
+            const auto op = user->Opcode();
+            if ((op != IrOpcode::SLessThan32 && op != IrOpcode::ULessThan32) || user->ArgumentCount() != 2u || user->Argument(0)->Resolve() != key) {
+                continue;
+            }
+            IrValue* candidate = user->Argument(1)->Resolve();
+            if (candidate->Type() != IrType::U32 || !walker.ValidateRuntimeValue(m_program.Resources(), candidate)) {
+                continue;
+            }
+            if (bound != nullptr && (!EquivalentValue(m_program.Resources(), bound, candidate) || countSigned != (op == IrOpcode::SLessThan32))) {
+                return false;
+            }
+            bound = candidate;
+            countSigned = op == IrOpcode::SLessThan32;
+        }
+        return bound != nullptr;
+    }
+
+    // A T# whose eight dwords are scalar loads from a raw address at `entryOffset + key * 32`, the
+    // key a loop counter over a runtime entry count: a bindless image table without a V#.
+    bool TryMakeAddressTableImage(IrValue& handle, IndirectImagePlan& plan) {
+        std::array<IrValue*, 8> heapReads {};
+        IrValue* addressHandle = nullptr;
+        IrValue* heapOffset = nullptr;
+        std::uint32_t immediateOffset = 0;
+        for (std::uint32_t dword = 0; dword < heapReads.size(); dword++) {
+            heapReads[dword] = handle.Argument(dword)->Resolve();
+            std::uint32_t memoryIndex = 0;
+            const MemoryInfo* memory = ScalarAddressReadMemory(*heapReads[dword], memoryIndex);
+            if (memory == nullptr || !MemoryIndexBelongsTo(memoryIndex, *heapReads[dword])) {
+                return false;
+            }
+            if (dword == 0u) {
+                immediateOffset = memory->offset;
+            } else if (memory->offset != immediateOffset + dword * sizeof(std::uint32_t)) {
+                return false;
+            }
+            IrValue* currentHandle = heapReads[dword]->Argument(0)->Resolve();
+            if (addressHandle != nullptr && currentHandle != addressHandle) {
+                return false;
+            }
+            addressHandle = currentHandle;
+            if (dword == 0u) {
+                heapOffset = heapReads[dword]->Argument(1)->Resolve();
+            } else if (!EquivalentValue(m_program.Resources(), heapOffset, heapReads[dword]->Argument(1))) {
+                return false;
+            }
+            plan.memory[dword] = memoryIndex;
+            plan.reads[dword] = heapReads[dword];
+        }
+        if (addressHandle->Opcode() != IrOpcode::GetAddressResource || addressHandle->ArgumentCount() != 2u || immediateOffset % sizeof(std::uint32_t) != 0u || immediateOffset >= 0x80000000u) {
+            return false;
+        }
+
+        IrValue* key = nullptr;
+        std::uint32_t entryOffset = 0;
+        if (!MatchTableOffset(heapOffset, key, entryOffset) || key->Type() != IrType::U32 || entryOffset % sizeof(std::uint32_t) != 0u) {
+            return false;
+        }
+        IrValue* bound = nullptr;
+        bool countSigned = false;
+        if (!MatchLoopBound(key, bound, countSigned)) {
+            return false;
+        }
+
+        const std::array<const IrValue*, 1> imageUsers {&handle};
+        for (const auto* read : heapReads) {
+            if (!usesOnly(*read, imageUsers)) {
+                return false;
+            }
+        }
+
+        DescriptorSource heapSource;
+        heapSource.dwordCount = 2u;
+        heapSource.dwords[0] = addressHandle->Argument(0)->Resolve();
+        heapSource.dwords[1] = addressHandle->Argument(1)->Resolve();
+        DescriptorSource countSource;
+        countSource.dwordCount = 1u;
+        countSource.dwords[0] = bound;
+        std::uint32_t badDword = 0;
+        if (!ValidateSource(heapSource, badDword) || !ValidateSource(countSource, badDword)) {
+            return false;
+        }
+
+        DescriptorSource::IndirectImage table;
+        table.heapSource = InternSource(heapSource);
+        table.materialSource = table.heapSource;
+        table.countSource = InternSource(countSource);
+        table.entryOffset = entryOffset + immediateOffset;
+        table.addressHeap = true;
+        table.countSigned = countSigned;
+
+        DescriptorSource imageSource;
+        imageSource.dwordCount = 8u;
+        imageSource.dwords = {heapSource.dwords[0], heapSource.dwords[1], bound, bound, heapSource.dwords[0], heapSource.dwords[1], bound, bound};
+        imageSource.indirectImage = table;
+
+        plan.handle = &handle;
+        plan.source = InternSource(imageSource);
+        plan.key = key;
+        plan.roots = imageSource.dwords;
+        return true;
+    }
+
     bool TryMakeTableImage(IrValue& handle, IndirectImagePlan& plan) {
         if (handle.Opcode() != IrOpcode::GetImageResource || handle.ArgumentCount() != 8u) {
             return false;
+        }
+        if (handle.Argument(0)->Resolve()->Opcode() == IrOpcode::LoadAddressU32) {
+            return TryMakeAddressTableImage(handle, plan);
         }
 
         std::array<IrValue*, 8> heapReads {};

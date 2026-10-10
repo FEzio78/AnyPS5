@@ -23,7 +23,9 @@ struct DescriptorSource {
     // A T# loaded from a table buffer (`heapSource`) at `entryOffset + key * 32`, the key a
     // wave-uniform runtime value (handle argument `keyArg`). With `hasMaterial` the key is itself
     // `M[readfirstlane(i) * selectorStride + selectorOffset]` over `materialSource`, so the key
-    // set can be enumerated from the material records (see ResourceMaterializer).
+    // set can be enumerated from the material records (see ResourceMaterializer). With
+    // `addressHeap` the table is a raw address (`heapSource` holds its two dwords) and the key is a
+    // loop counter bounded by `countSource`, which gives the number of entries.
     struct IndirectImage {
         std::uint32_t materialSource = 0;
         std::uint32_t heapSource = 0;
@@ -31,7 +33,10 @@ struct DescriptorSource {
         std::uint32_t selectorOffset = 0;
         std::uint32_t keyArg = 0;
         std::uint32_t entryOffset = 0;
+        std::uint32_t countSource = 0;
         bool hasMaterial = false;
+        bool addressHeap = false;
+        bool countSigned = false;
 
         bool operator==(const IndirectImage& other) const = default;
     };

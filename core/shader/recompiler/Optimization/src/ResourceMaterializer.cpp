@@ -1,4 +1,5 @@
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/SrtWalker/SrtAddressArithmetic.hpp"
 #include "Optimization/SrtWalker/SrtFlatSlotClasses.hpp"
 #include "Optimization/ShaderStageInputInfo.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
@@ -330,11 +331,23 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
     const auto slots = ResourceMaterializer::BindlessSlots();
     DescriptorValue heapValue;
     walker.EvaluateDescriptorSource(plan, table.heapSource, runtime, heapValue);
-    const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
-    const std::uint64_t heapSize = heap.GetSize();
-    if (heap.Type() != 0u || heap.Base48() > std::numeric_limits<std::uint64_t>::max() - heapSize) throw std::runtime_error("bindless heap buffer is invalid");
-    if (heapSize != 0u && (heapSize < table.entryOffset || (heapSize - table.entryOffset) % TableEntryBytes != 0u)) throw std::runtime_error("bindless heap contains a partial descriptor");
-    const auto entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
+    std::uint64_t heapBase = 0;
+    std::uint32_t entries = 0;
+    if (table.addressHeap) {
+        if (table.hasMaterial) throw std::runtime_error("bindless address tables with material selectors are unsupported");
+        heapBase = (static_cast<std::uint64_t>(heapValue.dwords[0]) | (static_cast<std::uint64_t>(heapValue.dwords[1]) << 32u)) & Detail::AddressMask & ~std::uint64_t{3};
+        DescriptorValue countValue;
+        walker.EvaluateDescriptorSource(plan, table.countSource, runtime, countValue);
+        const auto count = countValue.dwords[0];
+        entries = table.countSigned && static_cast<std::int32_t>(count) < 0 ? 0u : count;
+    } else {
+        const ShaderBufferResource heap = decodeBufferDescriptor(heapValue);
+        const std::uint64_t heapSize = heap.GetSize();
+        if (heap.Type() != 0u || heap.Base48() > std::numeric_limits<std::uint64_t>::max() - heapSize) throw std::runtime_error("bindless heap buffer is invalid");
+        if (heapSize != 0u && (heapSize < table.entryOffset || (heapSize - table.entryOffset) % TableEntryBytes != 0u)) throw std::runtime_error("bindless heap contains a partial descriptor");
+        entries = heapSize > table.entryOffset ? static_cast<std::uint32_t>(std::min<std::uint64_t>((heapSize - table.entryOffset) / TableEntryBytes, std::numeric_limits<std::uint32_t>::max())) : 0u;
+        heapBase = heap.Base48();
+    }
     const auto readWord = [&](std::uint64_t address, std::uint32_t& word) {
         if (!runtime.readMemory(runtime.userContext, address, &word)) {
             throw std::runtime_error("failed to read a bindless image table from memory");
@@ -385,7 +398,6 @@ void resolveTableImage(const IrResourcePlan& plan, std::uint32_t imageIndex, con
         for (std::uint32_t key = 0; key < entries; key++) keys[key] = key;
     }
     counters.outOfRange.fetch_add(outOfRange, std::memory_order_relaxed);
-    const std::uint64_t heapBase = heap.Base48();
     std::vector<DescriptorValue> candidates(keys.size());
     std::vector<std::uint8_t> valid(keys.size(), 0u);
     std::uint32_t paddedNull = 0u;

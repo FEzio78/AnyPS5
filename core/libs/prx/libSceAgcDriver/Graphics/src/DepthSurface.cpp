@@ -37,7 +37,7 @@ public:
             info.arrayLayers = 1;
             info.samples = VK_SAMPLE_COUNT_1_BIT;
             info.tiling = VK_IMAGE_TILING_OPTIMAL;
-            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+            info.usage = VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT | VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
             info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             info.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
             Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage depth");
@@ -232,6 +232,54 @@ bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resou
         return surface->context.device == context.device && (surface->target.address == address || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == address));
     });
     return found != list.rend() && (*found)->Holds(texture);
+}
+
+namespace {
+
+void copyDepthPlane(const Context& context, const GuestTextureResource& resource, VkImage colorImage, bool toDepth) {
+    std::lock_guard lock(surfacesMutex());
+    const auto& list = surfaces();
+    const auto found = std::find_if(list.rbegin(), list.rend(), [&](const auto& surface) { return surface->context.device == context.device && surface->target.address == resource.baseAddress; });
+    char text[320];
+    if (found == list.rend()) {
+        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to the stencil plane of depth surface 0x%llx is not implemented", static_cast<unsigned long long>(resource.baseAddress));
+        throw std::runtime_error(text);
+    }
+    const auto& surface = **found;
+    const bool d16 = surface.target.format == VK_FORMAT_D16_UNORM || surface.target.format == VK_FORMAT_D16_UNORM_S8_UINT;
+    const std::uint32_t texelBytes = d16 ? 2u : 4u;
+    if (resource.dimension != TextureDimension::k2D || resource.width != surface.target.extent.width || resource.height != surface.target.extent.height || resource.baseLevel != 0 || resource.baseArray != 0 || BytesPerElement(resource.format) != texelBytes) {
+        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth surface 0x%llx (%ux%u, vk format %d) as a %ux%u image of guest format %u, dimension %d, level %u, slice %u is not implemented", static_cast<unsigned long long>(surface.target.address), surface.target.extent.width, surface.target.extent.height, static_cast<int>(surface.target.format), resource.width, resource.height, resource.format, static_cast<int>(resource.dimension), resource.baseLevel, resource.baseArray);
+        throw std::runtime_error(text);
+    }
+    auto* recorder = Recorder::Active();
+    Require(recorder != nullptr, "a depth plane copy needs the recorder");
+    const auto bytes = static_cast<std::size_t>(surface.target.extent.width) * surface.target.extent.height * texelBytes;
+    auto staging = std::make_shared<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    const auto commands = recorder->Commands();
+    recorder->Keep(staging, staging->Size());
+    VkBufferImageCopy region{};
+    region.imageExtent = {surface.target.extent.width, surface.target.extent.height, 1};
+    region.imageSubresource = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, 0, 1};
+    VkBufferImageCopy color = region;
+    color.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    if (toDepth) context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, colorImage, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &color);
+    else context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, surface.image, VK_IMAGE_LAYOUT_GENERAL, staging->Handle(), 1, &region);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    if (toDepth) context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), surface.image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+    else context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), colorImage, VK_IMAGE_LAYOUT_GENERAL, 1, &color);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT);
+}
+
+}
+
+void CopyDepthPlaneToImage(const Context& context, const GuestTextureResource& resource, VkImage destination) {
+    copyDepthPlane(context, resource, destination, false);
+}
+
+void CopyImageToDepthPlane(const Context& context, const GuestTextureResource& resource, VkImage source) {
+    copyDepthPlane(context, resource, source, true);
 }
 
 bool DepthSurfaceAt(std::uint64_t address) {

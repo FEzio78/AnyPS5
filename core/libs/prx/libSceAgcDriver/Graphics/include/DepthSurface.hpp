@@ -20,6 +20,8 @@ std::uint64_t HtileDepthClearAddress(std::span<const std::uint32_t> code, std::s
 void NoteHtileDepthClear(std::uint64_t htileAddress);
 bool DepthSurfaceHolds(const Context& context, const GuestTextureResource& resource, const Texture* texture);
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components);
+void CopyDepthPlaneToImage(const Context& context, const GuestTextureResource& resource, VkImage destination);
+void CopyImageToDepthPlane(const Context& context, const GuestTextureResource& resource, VkImage source);
 
 }
 

@@ -805,12 +805,17 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
+
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
-    if (DepthSurfaceAt(viewed.baseAddress)) {
-        char text[112];
-        std::snprintf(text, sizeof(text), "AGC graphics: storage image access to depth/stencil surface 0x%llx is not implemented", static_cast<unsigned long long>(viewed.baseAddress));
-        throw std::runtime_error(text);
-    }
+    if (!DepthSurfaceAt(viewed.baseAddress)) return cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
+    auto image = cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
+    CopyDepthPlaneToImage(context, viewed, image->Image());
+    image->MarkDirty();
+    return image;
+}
+
+std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
     if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
     static_cast<void>(words);
@@ -3410,6 +3415,9 @@ bool SkipWriteBack() {
 
 void ShaderResources::WriteBack() {
     WriteBackBuffers();
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index] && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) CopyImageToDepthPlane(context, storageTextures[index]->Descriptor(), storageTextures[index]->Image());
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
@@ -3421,6 +3429,9 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
     // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
     // one of them (the copy HLE) must not land before the recorded work read it.
     recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        if (storageWritten[index] && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) CopyImageToDepthPlane(context, storageTextures[index]->Descriptor(), storageTextures[index]->Image());
+    }
     if (SkipWriteBack()) return;
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();

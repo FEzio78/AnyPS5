@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -503,6 +504,8 @@ std::uint64_t sampledBudget(const Context& context, TextureCache& cache) {
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
+    ImageProfile::Scope imageTiming(ImageProfile::Lookup, "full lookup");
+    imageTiming.Describe({resource.baseAddress, guestBytes, resource.format, resource.width, resource.height, words[0], words[3]});
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
@@ -526,7 +529,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto scanKeys = [&] {
         const auto scanStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        const auto keys = TextureClearKeys(resource, guestBytes);
+        const auto keys = ImageProfile::Measure(ImageProfile::Keys, "sampled lookup", [&] { return TextureClearKeys(resource, guestBytes); });
         if (profile && resource.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, scanStart);
         return keys;
     };
@@ -537,7 +540,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // A storage image whose results for this surface (or for a mip chain containing it) are still on
     // the GPU supplies the texture by a view of it; anything else needs those results in guest
     // memory first.
-    auto source = StorageTexture::FindPending(address, guestBytes);
+    imageTiming.Describe({address, guestBytes, resource.format, resource.width, resource.height, words[0], words[3]});
+    auto source = ImageProfile::Measure(ImageProfile::Source, "find pending", [&] { return StorageTexture::FindPending(address, guestBytes); });
     if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
@@ -566,7 +570,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
 
         keys = scanKeys();
         if (*keys == DccKeys::Uncompressed) {
-            source = sampledStorageSource(context, resource, guestBytes);
+            source = ImageProfile::Measure(ImageProfile::Source, "eligible imported surface", [&] { return sampledStorageSource(context, resource, guestBytes); });
         } else if (ClearedViewEnabled() && StorageClearAvailable(context, resource.format, *keys)) {
             // A fast-cleared surface is viewed as well, through its image cleared on the GPU (the
             // lookup's Refresh, see StorageTexture::upload), when the image's own descriptor names
@@ -595,7 +599,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // after them is current at the generation of a second (memoized) collect. The store marks the
     // surface's DCC keys uncompressed, so the keys are read after it.
     const auto flushStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    if (source == nullptr && !clearThroughKeys && StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture")) {
+    if (source == nullptr && !clearThroughKeys && ImageProfile::Measure(ImageProfile::Flush, "sampled snapshot", [&] { return StorageTexture::FlushPending(address, bytes, nullptr, "sampled texture"); })) {
         if (profile) LookupOutcomes::Add(LookupOutcomes::PendingFlush, flushStart);
         generation = GuestMemory::CollectWrites(address, bytes);
         keys.reset();
@@ -609,7 +613,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     auto& cache = Textures();
     const auto key = MakeTextureKey(context.device, words, components, depthCompare);
-    std::lock_guard lock(cache.mutex);
+    std::unique_lock lock(cache.mutex, std::defer_lock);
+    ImageProfile::Measure(ImageProfile::CacheLock, "sampled cache", [&] { lock.lock(); });
     dropUncachedViews(cache);
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
@@ -622,6 +627,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
+                imageTiming.Reason("cached storage view");
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
@@ -632,22 +638,25 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             const auto equalsCommitted = [&] {
                 if (Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-                return GuestMemory::EqualsCommitted(address, it->bytes);
+                return ImageProfile::Measure(ImageProfile::Compare, "snapshot changed stamp", [&] { return GuestMemory::EqualsCommitted(address, it->bytes); });
             };
             if (*keys != DccKeys::Uncompressed || GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation) || equalsCommitted()) {
                 it->generation = generation;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
                 reportTextureCounters();
+                imageTiming.Reason("unchanged snapshot");
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
             }
         }
         eraseTexture(cache, it);
+        imageTiming.Reason("stale cache entry");
         ++cache.counts.stale;
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     if (source != nullptr) {
+        imageTiming.Reason("new storage view");
         entry.source = source;
         entry.sourceVersion = source->Version();
         entry.texture = std::make_shared<Texture>(context, source, resource, components);
@@ -656,14 +665,15 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
         if (*keys == DccKeys::Uncompressed && Recorder::SnapshotWriteOverlaps(address, bytes)) counters.pendingReads.fetch_add(1, std::memory_order_relaxed);
-        ReadTextureSurface(resource, *keys, entry.bytes);
+        if (ImageProfile::active != nullptr) imageTiming.Reason(depthCompare ? "depth compare snapshot" : IsBlockCompressed(resource.format) ? "block compressed snapshot" : !StorageFormatAvailable(context, resource.format) ? "no storage format" : "no imported storage source");
+        ImageProfile::Measure(ImageProfile::Read, "new or changed snapshot", [&] { ReadTextureSurface(resource, *keys, entry.bytes); });
         static const bool traceTextures = std::getenv("APS5_TRACE_TEXTURES") != nullptr;
         if (traceTextures) {
             std::size_t nonzero = 0;
             for (std::size_t i = 0; i < entry.bytes.size(); i += 64) nonzero += entry.bytes[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, entry.bytes.size() / 64);
         }
-        entry.texture = std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare);
+        entry.texture = ImageProfile::Measure(ImageProfile::TextureCreate, "snapshot upload", [&] { return std::make_shared<Texture>(context, *context.detiler, resource, components, entry.bytes, depthCompare); });
         entry.accounted = entry.texture->AllocationBytes();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
@@ -808,6 +818,8 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
 
 std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
+    ImageProfile::Scope imageTiming(ImageProfile::StorageLookup, "lookup");
+    imageTiming.Describe({viewed.baseAddress, guestBytes, viewed.format, viewed.width, viewed.height, words.empty() ? 0u : words[0], words.size() < 4 ? 0u : words[3]});
     if (!DepthSurfaceAt(viewed.baseAddress)) return cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
     auto image = cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
     CopyDepthPlaneToImage(context, viewed, image->Image());
@@ -1432,19 +1444,22 @@ void ShaderResources::buildComplete() {
     try {
         // The lookups run in plan order: Revalidate walks the bindings the same way, and consecutive
         // storage elements of one mip chain share the previous element's image.
-        previousSampled = {};
-        for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
-        for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
-        previousSampled = {};
-        deferredImages.clear();
-        applyAnisoOverride();
-        // The records served their purpose: each holds the cache entry's objects as of stage A,
-        // which would otherwise keep a replaced texture or an evicted storage image (and its device
-        // memory) alive, outside the caches' budgets, for as long as this object is cached.
-        imageRecords.clear();
-        imageRecords.shrink_to_fit();
-        nextImageRecord = 0;
-        Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        {
+            ImageProfile::Scope imageTiming(ImageProfile::Images, "build complete", true);
+            previousSampled = {};
+            for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
+            for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
+            previousSampled = {};
+            deferredImages.clear();
+            applyAnisoOverride();
+            // The records served their purpose: each holds the cache entry's objects as of stage A,
+            // which would otherwise keep a replaced texture or an evicted storage image (and its device
+            // memory) alive, outside the caches' budgets, for as long as this object is cached.
+            imageRecords.clear();
+            imageRecords.shrink_to_fit();
+            nextImageRecord = 0;
+            Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        }
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
         timing.uploadMs += phase(BuildPhase::Upload);
@@ -2145,6 +2160,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    ImageProfile::Scope imageTiming(ImageProfile::Revalidate, "cached resources", true);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -3016,7 +3032,9 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
-    if (record.texture == nullptr) return nullptr;
+    ImageProfile::Scope imageTiming(ImageProfile::Fast, "stage A proof");
+    imageTiming.Describe({record.resource.baseAddress, record.guestBytes, record.resource.format, record.resource.width, record.resource.height, record.words[0], record.words[3]});
+    if (record.texture == nullptr) { imageTiming.Reason("no record"); return nullptr; }
     struct Outcome {
         bool profile;
         std::chrono::steady_clock::time_point start;
@@ -3035,9 +3053,9 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // between the stages marks them uncompressed).
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
-    if (DepthSurfaceAt(address)) return nullptr;
-    if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
-    if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
+    if (DepthSurfaceAt(address)) { imageTiming.Reason("depth surface"); return nullptr; }
+    if (GuestMemory::CollectWrites(address, bytes) == 0) { imageTiming.Reason("untracked surface"); return nullptr; }
+    if (PendingStorageOverlaps(address, bytes, record.source.get())) { imageTiming.Reason("foreign pending image"); return nullptr; }
     auto keys = record.keys;
     if (record.resource.dccAddress != 0) {
         const auto scanStart = outcome.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3048,7 +3066,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     }
     // The keys the entry was made under (a view of a pending render target was made under its clear
     // keys and stays valid while they are unchanged); a change is the full lookup's to judge.
-    if (keys != record.entryKeys) return nullptr;
+    if (keys != record.entryKeys) { imageTiming.Reason("dcc keys changed"); return nullptr; }
     if (record.source != nullptr) {
         if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
         if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
@@ -3067,6 +3085,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     if (it->source == nullptr) it->generation = record.generation;
     touchTexture(cache, it);
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
+    imageTiming.Reason("hit");
     outcome.hit = true;
     return record.texture;
 }
@@ -3103,6 +3122,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 continue;
             }
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
+            ImageProfile::Scope elementTiming(ImageProfile::Sampled, "resolve");
+            elementTiming.Describe({resource.baseAddress, record != nullptr ? record->guestBytes : 0, resource.format, resource.width, resource.height, words[0], words[3]});
             RequireDegammaFormat(resource.format, binding.imageSamplers[element], shaderSamplers);
             RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers[element], shaderSamplers);
             const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
@@ -3165,6 +3186,8 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
         const bool firstLayer = binding.imageShape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
         if (binding.imageShape.has_value() && !firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest storage texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
+        ImageProfile::Scope elementTiming(ImageProfile::Storage, sameAsPrevious && StorageDedupeEnabled() ? "deduplicated" : "resolve");
+        elementTiming.Describe({resource.baseAddress, record != nullptr ? record->guestBytes : 0, resource.format, resource.width, resource.height, words[0], words[3]});
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;

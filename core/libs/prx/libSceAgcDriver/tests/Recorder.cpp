@@ -4315,6 +4315,53 @@ void minLodTests(const Device& device, Recorder& recorder) {
     expectRed(sample(0x100, 0.0f, 1), unorm(1), "minimum LOD clamp: MIN_LOD at the view's base level reads its base level");
 }
 
+void recordedCpuStorageUploadTests(const Device& device, Recorder& recorder) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    TextureDetiler detiler(context);
+    context.detiler = &detiler;
+    GuestTextureResource resource{};
+    resource.width = 64;
+    resource.height = 4;
+    resource.mipCount = 1;
+    resource.dimension = TextureDimension::k2D;
+    resource.tileMode = TextureTileMode::kLinear;
+    resource.format = 56;
+    const auto bytes = static_cast<std::size_t>(DescribeSurface(resource).guestBytes);
+    std::vector<std::byte> memory(bytes + 256, std::byte{0x11});
+    auto* surface = reinterpret_cast<std::byte*>((reinterpret_cast<std::uintptr_t>(memory.data()) + 255) & ~std::uintptr_t{255});
+    resource.baseAddress = reinterpret_cast<std::uint64_t>(surface);
+    Require(HostImportFor(context, resource.baseAddress, bytes) == nullptr, "CPU upload test unexpectedly imported its surface");
+    auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+    const auto* mode = std::getenv("APS5_RECORD_CPU_STORAGE_UPLOADS");
+    const bool recorded = mode != nullptr && std::string_view(mode) == "1";
+    for (const auto value : {0x55, 0xaa}) {
+        recorder.Sync();
+        const auto submissions = recorder.Submissions();
+        std::memset(surface, value, bytes);
+        AgcDriver::GuestMemory::MarkWritten(resource.baseAddress, bytes);
+        Require(!image->Refresh(), "changed CPU bytes did not refresh the storage image");
+        if (recorded) Require(recorder.Recording() && recorder.Submissions() == submissions, "CPU storage refresh submitted or waited instead of recording");
+        std::memset(surface, 0xee, bytes);
+        auto readback = std::make_shared<Buffer>(context, resource.width * resource.height * 4, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+        const auto commands = recorder.Commands();
+        recorder.Keep(readback);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+        VkBufferImageCopy copy{};
+        copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+        copy.imageExtent = {resource.width, resource.height, 1};
+        context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback->Handle(), 1, &copy);
+        RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+        if (value == 0xaa && recorded) {
+            const std::weak_ptr<StorageTexture> alive = image;
+            image.reset();
+            Require(!alive.expired(), "recorded CPU upload did not keep its image alive");
+        }
+        recorder.Sync();
+        for (const auto byte : readback->Bytes()) Require(byte == std::byte(value), "CPU storage upload lost its snapshot or consumer ordering");
+    }
+}
+
 void singleCubeTests(const Device& device, Recorder& recorder) {
     auto context = device.GetContext();
     TextureDetiler detiler(context);
@@ -4795,6 +4842,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--cpu-storage-upload-only") {
+            recordedCpuStorageUploadTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cube-only") {
             singleCubeTests(device, recorder);
             std::cout << "Single cube snapshot and storage sampling tests passed\n";

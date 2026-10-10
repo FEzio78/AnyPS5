@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
@@ -2459,6 +2460,7 @@ void Recorder::KeepBytes(const void* owner, std::size_t bytes) {
 }
 
 void Recorder::BoundKeptBytes() {
+    ImageProfile::Scope imageTiming(ImageProfile::BoundKeeps, "kept byte budget");
     if (!GuestMemory::GpuMutex().HeldByThisThread()) return;
     if (open != nullptr && open->keptBytes >= KeptBytesBudget) Submit();
     if (DeferredBytes() != 0 && inFlightKeptBytes + DeferredBytes() > 2 * KeptBytesBudget) DestroyDeferred(TakeDeferred(), false);
@@ -3232,6 +3234,7 @@ void Recorder::FlushDeferredReleases() {
 }
 
 void Recorder::SyncThrough(std::uint64_t address, std::size_t bytes, bool waitUnlocked) {
+    ImageProfile::Scope imageTiming(ImageProfile::HookSync, "recorded writes");
     if (bytes == 0) return;
     const auto end = address + bytes;
     if (completionDepth != 0 && !CompletionStoreSyncs()) {

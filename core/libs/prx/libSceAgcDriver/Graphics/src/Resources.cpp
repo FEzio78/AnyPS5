@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -367,6 +368,7 @@ VkCommandBuffer CommandBatch::Handle() const {
 }
 
 void CommandBatch::SubmitAndWait() {
+    ImageProfile::Scope imageTiming(ImageProfile::StandaloneWait, "standalone batch");
     Submit();
     Wait();
 }

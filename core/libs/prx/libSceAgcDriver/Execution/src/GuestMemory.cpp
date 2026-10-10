@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1100,6 +1101,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
 }
 
 std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoized) {
+    Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::Collect, memoized ? "memoized collect" : "uncached collect");
     auto& tracker = Tracker();
     // Whole pages, so a page shared with the next range is collected with either.
     constexpr std::uint64_t page = 4096;
@@ -1799,6 +1801,7 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 }
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
+    Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryRead, "read committed and sync");
     if (destination.empty()) return;
     FlushGpuWrites(address, destination.size());
     const TimedAccess timed(CounterRead, destination.size());
@@ -1812,6 +1815,7 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
 }
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
+    Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryCompare, "compare committed and sync");
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
     return EqualsCommittedUnsynced(address, bytes);

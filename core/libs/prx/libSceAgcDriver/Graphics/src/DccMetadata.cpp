@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -597,6 +598,7 @@ bool KeyFastPath() {
 }
 
 DccKeys ProvedClearKeys(const GuestTextureResource& resource, std::uint64_t guestBytes, DccKeyProof& proof) {
+    ImageProfile::Scope imageTiming(ImageProfile::Keys, "proved clear keys");
     if (resource.dccAddress == 0) return DccKeys::Uncompressed;
     auto& counters = Proofs();
     if (!KeyFastPath()) {

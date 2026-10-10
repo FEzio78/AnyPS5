@@ -86,7 +86,7 @@ RuntimeDescriptor descriptor(SpirvValueEmitContext& context, const IrValue& inst
     return {base, context.Arg(*handle, 2u), stride, word3, both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u))), index, valid};
 }
 
-RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes) {
+RuntimeAddress addressInline(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes, bool parameters = false) {
     auto& state = context.state;
     const auto u32 = TypeU32(state);
     const auto boolean = TypeBool(state);
@@ -94,10 +94,11 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     const auto add = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpIAdd, u32, left, right); };
     const auto mul = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpIMul, u32, left, right); };
     const auto less = [&](std::uint32_t left, std::uint32_t right) { return Binary(state, spv::OpULessThan, boolean, left, right); };
+    const auto length = parameters ? bytes : constant(bytes);
     const auto fits = [&](std::uint32_t offset, std::uint32_t size) {
-        return both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, size, constant(bytes)), Binary(state, spv::OpULessThanEqual, boolean, offset, Binary(state, spv::OpISub, u32, size, constant(bytes))));
+        return both(state, Binary(state, spv::OpUGreaterThanEqual, boolean, size, length), Binary(state, spv::OpULessThanEqual, boolean, offset, Binary(state, spv::OpISub, u32, size, length)));
     };
-    const auto offset = resource.offset != 0u ? add(resource.offset, constant(componentOffset)) : add(context.Arg(instruction, 2u), constant(context.Memory(instruction).offset + componentOffset));
+    const auto offset = resource.offset != 0u ? add(resource.offset, parameters ? componentOffset : constant(componentOffset)) : add(context.Arg(instruction, 2u), constant(context.Memory(instruction).offset + componentOffset));
     const auto soffset = resource.soffset != 0u ? resource.soffset : context.Arg(instruction, 3u);
     const auto indexShift = add(field(state, resource.word3, 21u, 2u), constant(3u));
     const auto indices = Binary(state, spv::OpShiftLeftLogical, u32, constant(1u), indexShift);
@@ -120,6 +121,55 @@ RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instructio
     return {AddBdaAddress(context, instruction, resource.base, Unary(state, spv::OpUConvert, TypeScalarU64(state), byte), false), inBounds};
 }
 
+void defineBufferAddressFunction(SpirvValueEmitContext& context, const IrValue& instruction) {
+    auto& state = context.state;
+    if (state.formattedBufferAddressFunction != 0u) return;
+    const auto u32 = TypeU32(state);
+    const auto boolean = TypeBool(state);
+    const auto resultType = state.module.Type(spv::OpTypeStruct, u32, boolean);
+    const auto functionType = state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, boolean, boolean, u32, u32, u32, u32);
+    const auto id = state.module.AllocateId();
+    struct Restore {
+        SpirvEmitterState& state;
+        std::uint32_t label;
+        ~Restore() {
+            state.module.EndHelperFunction();
+            state.currentLabel = label;
+        }
+    };
+    state.module.BeginHelperFunction();
+    const Restore restore{state, state.currentLabel};
+    state.module.AddName(id, "formatted_buffer_address");
+    state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+    const std::array<std::uint32_t, 10> types{u32, u32, u32, u32, boolean, boolean, u32, u32, u32, u32};
+    std::array<std::uint32_t, 10> args{};
+    for (std::uint32_t index = 0; index < args.size(); ++index) {
+        args[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, types[index], args[index]);
+    }
+    EmitLabel(state, state.module.AllocateId());
+    const RuntimeDescriptor resource{ConstantU32(state, 0u), args[1], args[2], args[3], args[4], args[0], args[5], args[6], args[7]};
+    const auto access = addressInline(context, instruction, resource, args[8], args[9], true);
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeConstruct, resultType, result, access.guest, access.inBounds);
+    state.module.AddFunction(spv::OpReturnValue, result);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.formattedBufferAddressFunction = id;
+}
+
+RuntimeAddress address(SpirvValueEmitContext& context, const IrValue& instruction, const RuntimeDescriptor& resource, std::uint32_t componentOffset, std::uint32_t bytes) {
+    auto& state = context.state;
+    if (state.formattedBufferAccess[0] == 0u) return addressInline(context, instruction, resource, componentOffset, bytes);
+    const auto resultType = state.module.Type(spv::OpTypeStruct, TypeU32(state), TypeBool(state));
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, resultType, result, state.formattedBufferAddressFunction, resource.index, resource.records, resource.stride, resource.word3, resource.swizzle, resource.valid, resource.offset, resource.soffset, ConstantU32(state, componentOffset), ConstantU32(state, bytes));
+    const auto guest = state.module.AllocateId();
+    const auto inBounds = state.module.AllocateId();
+    state.module.AddFunction(spv::OpCompositeExtract, TypeU32(state), guest, result, 0u);
+    state.module.AddFunction(spv::OpCompositeExtract, TypeBool(state), inBounds, result, 1u);
+    return {guest, inBounds};
+}
+
 MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue& instruction, bool wide = false) {
     auto& state = context.state;
     const auto& memory = context.Memory(instruction);
@@ -129,8 +179,9 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
     MemoryResourceAccess access;
     access.kind = memory.kind;
     access.objectPointer = state.module.AllocateId();
-    state.module.AddFunction(spv::OpAccessChain, wide ? TypeStorageBufferU64Pointer(state) : TypeStorageBufferPointer(state), access.objectPointer, variable, ConstantU32(state, element));
-    access.byteOffset = state.memoryByteOffsets.at(element);
+    const auto index = state.formattedBufferAccess[0] != 0u ? state.formattedBufferAccess[0] : ConstantU32(state, element);
+    state.module.AddFunction(spv::OpAccessChain, wide ? TypeStorageBufferU64Pointer(state) : TypeStorageBufferPointer(state), access.objectPointer, variable, index);
+    access.byteOffset = state.formattedBufferAccess[0] != 0u ? state.formattedBufferAccess[1] : state.memoryByteOffsets.at(element);
     access.memoryAccess = memory.coherent ? spv::MemoryAccessVolatileMask : 0u;
     access.length = state.module.AllocateId();
     state.module.AddFunction(spv::OpArrayLength, TypeU32(state), access.length, access.objectPointer, 0u);
@@ -138,6 +189,7 @@ MemoryResourceAccess directAccess(SpirvValueEmitContext& context, const IrValue&
 }
 
 std::uint32_t baseMisalignment(SpirvValueEmitContext& context, const IrValue& instruction) {
+    if (context.state.formattedBufferAccess[0] != 0u) return context.state.formattedBufferAccess[2];
     const auto& memory = context.Memory(instruction);
     if (memory.kind == ResourceKind::ScalarBuffer) return ConstantU32(context.state, 0u);
     const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
@@ -150,7 +202,7 @@ std::uint32_t directWordIndex(SpirvEmitterState& state, const MemoryResourceAcce
     return EmitAddU32(state, relative, base);
 }
 
-std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits) {
+std::uint32_t readBufferInline(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits) {
     if (context.Memory(instruction).gpuDescriptor) return EmitBdaRead(context, instruction, address, bits);
     auto& state = context.state;
     const auto access = directAccess(context, instruction);
@@ -181,7 +233,7 @@ std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruct
     });
 }
 
-void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
+void writeBufferInline(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits) {
     if (context.Memory(instruction).gpuDescriptor) {
         EmitBdaWrite(context, instruction, address, value, bits);
         return;
@@ -223,6 +275,83 @@ void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std
             });
         });
     });
+}
+
+std::array<std::uint32_t, 4> memoryFunctionKey(const MemoryInfo& memory, std::uint32_t bits, bool store) {
+    return {bits, store ? 1u : 0u, memory.coherent ? 1u : 0u, static_cast<std::uint32_t>(memory.kind)};
+}
+
+void defineBufferMemoryFunction(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t bits, bool store) {
+    auto& state = context.state;
+    const auto key = memoryFunctionKey(context.Memory(instruction), bits, store);
+    if (state.formattedBufferMemoryFunctions.contains(key)) return;
+    const auto u32 = TypeU32(state);
+    const auto resultType = store ? state.module.Type(spv::OpTypeVoid) : u32;
+    const auto functionType = store ? state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, u32) : state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32);
+    const auto id = state.module.AllocateId();
+    struct Restore {
+        SpirvEmitterState& state;
+        std::uint32_t label;
+        std::array<std::uint32_t, 3> access;
+        ~Restore() {
+            state.module.EndHelperFunction();
+            state.currentLabel = label;
+            state.formattedBufferAccess = access;
+        }
+    };
+    state.module.BeginHelperFunction();
+    const Restore restore{state, state.currentLabel, state.formattedBufferAccess};
+    state.module.AddName(id, std::string(store ? "write" : "read") + "_formatted_buffer_bits" + std::to_string(bits));
+    state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+    std::array<std::uint32_t, 5> parameters{};
+    for (std::uint32_t index = 0; index < (store ? 5u : 4u); ++index) {
+        parameters[index] = state.module.AllocateId();
+        state.module.AddFunction(spv::OpFunctionParameter, u32, parameters[index]);
+    }
+    EmitLabel(state, state.module.AllocateId());
+    const auto merge = state.module.AllocateId();
+    std::vector<std::uint32_t> labels(state.memoryByteOffsets.size());
+    std::vector<std::uint32_t> branch{spv::OpSwitch, parameters[0], merge};
+    for (std::uint32_t index = 0; index < labels.size(); ++index) {
+        labels[index] = state.module.AllocateId();
+        branch.insert(branch.end(), {index, labels[index]});
+    }
+    state.module.AddFunction(spv::OpSelectionMerge, merge, spv::SelectionControlMaskNone);
+    state.module.AddFunction(branch);
+    for (std::uint32_t index = 0; index < labels.size(); ++index) {
+        EmitLabel(state, labels[index]);
+        state.formattedBufferAccess = {ConstantU32(state, index), parameters[2], parameters[3]};
+        if (store) {
+            writeBufferInline(context, instruction, parameters[1], parameters[4], bits);
+            state.module.AddFunction(spv::OpReturn);
+        } else {
+            const auto value = readBufferInline(context, instruction, parameters[1], bits);
+            state.module.AddFunction(spv::OpReturnValue, value);
+        }
+    }
+    EmitLabel(state, merge);
+    state.module.AddFunction(spv::OpUnreachable);
+    state.module.AddFunction(spv::OpFunctionEnd);
+    state.formattedBufferMemoryFunctions.emplace(key, id);
+}
+
+std::uint32_t readBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t bits) {
+    auto& state = context.state;
+    if (state.formattedBufferAccess[0] == 0u) return readBufferInline(context, instruction, address, bits);
+    const auto function = state.formattedBufferMemoryFunctions.at(memoryFunctionKey(context.Memory(instruction), bits, false));
+    const auto result = state.module.AllocateId();
+    state.module.AddFunction(spv::OpFunctionCall, TypeU32(state), result, function, state.formattedBufferAccess[0], address, state.formattedBufferAccess[1], state.formattedBufferAccess[2]);
+    return result;
+}
+
+void writeBuffer(SpirvValueEmitContext& context, const IrValue& instruction, std::uint32_t address, std::uint32_t value, std::uint32_t bits = 32u) {
+    auto& state = context.state;
+    if (state.formattedBufferAccess[0] == 0u) {
+        writeBufferInline(context, instruction, address, value, bits);
+        return;
+    }
+    const auto function = state.formattedBufferMemoryFunctions.at(memoryFunctionKey(context.Memory(instruction), bits, true));
+    state.module.AddFunction(spv::OpFunctionCall, TypeVoid(state), state.module.AllocateId(), function, state.formattedBufferAccess[0], address, state.formattedBufferAccess[1], state.formattedBufferAccess[2], value);
 }
 
 std::uint32_t composite(SpirvEmitterState& state, std::uint32_t components, const std::array<std::uint32_t, 4>& values) {
@@ -397,42 +526,38 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
     const auto valueType = components == 1u ? u32 : TypeU32Composite(state, components);
     const auto resultType = store ? state.module.Type(spv::OpTypeVoid) : valueType;
     const auto element = ResourceForDescriptor(state, DescriptorBindingKind::Buffers, memory.resource);
-    const std::array<std::uint32_t, 6> key{memory.resource, components, store ? 1u : 0u, memory.d16 ? 1u : 0u, memory.coherent ? 1u : 0u, static_cast<std::uint32_t>(memory.kind)};
+    const std::array<std::uint32_t, 6> key{0u, components, store ? 1u : 0u, memory.d16 ? 1u : 0u, memory.coherent ? 1u : 0u, static_cast<std::uint32_t>(memory.kind)};
     auto function = state.formattedBufferFunctions.find(key);
     if (function == state.formattedBufferFunctions.end()) {
+        defineBufferAddressFunction(context, instruction);
+        for (const auto bits : {8u, 16u, 32u}) defineBufferMemoryFunction(context, instruction, bits, store);
         const auto id = state.module.AllocateId();
-        const auto functionType = store ? state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, u32, valueType) : state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, u32);
-        const auto label = state.currentLabel;
-        const auto byteOffset = state.memoryByteOffsets.at(element);
+        const auto boolean = TypeBool(state);
+        const auto functionType = store ? state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, u32, u32, u32, boolean, boolean, u32, u32, valueType) : state.module.Type(spv::OpTypeFunction, resultType, u32, u32, u32, u32, u32, u32, u32, boolean, boolean, u32, u32);
         struct Restore {
             SpirvEmitterState& state;
-            std::uint32_t element;
             std::uint32_t label;
-            std::uint32_t byteOffset;
+            std::array<std::uint32_t, 3> access;
             ~Restore() {
                 state.module.EndHelperFunction();
-                state.memoryByteOffsets.at(element) = byteOffset;
+                state.formattedBufferAccess = access;
                 state.currentLabel = label;
             }
         };
         state.module.BeginHelperFunction();
-        const Restore restore{state, element, label, byteOffset};
+        const Restore restore{state, state.currentLabel, state.formattedBufferAccess};
+        state.module.AddName(id, std::string(store ? "store" : "load") + "_formatted_buffer_x" + std::to_string(components));
         state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
-        std::array<std::uint32_t, 6> parameters{};
-        for (std::uint32_t index = 0; index < (store ? 6u : 5u); ++index) {
+        const std::array<std::uint32_t, 12> types{u32, u32, u32, u32, u32, u32, u32, boolean, boolean, u32, u32, valueType};
+        std::array<std::uint32_t, 12> parameters{};
+        for (std::uint32_t index = 0; index < (store ? 12u : 11u); ++index) {
             parameters[index] = state.module.AllocateId();
-            state.module.AddFunction(spv::OpFunctionParameter, index == 5u ? valueType : u32, parameters[index]);
+            state.module.AddFunction(spv::OpFunctionParameter, types[index], parameters[index]);
         }
         EmitLabel(state, state.module.AllocateId());
-        state.memoryByteOffsets.at(element) = parameters[4];
-        const auto first = PipelineSpecialization::BufferBase + memory.resource * PipelineSpecialization::BufferWords;
-        const auto word1 = state.module.SpecializationConstant(u32, first, 0u);
-        const auto word3 = state.module.SpecializationConstant(u32, first + 1u, 0u);
-        const auto stride = field(state, word1, 16u, 14u);
-        const auto swizzle = both(state, nonzero(state, stride), nonzero(state, field(state, word1, 31u, 1u)));
-        const auto valid = nonzero(state, state.module.SpecializationConstant(u32, first + 2u, 0u));
-        const RuntimeDescriptor shared{ConstantU32(state, 0u), parameters[3], stride, word3, swizzle, parameters[0], valid, parameters[1], parameters[2]};
-        const auto value = formatSwitch(context, instruction, shared, components, store, store ? parameters[5] : 0u);
+        state.formattedBufferAccess = {parameters[9], parameters[4], parameters[10]};
+        const RuntimeDescriptor shared{ConstantU32(state, 0u), parameters[3], parameters[5], parameters[6], parameters[7], parameters[0], parameters[8], parameters[1], parameters[2]};
+        const auto value = formatSwitch(context, instruction, shared, components, store, store ? parameters[11] : 0u);
         if (store) state.module.AddFunction(spv::OpReturn);
         else state.module.AddFunction(spv::OpReturnValue, value);
         state.module.AddFunction(spv::OpFunctionEnd);
@@ -440,8 +565,9 @@ std::uint32_t formattedCall(SpirvValueEmitContext& context, const IrValue& instr
     }
     const auto offset = Binary(state, spv::OpIAdd, u32, context.Arg(instruction, 2u), ConstantU32(state, memory.offset));
     const auto result = state.module.AllocateId();
-    if (store) state.module.AddFunction(spv::OpFunctionCall, resultType, result, function->second, resource.index, offset, context.Arg(instruction, 3u), resource.records, state.memoryByteOffsets.at(element), data);
-    else state.module.AddFunction(spv::OpFunctionCall, resultType, result, function->second, resource.index, offset, context.Arg(instruction, 3u), resource.records, state.memoryByteOffsets.at(element));
+    std::vector<std::uint32_t> call{spv::OpFunctionCall, resultType, result, function->second, resource.index, offset, context.Arg(instruction, 3u), resource.records, state.memoryByteOffsets.at(element), resource.stride, resource.word3, resource.swizzle, resource.valid, ConstantU32(state, element), baseMisalignment(context, instruction)};
+    if (store) call.push_back(data);
+    state.module.AddFunction(call);
     return store ? ConstantU32(state, 0u) : result;
 }
 

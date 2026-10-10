@@ -103,7 +103,10 @@ struct SpirvEmitterState {
     std::uint32_t storageBufferVariable = 0;
     std::uint32_t storageBufferU64Variable = 0;
     std::vector<std::uint32_t> memoryByteOffsets;
+    std::array<std::uint32_t, 3> formattedBufferAccess {};
+    std::uint32_t formattedBufferAddressFunction = 0;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedBufferFunctions;
+    std::map<std::array<std::uint32_t, 4>, std::uint32_t> formattedBufferMemoryFunctions;
     std::map<std::array<std::uint32_t, 6>, std::uint32_t> formattedGpuBufferFunctions;
     std::uint32_t bdaPagetableVariable = 0;
     std::uint32_t faultBufferVariable = 0;

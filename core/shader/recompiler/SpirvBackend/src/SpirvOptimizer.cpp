@@ -193,7 +193,7 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     {
         const auto now = std::chrono::steady_clock::now();
         const auto seconds = [](auto from, auto to) { return std::chrono::duration<double>(to - from).count(); };
-        if (seconds(started, now) > 2.0) std::fprintf(stderr, "[spirv-time] %zu -> %zu words specialize=%d: validate %.1f s, optimize %.1f s, revalidate %.1f s\n", spirv.size(), optimized.size(), specialize ? 1 : 0, seconds(started, optimizeStarted), seconds(optimizeStarted, validateStarted), seconds(validateStarted, now));
+        if (seconds(started, now) > 2.0 || std::getenv("APS5_SPIRV_TIMING") != nullptr) std::fprintf(stderr, "[spirv-time] %zu -> %zu words specialize=%d: validate %.3f s, optimize %.3f s, revalidate %.3f s\n", spirv.size(), optimized.size(), specialize ? 1 : 0, seconds(started, optimizeStarted), seconds(optimizeStarted, validateStarted), seconds(validateStarted, now));
     }
     return optimized;
 }

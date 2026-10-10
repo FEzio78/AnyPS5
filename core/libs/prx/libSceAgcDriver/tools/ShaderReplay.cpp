@@ -44,6 +44,7 @@ bool g_spirv = false;
 bool g_graph = false;
 bool g_maintenance8 = false;
 bool g_code = false;
+bool g_prepared = false;
 
 bool Replay(const char* path) {
     auto request = ShaderRecompiler::RequestSerializer{}.Deserialize(ReadText(path));
@@ -115,12 +116,20 @@ bool Replay(const char* path) {
     }
     try {
         if (g_maintenance8) request.request.target.nonConstantImageOffsets = true;
-        const auto result = ShaderRecompiler::Recompile(request.request);
+        ShaderRecompiler::RecompileResult result;
+        if (g_prepared) {
+            const auto handle = ShaderRecompiler::PrepareShader(request.request);
+            static_cast<ShaderRecompiler::CompiledShaderArtifact&>(result) = ShaderRecompiler::GetPreparedArtifact(*handle);
+        } else {
+            result = ShaderRecompiler::Recompile(request.request);
+        }
         std::printf("  recompiled: %zu SPIR-V words\n", result.spirv.size());
         if (g_spirv) {
             std::string name(path);
             name = name.substr(name.find_last_of("/\\") + 1) + ".spv";
-            std::ofstream(name, std::ios::binary).write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
+            std::ofstream file(name, std::ios::binary);
+            file.write(reinterpret_cast<const char*>(result.spirv.data()), static_cast<std::streamsize>(result.spirv.size() * sizeof(result.spirv[0])));
+            if (!file) throw std::runtime_error("could not write " + name);
         }
         if (g_memory) {
             for (const auto& binding : result.bindings) {
@@ -152,11 +161,15 @@ bool Replay(const char* path) {
 
 int main(int argc, char** argv) {
     if (argc < 2) {
-        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] <shader.req>...\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
+        std::fprintf(stderr, "usage: agc_shader_replay [--dis] [--asm] [--cfg] [--mem] [--spv] [--code] [--maintenance8] [--prepared] <shader.req>...\n  --prepared emits the generic artifact without materializing captured resources\n  APS5_SPIRV_OPT=none skips optimization when dumping with --spv\n  the driver writes shader_<address>.req files when APS5_DUMP_SHADERS is set\n");
         return 2;
     }
     int failures = 0;
     for (int i = 1; i < argc; ++i) {
+        if (std::string(argv[i]) == "--prepared") {
+            g_prepared = true;
+            continue;
+        }
         if (std::string(argv[i]) == "--dis") {
             g_disassemble = true;
             continue;

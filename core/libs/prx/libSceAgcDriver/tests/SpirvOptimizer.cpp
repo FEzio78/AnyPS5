@@ -241,6 +241,69 @@ OpFunctionEnd
     }
 }
 
+void testLoopBodyInContinueConstruct(bool customPipeline) {
+    const auto words = assemble(R"(OpCapability Shader
+OpExtension "SPV_KHR_storage_buffer_storage_class"
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %index
+OpExecutionMode %main LocalSize 8 1 1
+OpDecorate %index BuiltIn LocalInvocationIndex
+OpDecorate %block Block
+OpMemberDecorate %block 0 Offset 0
+OpDecorate %buffer DescriptorSet 0
+OpDecorate %buffer Binding 0
+%void = OpTypeVoid
+%bool = OpTypeBool
+%uint = OpTypeInt 32 0
+%input = OpTypePointer Input %uint
+%block = OpTypeStruct %uint
+%blockPointer = OpTypePointer StorageBuffer %block
+%pointer = OpTypePointer StorageBuffer %uint
+%function = OpTypeFunction %void
+%zero = OpConstant %uint 0
+%one = OpConstant %uint 1
+%index = OpVariable %input Input
+%buffer = OpVariable %blockPointer StorageBuffer
+%main = OpFunction %void None %function
+%entry = OpLabel
+%lane = OpLoad %uint %index
+%dead = OpIAdd %uint %lane %one
+OpBranch %header
+%header = OpLabel
+%counter = OpPhi %uint %zero %entry %next %latch
+OpLoopMerge %merge %continue None
+OpBranch %continue
+%continue = OpLabel
+OpBranch %body
+%body = OpLabel
+%odd = OpBitwiseAnd %uint %counter %one
+%write = OpIEqual %bool %odd %one
+OpSelectionMerge %join None
+OpBranchConditional %write %store %join
+%store = OpLabel
+%output = OpAccessChain %pointer %buffer %zero
+OpStore %output %counter
+OpBranch %join
+%join = OpLabel
+%next = OpIAdd %uint %counter %one
+OpBranch %latch
+%latch = OpLabel
+%done = OpUGreaterThanEqual %bool %next %lane
+OpBranchConditional %done %merge %header
+%merge = OpLabel
+OpReturn
+OpFunctionEnd
+)");
+    try {
+        const auto output = ShaderRecompiler::ValidateAndOptimizeSpirv(words, Vulkan11, Spirv13, false);
+        check(spvtools::SpirvTools(SPV_ENV_VULKAN_1_1).Validate(output), "loop body in a continue construct: optimizer returned invalid SPIR-V");
+        if (customPipeline) check(opcodeCount(output, spv::OpIAdd) == 1u, "loop body in a continue construct: the module was not optimized");
+        check(opcodeCount(output, spv::OpStore) == 1u, "loop body in a continue construct: optimizer lost the store");
+    } catch (const std::exception& error) {
+        check(false, std::string("loop body in a continue construct: ") + error.what());
+    }
+}
+
 void testInvalidInputIsRejected() {
     const auto valid = assemble(moduleSource(Types.front(), false, ArithmeticSupport::StorageOnly));
     expectRejected(valid, 0x00400000u, Spirv13, "SPIR-V 1.3 with Vulkan 1.0");
@@ -285,6 +348,7 @@ int main() {
     testNarrowConversions(optimizationEnabled);
     testInvalidInputIsRejected();
     testSpecializedSelectionExit();
+    testLoopBodyInContinueConstruct(mode == nullptr);
     if (failures != 0) {
         std::fprintf(stderr, "%d optimizer check(s) failed\n", failures);
         return 1;

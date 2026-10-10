@@ -149,12 +149,13 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
                 .RegisterPass(spvtools::CreateCopyPropagateArraysPass())
                 .RegisterPass(spvtools::CreateReduceLoadSizePass());
         }
-        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true))
-            .RegisterPass(spvtools::CreateBlockMergePass());
+        // TODO: SPIRV-Tools v2025.4 BlockMergePass merges a loop header into a multi-block continue
+        // construct and makes the header the continue target, which the validator rejects. Restore the
+        // pass once SPIRV-Tools refuses that merge; the Vulkan driver merges blocks itself.
+        optimizer.RegisterPass(spvtools::CreateAggressiveDCEPass(true));
         if (full) {
             optimizer.RegisterPass(spvtools::CreateRedundancyEliminationPass())
-                .RegisterPass(spvtools::CreateDeadBranchElimPass())
-                .RegisterPass(spvtools::CreateBlockMergePass());
+                .RegisterPass(spvtools::CreateDeadBranchElimPass());
         }
         if (allowFolding) optimizer.RegisterPass(spvtools::CreateSimplificationPass());
     }

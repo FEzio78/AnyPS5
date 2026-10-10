@@ -2,6 +2,8 @@
 #include <spirv-tools/libspirv.hpp>
 #include <spirv-tools/optimizer.hpp>
 #include <spirv/unified1/spirv.hpp>
+#include <atomic>
+#include <cstdio>
 #include <cstdlib>
 #include <stdexcept>
 #include <string>
@@ -167,7 +169,9 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     }
     diagnostics.clear();
     if (!tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
-        throw std::runtime_error("SPIR-V validation after optimization failed:\n" + diagnostics);
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[spirv] optimizer produced an invalid module; using it unoptimized: %s\n", diagnostics.substr(0, diagnostics.find('\n')).c_str());
+        return std::vector<std::uint32_t>(spirv.begin(), spirv.end());
     }
     return optimized;
 }

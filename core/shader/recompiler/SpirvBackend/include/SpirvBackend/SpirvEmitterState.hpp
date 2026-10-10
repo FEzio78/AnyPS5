@@ -9,6 +9,7 @@
 #include <cstdint>
 #include <map>
 #include <span>
+#include <string>
 #include <string_view>
 #include <unordered_map>
 #include <unordered_set>
@@ -90,6 +91,7 @@ struct SpirvEmitterState {
     bool splitSubgroup = false;
     bool narrowSubgroupClock = false;
     std::unordered_set<const IrValue*> sharedLaneValues;
+    std::unordered_map<std::string, std::uint32_t> arithmeticFunctions;
     std::uint32_t laneHalf = 0;
     // The target's SPIR-V version and what the device accepts, for capabilities an emitter adds
     // only when needed (bindless image tables: see TableImageIndex).

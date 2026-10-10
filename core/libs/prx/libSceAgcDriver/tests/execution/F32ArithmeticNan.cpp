@@ -18,7 +18,7 @@ namespace {
 using AgcDriver::Graphics::Require;
 using ShaderRecompiler::ShaderStage;
 
-constexpr std::uint32_t Threads = 32;
+constexpr std::uint32_t Threads = 64;
 constexpr std::uint32_t Inputs = 4;
 constexpr std::uint32_t Results = 16;
 alignas(256) std::array<std::uint32_t, Threads * Inputs> Input{};
@@ -157,7 +157,8 @@ constexpr const char* Names[16] = {
 };
 
 void Fill(std::uint32_t tid, std::uint32_t* words) {
-    std::copy(std::begin(Rows[tid]), std::end(Rows[tid]), words);
+    const auto row = tid < 32u ? tid : 63u - tid;
+    std::copy(std::begin(Rows[row]), std::end(Rows[row]), words);
 }
 
 std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
@@ -183,7 +184,7 @@ bool IsNan16(std::uint32_t value) {
     return (value & 0x7fffu) > 0x7c00u;
 }
 
-void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode) {
+void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode, std::uint32_t waveSize) {
     for (std::uint32_t tid = 0; tid < Threads; ++tid) Fill(tid, &Input[tid * Inputs]);
     Output.fill(0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
@@ -193,10 +194,10 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     std::copy(output.begin(), output.end(), userData.begin() + 4);
     const std::span<const std::uint32_t> code(Code);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
-    const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
+    const ShaderRecompiler::ShaderComputeStageInfo compute{{waveSize, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
         {ShaderStage::Compute, reinterpret_cast<std::uintptr_t>(code.data()), code, 0, {}},
-        {32, 0, userData, compute, std::nullopt, std::nullopt, memory},
+        {waveSize, 0, userData, compute, std::nullopt, std::nullopt, memory},
         device.Target(),
         {0, 0, 0, 128}
     };
@@ -207,12 +208,12 @@ void Run(AgcDriver::VulkanDevice& device, const std::optional<ShaderRecompiler::
     device.WaitIdle();
 }
 
-void Check(const std::uint32_t (&expected)[32][16], const char* mode) {
-    for (std::uint32_t tid = 0; tid < Threads; ++tid) {
+void Check(const std::uint32_t (&expected)[32][16], const char* mode, std::uint32_t waveSize) {
+    for (std::uint32_t tid = 0; tid < waveSize; ++tid) {
         const std::uint32_t* out = &Output[tid * Results];
         for (std::uint32_t i = 0; i < 16; ++i) {
             const std::string name = std::string(mode) + " " + Names[i];
-            Expect(tid, out[i], expected[tid][i], name.c_str());
+            Expect(tid, out[i], expected[tid < 32u ? tid : 63u - tid][i], name.c_str());
         }
     }
 }
@@ -223,12 +224,14 @@ int main() {
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
-        Run(*device, std::nullopt);
-        Check(ExpectedNoIeee, "no float mode");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false});
-        Check(ExpectedNoIeee, "IEEE=0");
-        Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false});
-        Check(ExpectedIeee, "IEEE=1");
+        for (const auto waveSize : {32u, 64u}) {
+            Run(*device, std::nullopt, waveSize);
+            Check(ExpectedNoIeee, "no float mode", waveSize);
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, false, false}, waveSize);
+            Check(ExpectedNoIeee, "IEEE=0", waveSize);
+            Run(*device, ShaderRecompiler::ShaderFloatMode{0xc0u, true, true, false}, waveSize);
+            Check(ExpectedIeee, "IEEE=1", waveSize);
+        }
         std::puts("f32 arithmetic nan tests passed");
         return 0;
     } catch (const std::exception& error) {

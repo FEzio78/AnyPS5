@@ -1,5 +1,6 @@
 #include "SpirvBackend/SpirvFlowEmitter.hpp"
 #include "SpirvBackend/SpirvBda.hpp"
+#include "SpirvBackend/SpirvArithmeticOutlining.hpp"
 #include "SpirvBackend/SpirvEmitterInstructions.hpp"
 #include "SpirvBackend/SpirvMemory/SpirvSubgroup.hpp"
 #include <cstdio>
@@ -709,7 +710,48 @@ void EmitStructuredInstruction(SpirvValueEmitContext& ctx, StructuredFunctionSta
     EmitDirectInstruction(ctx, inst);
 }
 
-void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block) {
+void EmitArithmeticCall(SpirvValueEmitContext& ctx, const SpirvArithmeticGraph& graph) {
+    auto& state = ctx.state;
+    const auto* root = graph.instructions.back();
+    const auto resultType = TypeId(state, root->Type());
+    auto found = state.arithmeticFunctions.find(graph.key);
+    if (found == state.arithmeticFunctions.end()) {
+        std::vector<std::uint32_t> signature{resultType};
+        for (const auto* input : graph.inputs) signature.push_back(TypeId(state, input->Type()));
+        const auto functionType = state.module.Type(spv::OpTypeFunction, signature);
+        const auto id = state.module.AllocateId();
+        struct Restore {
+            SpirvEmitterState& state;
+            std::uint32_t label;
+            ~Restore() {
+                state.module.EndHelperFunction();
+                state.currentLabel = label;
+            }
+        };
+        state.module.BeginHelperFunction();
+        const Restore restore{state, state.currentLabel};
+        state.module.AddName(id, "arithmetic_" + std::to_string(state.arithmeticFunctions.size()));
+        state.module.AddFunction(spv::OpFunction, resultType, id, spv::FunctionControlDontInlineMask, functionType);
+        SpirvValueEmitContext helper(state);
+        for (const auto* input : graph.inputs) {
+            const auto parameter = state.module.AllocateId();
+            state.module.AddFunction(spv::OpFunctionParameter, TypeId(state, input->Type()), parameter);
+            helper.Define(*input, parameter);
+        }
+        EmitLabel(state, state.module.AllocateId());
+        for (const auto* instruction : graph.instructions) EmitDirectInstruction(helper, *instruction);
+        state.module.AddFunction(spv::OpReturnValue, helper.Def(root));
+        state.module.AddFunction(spv::OpFunctionEnd);
+        found = state.arithmeticFunctions.emplace(graph.key, id).first;
+    }
+    const auto result = state.module.AllocateId();
+    std::vector<std::uint32_t> call{spv::OpFunctionCall, resultType, result, found->second};
+    for (const auto* input : graph.inputs) call.push_back(ctx.Def(input));
+    state.module.AddFunction(call);
+    ctx.Define(*root, result);
+}
+
+void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& functionState, const IrBlock* block, const SpirvArithmeticPlan& arithmetic) {
     auto& state = ctx.state;
     state.currentBlock = block;
     EmitLabel(state, ctx.Label(block));
@@ -719,6 +761,7 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
     bool ldsWritten = true;
     bool ldsRead = false;
     for (const IrValue* inst : block->Instructions()) {
+        if (arithmetic.interiors.contains(inst)) continue;
         if (inst->Opcode() == IrOpcode::Phi) {
             if (emittedNonPhi) {
                 ctx.Fail(*inst, "appears after a non-Phi instruction");
@@ -756,7 +799,11 @@ void EmitStructuredBlock(SpirvValueEmitContext& ctx, StructuredFunctionState& fu
             SpirvValueEmitContext& lane = half == 0 ? ctx : *ctx.otherHalf;
             state.laneHalf = half;
             if (half == 0 || (inst->Opcode() != IrOpcode::Barrier && inst->Opcode() != IrOpcode::MeshAllocate)) {
-                EmitStructuredInstruction(lane, functionState, *inst);
+                if (const auto graph = arithmetic.roots.find(inst); graph != arithmetic.roots.end()) {
+                    EmitArithmeticCall(lane, graph->second);
+                } else {
+                    EmitStructuredInstruction(lane, functionState, *inst);
+                }
             }
         }
         state.laneHalf = 0;
@@ -792,6 +839,7 @@ void EmitControlFlow(SpirvModule& module, const IrProgram& program) {
 
 void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& functionState, const IrProgram& program) {
     auto& state = context.state;
+    const auto arithmetic = PlanArithmeticOutlining(program, state.laneCount, state.sharedLaneValues);
     const std::vector<IrBlock*>& blocks = program.BlockOrder();
     if (blocks.empty() || blocks.front() == nullptr) {
         context.Fail("structured control flow requires at least one block");
@@ -825,7 +873,7 @@ void EmitControlFlow(SpirvValueEmitContext& context, StructuredFunctionState& fu
         const bool stops = state.bdaStopsInvocations;
         state.continueTarget = IsContinueTarget(program, info->id);
         state.bdaStopsInvocations = stops && !state.continueTarget;
-        EmitStructuredBlock(context, functionState, block);
+        EmitStructuredBlock(context, functionState, block, arithmetic);
         functionState.blockExitLabels.emplace(block, state.currentLabel);
         EmitStructuredTerminator(context, program, *info);
         state.bdaStopsInvocations = stops;

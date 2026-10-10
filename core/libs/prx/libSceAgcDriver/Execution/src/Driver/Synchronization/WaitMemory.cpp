@@ -357,6 +357,24 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
             start = std::chrono::steady_clock::now();
         }
 
+        {
+            static const auto stallSeconds = [] { const char* text = std::getenv("APS5_DIAG_WAIT_STALL_S"); return text ? std::atoi(text) : 0; }();
+            static thread_local auto stallStart = std::chrono::steady_clock::now();
+            static thread_local const void* stallPacket = nullptr;
+            static thread_local bool stallReported = false;
+            if (stallPacket != packet.data()) {
+                stallPacket = packet.data();
+                stallStart = std::chrono::steady_clock::now();
+                stallReported = false;
+            }
+            if (stallSeconds > 0 && !stallReported && std::chrono::steady_clock::now() - stallStart > std::chrono::seconds(stallSeconds)) {
+                stallReported = true;
+                const bool wideDiag = ((packet[0] >> 8u) & 0xffu) == 0x93u;
+                const std::uint64_t currentDiag = wideDiag ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+                std::fprintf(stderr, "[DIAG stall] queue 0x%x waits %ds at 0x%llx function %u ref 0x%x mask 0x%x value 0x%llx inflight %llu done %llu\n", queue, stallSeconds, static_cast<unsigned long long>(awaited), packet[1] & 7u, packet[4], packet[5], static_cast<unsigned long long>(currentDiag), static_cast<unsigned long long>(packetsInFlight.load()), static_cast<unsigned long long>(packetsDone.load()));
+                std::fflush(stderr);
+            }
+        }
         if (!warned && std::chrono::steady_clock::now() - start > std::chrono::milliseconds(waitTimeoutMs())) {
             warned = true;
             ++outcomes.timedOut;

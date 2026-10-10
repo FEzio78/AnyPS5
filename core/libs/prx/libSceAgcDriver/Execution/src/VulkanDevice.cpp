@@ -3622,6 +3622,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    {
+        static const std::uint64_t watchedWriter = [] { const char* text = std::getenv("APS5_DIAG_WRITER"); return text ? std::strtoull(text, nullptr, 16) : 0ull; }();
+        if (watchedWriter != 0) {
+            bool hit = false;
+            for (const auto& [from, to] : resources.GpuWrites()) hit = hit || (watchedWriter >= from && watchedWriter < to);
+            if (hit || resources.HoldsLease()) std::fprintf(stderr, "[DIAG writer] dispatch cs 0x%llx %ux%ux%u queue %u writes it %d lease %d writes %zu\n", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, GuestMemory::CurrentPacket().queue, hit ? 1 : 0, resources.HoldsLease() ? 1 : 0, resources.GpuWrites().size());
+        }
+    }
     const auto packet = GuestMemory::CurrentPacket();
     const Graphics::DebugLabel label(context, commands, "dispatch cs 0x%llx %ux%ux%u%s (pm4 0x%x queue %u)", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.arguments != 0 ? " indirect" : "", packet.opcode, packet.queue);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);

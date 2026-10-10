@@ -424,6 +424,14 @@ void ReportAllThreads() {
     if (skippedCount != 0) Report("  %llu further thread(s) left out\n", static_cast<unsigned long long>(skippedCount));
 }
 
+DWORD WINAPI FlushStandardError(LPVOID) {
+    for (;;) {
+        Sleep(100);
+        std::fflush(stderr);
+    }
+    return 0;
+}
+
 DWORD WINAPI HangWatchdog(LPVOID param) {
     const auto seconds = static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(param));
     Sleep(static_cast<DWORD>(seconds * 1000ull));
@@ -482,6 +490,10 @@ const bool g_crashReportInstalled = [] {
     std::signal(SIGABRT, AbortSignalHandler);
     _set_invalid_parameter_handler(InvalidParameterHandler);
     InstallWatch();
+    if (!IsEnvironmentSet("APS5_UNBUFFERED_STDERR")) {
+        std::setvbuf(stderr, nullptr, _IOFBF, 1u << 16);
+        CreateThread(nullptr, 0, FlushStandardError, nullptr, 0, nullptr);
+    }
     if (const char* hang = std::getenv("APS5_HANG_DUMP_SECS")) {
         unsigned long long seconds = 0;
         if (hang[0] >= '0' && hang[0] <= '9') {

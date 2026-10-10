@@ -274,6 +274,7 @@ void PublishRegisteredShader(std::shared_ptr<ShaderRegistry>& registry, const st
 namespace {
 
 void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler::RecompileRequest& request) {
+    if (request.context.compute && request.context.compute->PartialGroups()) return;
     if (snapshot.codeAddress == NullPixelProgramAddress() && request.shader.stage == ShaderRecompiler::ShaderStage::Fragment && request.context.waveSize == 32u) {
         APS5_LOG_ERR("The null pixel program has no wave%u artifact for this draw; preparing it at draw", request.context.waveSize);
         return;
@@ -284,6 +285,13 @@ void ReportPreparedAtUse(const ShaderSnapshot& snapshot, const ShaderRecompiler:
     }
     if (snapshot.type != 0 || request.shader.stage != ShaderRecompiler::ShaderStage::Compute) throw std::runtime_error("AGC driver: unregistered program is not a compute shader");
     APS5_LOG_ERR("Compute shader 0x%llx was not registered; preparing its artifact at dispatch", static_cast<unsigned long long>(snapshot.codeAddress));
+}
+
+std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareAtUse(const ShaderRecompiler::RecompileRequest& request) {
+    if (!request.context.compute || !request.context.compute->PartialGroups()) return PrepareShaderWithDiagnostics(request);
+    auto generic = request;
+    generic.context.compute->partialThreads = {1, 1, 1};
+    return PrepareShaderWithDiagnostics(generic);
 }
 
 }
@@ -300,7 +308,7 @@ std::shared_ptr<const ShaderRecompiler::SourceHandle> SourceHandleFor(const Shad
         if (entry.codeOffset == codeOffset && ShaderRecompiler::MatchesPreparedShader(request, *entry.handle, key)) return entry.handle;
     }
     ReportPreparedAtUse(snapshot, request);
-    auto handle = PrepareShaderWithDiagnostics(request);
+    auto handle = PrepareAtUse(request);
     snapshot.prepared->entries.push_back({codeOffset, handle});
     return handle;
 }
@@ -343,7 +351,7 @@ ShaderRecompiler::PreparedShaderInvocation InvocationFor(const ShaderSnapshot& s
         if (auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, entry.handle, key)) return std::move(*invocation);
     }
     ReportPreparedAtUse(snapshot, request);
-    auto handle = PrepareShaderWithDiagnostics(request);
+    auto handle = PrepareAtUse(request);
     invocationRequest = request;
     invocationRequest.shader.code = ShaderRecompiler::GetPreparedCode(*handle);
     auto invocation = ShaderRecompiler::PreparedShaderInvocation::TryCreate(invocationRequest, handle, key);
@@ -537,10 +545,7 @@ std::vector<PreparedShaders::Entry> PrepareRegistered(RegisteredPreparation& pla
         entries.push_back({plan.codeOffset, PrepareShaderWithDiagnostics(request, &preparation)});
     };
     append();
-    if (request.context.compute) {
-        request.context.compute->partialThreads = {1, 1, 1};
-        append();
-    } else if (request.context.pixel) {
+    if (request.context.pixel) {
         request.layout.pushConstantSizeBytes = 0;
         append();
     }

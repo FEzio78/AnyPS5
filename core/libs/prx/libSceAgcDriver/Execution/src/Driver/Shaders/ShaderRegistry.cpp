@@ -14,6 +14,7 @@
 #include <condition_variable>
 #include <cstdio>
 #include <cstddef>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
@@ -28,7 +29,15 @@ namespace AgcDriver::DriverDetail {
 
 std::shared_ptr<const ShaderRecompiler::SourceHandle> PrepareShaderWithDiagnostics(const ShaderRecompiler::RecompileRequest& request, ShaderRecompiler::ShaderPreparationContext* preparation) {
     try {
-        return ShaderRecompiler::PrepareShader(request, preparation);
+        static const double slowSeconds = [] { const char* text = std::getenv("APS5_DUMP_SLOW_SHADERS_S"); return text ? std::atof(text) : 0.0; }();
+        const auto started = std::chrono::steady_clock::now();
+        auto prepared = ShaderRecompiler::PrepareShader(request, preparation);
+        if (slowSeconds > 0.0 && std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count() > slowSeconds) {
+            try {
+                static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));
+            } catch (...) {}
+        }
+        return prepared;
     } catch (...) {
         try {
             if (std::getenv("APS5_DUMP_SHADERS") != nullptr) static_cast<void>(Driver::dumpRequest(request.shader.codeAddress, request));

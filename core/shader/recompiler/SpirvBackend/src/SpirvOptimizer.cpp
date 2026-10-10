@@ -176,6 +176,17 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
     if (!tools.Validate(optimized.data(), optimized.size(), validatorOptions)) {
         static std::atomic<bool> reported{false};
         if (!reported.exchange(true)) std::fprintf(stderr, "[spirv] optimizer produced an invalid module; using it unoptimized: %s\n", diagnostics.substr(0, diagnostics.find('\n')).c_str());
+        if (std::getenv("APS5_DUMP_SPIRV_FALLBACK") != nullptr) {
+            static std::atomic<int> dumped{0};
+            const int index = dumped.fetch_add(1);
+            if (index < 8) {
+                const std::string path = "spirv_fallback_" + std::to_string(index) + (specialize ? "_specialized" : "") + ".spv";
+                if (std::FILE* file = std::fopen(path.c_str(), "wb")) {
+                    std::fwrite(spirv.data(), sizeof(std::uint32_t), spirv.size(), file);
+                    std::fclose(file);
+                }
+            }
+        }
         return std::vector<std::uint32_t>(spirv.begin(), spirv.end());
     }
     {

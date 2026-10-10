@@ -118,6 +118,12 @@ The game runs on the first Vulkan 1.1 device with graphics and compute queues an
 
 GPU results in storage images and render targets stay on the GPU until something reads their memory. A title that frees such an image after waiting for its GPU work and reuses the memory can have its new data overwritten when the results are stored later ([TechnicalDebt](../dev/TechnicalDebt.md)). `APS5_STORE_AT_FLIP=1` stores every pending result when a display buffer is flipped, at the cost of one write-back per pending image and frame. Any other value stops the title at its first flip.
 
+### Vulkan debugging
+
+- `APS5_VULKAN_VALIDATION=1` enables `VK_LAYER_KHRONOS_validation` and prints its messages to stderr as `[vulkan] <severity> <VUID>: <message>`. Each message ID is printed at most 10 times. Debug printf output (`DEBUG-PRINTF`) is printed as well. The layer comes with the Vulkan SDK; a layer built elsewhere can be added with the loader's `VK_ADD_LAYER_PATH`. Its settings, such as GPU-assisted validation or debug printf, are chosen with `vkconfig` or the `VK_LAYER_*` variables. Without the layer, the start fails with an error.
+- `APS5_VULKAN_DEBUG=1` names Vulkan objects after their guest resources (`storage 0x<address> <width>x<height> ...`, `texture ...`, `depth ...`, compute pipelines as `cs 0x<program address>`, graphics pipelines by stage and variant), and labels each recorded dispatch and draw with its program or targets and its PM4 packet and queue. RenderDoc, Nsight Graphics, Radeon GPU Detective and the validation layer show these names. The validation option implies it.
+- When the device supports `VK_EXT_device_fault`, a lost device (`VK_ERROR_DEVICE_LOST`) prints the driver's fault description, the faulting GPU addresses with their range and the vendor fault codes. A vendor crash dump, when the driver provides one, is written to `aps5-device-fault-<time>.bin` in the working directory. `APS5_NO_DEVICE_FAULT=1` leaves the extension off.
+
 ## Exit codes
 
 `0`: conversion succeeded. `1`: invalid arguments. `2`: conversion failed; the error is printed to stderr. With `--autorun`, successful conversion returns the launched application's exit code.

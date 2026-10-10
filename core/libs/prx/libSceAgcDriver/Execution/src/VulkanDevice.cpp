@@ -12,6 +12,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PresentationScaler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VulkanDebug.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayFormat.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureDetiler.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -59,6 +60,7 @@ namespace AgcDriver {
 namespace {
 
 void check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) Graphics::ReportDeviceLost(operation);
     if (result != VK_SUCCESS) {
         throw std::runtime_error(std::string(operation) + ": Vulkan result " + std::to_string(result));
     }
@@ -186,6 +188,9 @@ struct VulkanDevice::State {
     PFN_vkGetInstanceProcAddr instanceProc = nullptr;
     PFN_vkGetDeviceProcAddr deviceProc = nullptr;
     VkInstance instance = VK_NULL_HANDLE;
+    VkDebugUtilsMessengerEXT messenger = VK_NULL_HANDLE;
+    bool debugUtils = false;
+    bool deviceFault = false;
     VkDevice device = VK_NULL_HANDLE;
     VkPhysicalDevice physical = VK_NULL_HANDLE;
     VkQueue queue = VK_NULL_HANDLE;
@@ -644,9 +649,11 @@ struct VulkanDevice::State {
             if (pool != VK_NULL_HANDLE) {
                 destroyPool(device, pool, nullptr);
             }
+            if (deviceFault) Graphics::UnregisterDeviceFaultSource(device);
             destroyDevice(device, nullptr);
         }
         if (instance != VK_NULL_HANDLE) {
+            if (messenger) reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(instanceProc(instance, "vkDestroyDebugUtilsMessengerEXT"))(instance, messenger, nullptr);
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
@@ -696,11 +703,46 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
                 throw std::runtime_error(std::string("Vulkan presentation: required instance extension missing: ") + name);
             }
         }
-        create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
-        create.ppEnabledExtensionNames = instanceExtensions.data();
     }
+    const bool validation = Graphics::VulkanValidationRequested();
+    state->debugUtils = validation || Graphics::VulkanDebugNamesRequested();
+    constexpr const char* validationLayer = "VK_LAYER_KHRONOS_validation";
+    const auto messengerInfo = Graphics::VulkanValidationMessengerInfo();
+    if (state->debugUtils) {
+        const auto enumerateExtensions = state->InstanceFunction<PFN_vkEnumerateInstanceExtensionProperties>("vkEnumerateInstanceExtensionProperties");
+        const auto offers = [&](const char* layer, const char* extension) {
+            std::uint32_t count = 0;
+            if (enumerateExtensions(layer, &count, nullptr) != VK_SUCCESS) return false;
+            std::vector<VkExtensionProperties> offered(count);
+            if (enumerateExtensions(layer, &count, offered.data()) != VK_SUCCESS) return false;
+            return std::any_of(offered.begin(), offered.end(), [&](const auto& item) { return std::strcmp(item.extensionName, extension) == 0; });
+        };
+        if (validation) {
+            std::uint32_t layerCount = 0;
+            const auto enumerateLayers = state->InstanceFunction<PFN_vkEnumerateInstanceLayerProperties>("vkEnumerateInstanceLayerProperties");
+            check(enumerateLayers(&layerCount, nullptr), "vkEnumerateInstanceLayerProperties");
+            std::vector<VkLayerProperties> layers(layerCount);
+            check(enumerateLayers(&layerCount, layers.data()), "vkEnumerateInstanceLayerProperties");
+            if (std::none_of(layers.begin(), layers.end(), [&](const auto& layer) { return std::strcmp(layer.layerName, validationLayer) == 0; })) {
+                throw std::runtime_error("APS5_VULKAN_VALIDATION=1: the Vulkan loader finds no VK_LAYER_KHRONOS_validation (install the Vulkan SDK)");
+            }
+            create.enabledLayerCount = 1;
+            create.ppEnabledLayerNames = &validationLayer;
+            create.pNext = &messengerInfo;
+        }
+        if (!offers(nullptr, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) && !(validation && offers(validationLayer, VK_EXT_DEBUG_UTILS_EXTENSION_NAME))) {
+            throw std::runtime_error("APS5_VULKAN_DEBUG=1: the Vulkan loader offers no VK_EXT_debug_utils");
+        }
+        instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+    create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
+    create.ppEnabledExtensionNames = instanceExtensions.empty() ? nullptr : instanceExtensions.data();
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (validation) {
+        check(state->InstanceFunction<PFN_vkCreateDebugUtilsMessengerEXT>("vkCreateDebugUtilsMessengerEXT")(state->instance, &messengerInfo, nullptr, &state->messenger), "vkCreateDebugUtilsMessengerEXT");
+        std::fprintf(stderr, "[vulkan] validation layer enabled (APS5_VULKAN_VALIDATION=1); its settings come from vkconfig or VK_LAYER_* variables\n");
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
@@ -1281,6 +1323,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
         pipelineFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &pipelineFeatures;
     }
+    VkPhysicalDeviceFaultFeaturesEXT faultFeatures{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+    if (hasExtension(VK_EXT_DEVICE_FAULT_EXTENSION_NAME) && std::getenv("APS5_NO_DEVICE_FAULT") == nullptr) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &faultFeatures};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+        state->deviceFault = faultFeatures.deviceFault == VK_TRUE;
+    }
+    const bool faultVendorBinary = state->deviceFault && faultFeatures.deviceFaultVendorBinary == VK_TRUE;
+    if (state->deviceFault) {
+        faultFeatures = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FAULT_FEATURES_EXT};
+        faultFeatures.deviceFault = VK_TRUE;
+        faultFeatures.deviceFaultVendorBinary = faultVendorBinary ? VK_TRUE : VK_FALSE;
+        faultFeatures.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &faultFeatures;
+        deviceExtensions.push_back(VK_EXT_DEVICE_FAULT_EXTENSION_NAME);
+    }
     bdaFeatures.pNext = &byteFeatures;
     VkPhysicalDeviceRobustness2FeaturesEXT robustness2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     Graphics::Require(hasExtension(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME), "shader runtime requires VK_EXT_robustness2");
@@ -1298,6 +1355,7 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     auto shaderProfile = std::make_unique<const ShaderDeviceProfile>(buildTarget(), deviceInfo, state->properties.limits);
     check(state->InstanceFunction<PFN_vkCreateDevice>("vkCreateDevice")(selected, &deviceInfo, nullptr, &state->device), "vkCreateDevice");
     state->shaderProfile = std::move(shaderProfile);
+    if (state->deviceFault) Graphics::RegisterDeviceFaultSource(state->device, state->DeviceFunction<PFN_vkGetDeviceFaultInfoEXT>("vkGetDeviceFaultInfoEXT"), faultVendorBinary);
     state->DeviceFunction<PFN_vkGetDeviceQueue>("vkGetDeviceQueue")(state->device, family, 0, &state->queue);
     APS5_LOG_OUT("Vulkan device ready device=%p queue=%p family=%u", reinterpret_cast<void*>(state->device), reinterpret_cast<void*>(state->queue), family);
     VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -2726,6 +2784,11 @@ Graphics::Context VulkanDevice::buildContext() const {
         state->hostImportAlignment
     };
     context.dmaBufImport = state->dmaBufImport;
+    if (state->debugUtils) {
+        context.setObjectName = reinterpret_cast<PFN_vkSetDebugUtilsObjectNameEXT>(state->deviceProc(state->device, "vkSetDebugUtilsObjectNameEXT"));
+        context.beginLabel = reinterpret_cast<PFN_vkCmdBeginDebugUtilsLabelEXT>(state->deviceProc(state->device, "vkCmdBeginDebugUtilsLabelEXT"));
+        context.endLabel = reinterpret_cast<PFN_vkCmdEndDebugUtilsLabelEXT>(state->deviceProc(state->device, "vkCmdEndDebugUtilsLabelEXT"));
+    }
     context.recorder = state->recorder.get();
     context.descriptorCache = state->descriptorCache.get();
     context.samplerCache = state->samplerCache.get();
@@ -3555,6 +3618,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
         recorder.EndGpuTiming(timing);
         ++d.preBarriersRecorded;
     }
+    const auto packet = GuestMemory::CurrentPacket();
+    const Graphics::DebugLabel label(context, commands, "dispatch cs 0x%llx %ux%ux%u%s (pm4 0x%x queue %u)", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.arguments != 0 ? " indirect" : "", packet.opcode, packet.queue);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
     resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
@@ -3800,6 +3865,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         objects->destroyModule(objects->device, objects->module, nullptr);
         objects->module = VK_NULL_HANDLE;
         Graphics::LogPipelineStatistics_nid_no_patch(context, objects->pipeline);
+        Graphics::NameObject(context, VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(objects->pipeline), "cs 0x%llx variant %016llx", static_cast<unsigned long long>(programAddress), static_cast<unsigned long long>(shader.PipelineVariantId()));
         timing.Mark("pipeline_create");
         if (pipelineKey != 0) {
             // Find-or-insert: objects another dispatch of the variant mapped meanwhile serve this

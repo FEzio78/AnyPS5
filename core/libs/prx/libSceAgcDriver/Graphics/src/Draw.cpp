@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VulkanDebug.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/General.hpp"
@@ -1299,6 +1300,8 @@ struct IndirectRecord {
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 void recordDrawCommands(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset) {
+    const auto packet = GuestMemory::CurrentPacket();
+    const DebugLabel label(context, commands, "draw %u x%u%s rt 0x%llx %ux%u depth 0x%llx (pm4 0x%x queue %u)", draw.indexCount, draw.instanceCount, indirect != nullptr ? " indirect" : "", static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.depth ? state.depth->address : 0), packet.opcode, packet.queue);
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {

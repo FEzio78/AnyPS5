@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VulkanDebug.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -380,6 +381,27 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
         _modules.clear();
         timing.Mark("create");
+        if (context.setObjectName != nullptr) {
+            const auto stageName = [](VkShaderStageFlagBits stage) {
+                switch (stage) {
+                    case VK_SHADER_STAGE_VERTEX_BIT: return "vs";
+                    case VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT: return "hs";
+                    case VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT: return "ds";
+                    case VK_SHADER_STAGE_GEOMETRY_BIT: return "gs";
+                    case VK_SHADER_STAGE_MESH_BIT_EXT: return "ms";
+                    case VK_SHADER_STAGE_FRAGMENT_BIT: return "ps";
+                    default: return "stage";
+                }
+            };
+            std::string name = "graphics";
+            for (const auto& shader : shaders) {
+                char part[48];
+                std::snprintf(part, sizeof(part), " %s %016llx", stageName(VulkanStage(shader.stage)), static_cast<unsigned long long>(shader.program->PipelineVariantId()));
+                name += part;
+            }
+            NameObject(context, VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(pipeline), "%s", name.c_str());
+            if (backFaces != VK_NULL_HANDLE) NameObject(context, VK_OBJECT_TYPE_PIPELINE, reinterpret_cast<std::uint64_t>(backFaces), "%s (back faces)", name.c_str());
+        }
         LogPipelineStatistics_nid_no_patch(context, pipeline);
     } catch (...) {
         release();

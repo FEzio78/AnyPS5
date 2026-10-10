@@ -11,6 +11,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/VulkanDebug.hpp"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -278,6 +279,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");
+        NameObject(context, VK_OBJECT_TYPE_IMAGE, reinterpret_cast<std::uint64_t>(image), "texture 0x%llx %ux%u format %u", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.format);
         owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
 
         VkMemoryRequirements requirements{};
@@ -740,6 +742,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage storage");
+        NameObject(context, VK_OBJECT_TYPE_IMAGE, reinterpret_cast<std::uint64_t>(image), "storage 0x%llx %ux%u mip %u format %u", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, mipLevel, descriptor.format);
         VkMemoryRequirements requirements{};
         context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
         VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};

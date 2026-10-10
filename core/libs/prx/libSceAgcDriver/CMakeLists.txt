@@ -179,6 +179,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/VulkanDebug.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
@@ -542,6 +543,21 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+add_test_executable(agc_vulkan_debug_tests EXCLUDE_FROM_ALL tests/VulkanDebug.cpp)
+target_include_directories(agc_vulkan_debug_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
+target_link_libraries(agc_vulkan_debug_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_vulkan_debug_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_vulkan_debug_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_vulkan_debug_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    add_test(NAME agc_vulkan_debug COMMAND agc_vulkan_debug_tests)
+    set_tests_properties(agc_vulkan_debug PROPERTIES WORKING_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}")
+    if(WIN32)
+        set_tests_properties(agc_vulkan_debug PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+    endif()
+endif()
+
 add_test_executable(agc_display_buffer_dcc_tests EXCLUDE_FROM_ALL tests/DisplayBufferDcc.cpp)
 target_include_directories(agc_display_buffer_dcc_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include)
 target_link_libraries(agc_display_buffer_dcc_tests PRIVATE libSceAgcDriver libc)
@@ -823,6 +839,7 @@ add_test_executable(agc_driver_graphics_tests EXCLUDE_FROM_ALL
         Graphics/src/Recorder.cpp
         Graphics/src/ParallelCompare.cpp
         Graphics/src/ShaderInputState.cpp
+        Graphics/src/VulkanDebug.cpp
         ${agcTextureDetileShaderHeader}
         ${agcCmaskClearShaderHeader}
         ${agcMeshArgumentsShaderHeader}
@@ -861,6 +878,7 @@ add_test_executable(agc_driver_bda_device_tests EXCLUDE_FROM_ALL
         Execution/src/BdaFeatures.cpp
         Graphics/src/Resources.cpp
         Graphics/src/BufferAddress.cpp
+        Graphics/src/VulkanDebug.cpp
 )
 
 target_include_directories(agc_driver_bda_device_tests PRIVATE

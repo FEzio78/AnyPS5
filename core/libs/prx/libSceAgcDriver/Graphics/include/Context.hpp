@@ -29,7 +29,10 @@ inline void Require(bool condition, const std::string& reason) {
     if (!condition) throw std::runtime_error("AGC graphics: " + reason);
 }
 
+void ReportDeviceLost(const char* operation);
+
 inline void Check(VkResult result, const char* operation) {
+    if (result == VK_ERROR_DEVICE_LOST) ReportDeviceLost(operation);
     if (result != VK_SUCCESS) throw std::runtime_error(std::string("AGC graphics: ") + operation + ": Vulkan result " + std::to_string(result));
 }
 
@@ -167,6 +170,9 @@ struct Context {
     bool provokingVertexLast = false;
     bool provokingVertexModePerPipeline = false;
     bool singlePassStorage = false;
+    PFN_vkSetDebugUtilsObjectNameEXT setObjectName = nullptr;
+    PFN_vkCmdBeginDebugUtilsLabelEXT beginLabel = nullptr;
+    PFN_vkCmdEndDebugUtilsLabelEXT endLabel = nullptr;
 
     template<typename TFunction>
     TFunction Function(const char* name) const {

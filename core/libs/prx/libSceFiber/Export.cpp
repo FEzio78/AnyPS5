@@ -189,6 +189,12 @@ static void SetBounds(const StackBounds& bounds) {
 
 static void PinStack(const void* context, std::uint64_t bytes) {
     GuestArena::GuestArenaPinWritable_nid_postfix(context, static_cast<std::size_t>(bytes));
+    static const bool guard = std::getenv("APS5_FIBER_GUARD") != nullptr;
+    if (guard && bytes > 0x2000 && (reinterpret_cast<std::uintptr_t>(context) & 0xfff) == 0) {
+        DWORD old = 0;
+        VirtualProtect(const_cast<void*>(context), 0x1000, PAGE_NOACCESS, &old);
+        std::fprintf(stderr, "[fiber] guard page at %p\n", context);
+    }
 }
 
 static void UnpinStack(const void* context, std::uint64_t bytes) {

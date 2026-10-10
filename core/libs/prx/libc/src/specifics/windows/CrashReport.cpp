@@ -444,6 +444,17 @@ void ReportBacktrace(const char* what, bool reportThreads) {
         DescribeAddress(reinterpret_cast<std::uint64_t>(frames[i]), line, sizeof(line));
         Report("    #%u %s\n", static_cast<unsigned>(i), line);
     }
+    Report("  stack return address candidates:\n");
+    const auto top = reinterpret_cast<std::uint64_t>(&frames[0]);
+    int printed = 0;
+    for (std::uint64_t slot = top; printed < 32 && slot < top + 0x4000; slot += 8) {
+        if (!IsReadable(slot)) break;
+        const auto value = *reinterpret_cast<const std::uint64_t*>(slot);
+        if (!IsExecutable(value)) continue;
+        DescribeAddress(value, line, sizeof(line));
+        Report("    [+0x%llx] %s\n", static_cast<unsigned long long>(slot - top), line);
+        ++printed;
+    }
     if (reportThreads) ReportAllThreads();
     std::fflush(stderr);
 }

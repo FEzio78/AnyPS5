@@ -1709,10 +1709,9 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
     ImageProfile::Scope imageTiming(ImageProfile::Baseline, "storage guest baseline");
     comparedGuestBytes = {};
     const bool complete = layers == nullptr || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; });
-    for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-        if (layers != nullptr && !(*layers)[layer]) continue;
-        const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-        GuestMemory::ReadCommitted(layerBegin(layer), std::span(original).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+    const auto runs = unitRuns(layers != nullptr ? *layers : std::vector<bool>(trackedLayers, true));
+    for (const auto& [begin, end] : runs) {
+        GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));
     }
     originalValid = originalValid || complete;
 }

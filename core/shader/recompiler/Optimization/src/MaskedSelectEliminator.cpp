@@ -1,6 +1,9 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/DeadCodeEliminator.hpp"
 #include "RdnaDecoder/RdnaInstruction.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdint>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -13,11 +16,55 @@ namespace {
 constexpr std::size_t VisitLimit = 4096;
 constexpr std::uint32_t DepthLimit = 8;
 
+class VisitedValues {
+public:
+    void Reset() {
+        if (slots.empty()) {
+            slots.assign(Capacity, nullptr);
+            stamps.assign(Capacity, 0u);
+        }
+        if (++epoch == 0u) {
+            std::fill(stamps.begin(), stamps.end(), 0u);
+            epoch = 1u;
+        }
+        count = 0;
+    }
+    bool Insert(const IrValue* value) {
+        auto index = (reinterpret_cast<std::uintptr_t>(value) >> 4u) * 0x9e3779b97f4a7c15ull >> (64u - CapacityBits);
+        while (stamps[index] == epoch) {
+            if (slots[index] == value) return false;
+            index = (index + 1u) & (Capacity - 1u);
+        }
+        slots[index] = value;
+        stamps[index] = epoch;
+        ++count;
+        return true;
+    }
+    bool Contains(const IrValue* value) const {
+        auto index = (reinterpret_cast<std::uintptr_t>(value) >> 4u) * 0x9e3779b97f4a7c15ull >> (64u - CapacityBits);
+        while (stamps[index] == epoch) {
+            if (slots[index] == value) return true;
+            index = (index + 1u) & (Capacity - 1u);
+        }
+        return false;
+    }
+    std::size_t Size() const { return count; }
+
+private:
+    static constexpr std::size_t CapacityBits = 14;
+    static constexpr std::size_t Capacity = std::size_t{1} << CapacityBits;
+    static_assert(Capacity >= 2u * (VisitLimit + 2u));
+    std::vector<const IrValue*> slots;
+    std::vector<std::uint32_t> stamps;
+    std::uint32_t epoch = 0;
+    std::size_t count = 0;
+};
+
 bool isSelect(IrOpcode opcode) {
     return opcode == IrOpcode::SelectU1 || opcode == IrOpcode::SelectU32 || opcode == IrOpcode::SelectF32;
 }
 
-bool isLaneLocal(IrOpcode opcode) {
+bool computeLaneLocal(IrOpcode opcode) {
     if (IrOpcodeHasSideEffects(opcode)) return false;
     switch (opcode) {
         case IrOpcode::Identity:
@@ -175,7 +222,7 @@ bool isLaneLocal(IrOpcode opcode) {
     }
 }
 
-bool readsOnlyWhereActive(IrOpcode opcode) {
+bool computeReadsOnlyWhereActive(IrOpcode opcode) {
     switch (opcode) {
         case IrOpcode::LoadBufferU8:
         case IrOpcode::LoadBufferU16:
@@ -206,6 +253,30 @@ bool readsOnlyWhereActive(IrOpcode opcode) {
         default:
             return false;
     }
+}
+
+struct OpcodeTables {
+    std::array<std::uint8_t, static_cast<std::size_t>(IrOpcode::Count)> laneLocal{};
+    std::array<std::uint8_t, static_cast<std::size_t>(IrOpcode::Count)> readsOnlyWhereActive{};
+    OpcodeTables() {
+        for (std::size_t index = 0; index < laneLocal.size(); ++index) {
+            laneLocal[index] = computeLaneLocal(static_cast<IrOpcode>(index)) ? 1u : 0u;
+            readsOnlyWhereActive[index] = computeReadsOnlyWhereActive(static_cast<IrOpcode>(index)) ? 1u : 0u;
+        }
+    }
+};
+
+const OpcodeTables& opcodeTables() {
+    static const OpcodeTables tables;
+    return tables;
+}
+
+bool isLaneLocal(IrOpcode opcode) {
+    return opcodeTables().laneLocal[static_cast<std::size_t>(opcode)] != 0u;
+}
+
+bool readsOnlyWhereActive(IrOpcode opcode) {
+    return opcodeTables().readsOnlyWhereActive[static_cast<std::size_t>(opcode)] != 0u;
 }
 
 bool isExplicitLodSample(const IrProgram& program, const IrValue& value) {
@@ -337,22 +408,140 @@ std::unordered_set<const IrBlock*> blocksOutsideLoops(const IrProgram& program) 
     return result;
 }
 
-bool unobservedWhereMasked(const IrProgram& program, const std::unordered_set<const IrBlock*>& once, const IrValue& select, const IrValue* mask) {
+struct Witness {
+    const IrValue* user = nullptr;
+    std::uint32_t operand = 0;
+};
+
+constexpr std::size_t WitnessHopLimit = 1u << 20;
+
+class WalkState {
+public:
+    void Reset(const IrProgram& program) {
+        std::uint32_t maxValueId = 0;
+        std::uint32_t maxBlockId = 0;
+        for (const IrBlock* block : program.BlockOrder()) {
+            maxBlockId = std::max(maxBlockId, block->Id());
+            for (const IrValue* inst : block->Instructions()) maxValueId = std::max(maxValueId, inst->Id());
+        }
+        witnesses.assign(static_cast<std::size_t>(maxValueId) + 1u, Witness{});
+        rejectedStamp.assign(static_cast<std::size_t>(maxValueId) + 1u, 0u);
+        queuedStamp.assign(static_cast<std::size_t>(maxValueId) + 1u, 0u);
+        walk = 0;
+        once.assign(static_cast<std::size_t>(maxBlockId) + 1u, 0u);
+        for (const IrBlock* block : blocksOutsideLoops(program)) once[block->Id()] = 1u;
+    }
+    bool Once(const IrBlock* block) const { return block != nullptr && block->Id() < once.size() && once[block->Id()] != 0u; }
+    Witness* WitnessOf(const IrValue* value) { return value->Id() < witnesses.size() ? &witnesses[value->Id()] : nullptr; }
+    void BeginWalk() { ++walk; }
+    bool Rejected(const IrValue* value) const { return value->Id() < rejectedStamp.size() && rejectedStamp[value->Id()] == walk; }
+    void Reject(const IrValue* value) { if (value->Id() < rejectedStamp.size()) rejectedStamp[value->Id()] = walk; }
+    bool Queued(const IrValue* value) const { return value->Id() < queuedStamp.size() && queuedStamp[value->Id()] == walk; }
+    void MarkQueued(const IrValue* value) { if (value->Id() < queuedStamp.size()) queuedStamp[value->Id()] = walk; }
+
+    VisitedValues visited;
+    std::vector<const IrValue*> pending;
+    std::vector<const IrValue*> reverseQueue;
+    std::vector<const IrValue*> chain;
+
+private:
+    std::vector<Witness> witnesses;
+    std::vector<std::uint32_t> rejectedStamp;
+    std::vector<std::uint32_t> queuedStamp;
+    std::vector<std::uint8_t> once;
+    std::uint32_t walk = 0;
+};
+
+const IrValue* edgeControl(const IrValue* user, std::size_t operand) {
+    if (isSelect(user->Opcode()) && operand == 1u) return user->Argument(0);
+    if (user->Opcode() == IrOpcode::LogicalAnd && operand < 2u) return user->Argument(1u - operand);
+    if (readsOnlyWhereActive(user->Opcode()) && operand + 1u < user->ArgumentCount()) return user->Argument(user->ArgumentCount() - 1u);
+    return nullptr;
+}
+
+bool isBadUser(const IrProgram& program, const IrValue& user) {
+    return !user.IsPhi() && !isLaneLocal(user.Opcode()) && !isExplicitLodSample(program, user);
+}
+
+bool witnessProvesFailure(const IrProgram& program, WalkState& state, const IrValue* start, const IrValue* mask) {
     const auto waveSize = program.WaveSize();
-    std::vector<const IrValue*> pending{&select};
-    std::unordered_set<const IrValue*> visited{&select};
+    auto& chain = state.chain;
+    chain.clear();
+    const IrValue* value = start;
+    bool proven = false;
+    for (std::size_t hops = 0; hops < WitnessHopLimit; ++hops) {
+        if (state.Rejected(value)) break;
+        const Witness* witness = state.WitnessOf(value);
+        if (witness == nullptr || witness->user == nullptr) break;
+        chain.push_back(value);
+        const IrValue* user = witness->user;
+        if (witness->operand >= user->ArgumentCount() || user->Argument(witness->operand) != value) break;
+        if (!state.Once(user->Parent())) { proven = true; break; }
+        const IrValue* control = edgeControl(user, witness->operand);
+        if (control != nullptr && implies(control, mask, waveSize)) break;
+        if (isBadUser(program, *user)) { proven = true; break; }
+        value = user;
+    }
+    if (!proven) {
+        for (const IrValue* rejected : chain) state.Reject(rejected);
+    }
+    return proven;
+}
+
+void recordWitnesses(WalkState& state, const IrValue* from, const IrValue* user, std::size_t operand, const IrValue* mask, std::uint32_t waveSize) {
+    auto& queue = state.reverseQueue;
+    queue.clear();
+    if (Witness* witness = state.WitnessOf(from)) *witness = Witness{user, static_cast<std::uint32_t>(operand)};
+    state.MarkQueued(from);
+    queue.push_back(from);
+    for (std::size_t next = 0; next < queue.size(); ++next) {
+        const IrValue* target = queue[next];
+        const auto count = target->ArgumentCount();
+        for (std::size_t index = 0; index < count; ++index) {
+            const IrValue* argument = target->Argument(index);
+            if (argument == nullptr || !state.visited.Contains(argument)) continue;
+            Witness* witness = state.WitnessOf(argument);
+            if (witness == nullptr || state.Queued(argument)) continue;
+            const IrValue* control = edgeControl(target, index);
+            if (control != nullptr && implies(control, mask, waveSize)) continue;
+            state.MarkQueued(argument);
+            *witness = Witness{target, static_cast<std::uint32_t>(index)};
+            queue.push_back(argument);
+        }
+    }
+}
+
+bool unobservedWhereMasked(const IrProgram& program, WalkState& state, const IrValue& select, const IrValue* mask) {
+    const auto waveSize = program.WaveSize();
+    state.BeginWalk();
+    if (witnessProvesFailure(program, state, &select, mask)) return false;
+    auto& pending = state.pending;
+    auto& visited = state.visited;
+    pending.clear();
+    pending.push_back(&select);
+    visited.Reset();
+    visited.Insert(&select);
     while (!pending.empty()) {
         const IrValue* value = pending.back();
         pending.pop_back();
         for (const IrUse& use : value->OperandUses()) {
             const IrValue* user = use.user;
-            if (user->Parent() == nullptr || !once.contains(user->Parent())) return false;
-            if (isSelect(user->Opcode()) && use.operand == 1u && implies(user->Argument(0), mask, waveSize)) continue;
-            if (user->Opcode() == IrOpcode::LogicalAnd && use.operand < 2u && implies(user->Argument(1u - use.operand), mask, waveSize)) continue;
-            if (readsOnlyWhereActive(user->Opcode()) && use.operand + 1u < user->ArgumentCount() && implies(user->Argument(user->ArgumentCount() - 1u), mask, waveSize)) continue;
-            if (!user->IsPhi() && !isLaneLocal(user->Opcode()) && !isExplicitLodSample(program, *user)) return false;
-            if (visited.insert(user).second) {
-                if (visited.size() > VisitLimit) return false;
+            if (!state.Once(user->Parent())) {
+                recordWitnesses(state, value, user, use.operand, mask, waveSize);
+                return false;
+            }
+            const IrValue* control = edgeControl(user, use.operand);
+            if (control != nullptr && implies(control, mask, waveSize)) continue;
+            if (isBadUser(program, *user)) {
+                recordWitnesses(state, value, user, use.operand, mask, waveSize);
+                return false;
+            }
+            if (!visited.Contains(user) && witnessProvesFailure(program, state, user, mask)) {
+                recordWitnesses(state, value, user, use.operand, mask, waveSize);
+                return false;
+            }
+            if (visited.Insert(user)) {
+                if (visited.Size() > VisitLimit) return false;
                 pending.push_back(user);
             }
         }
@@ -364,12 +553,13 @@ bool unobservedWhereMasked(const IrProgram& program, const std::unordered_set<co
 
 MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& program) const {
     MaskedSelectEliminationStats stats;
-    const auto once = blocksOutsideLoops(program);
+    static thread_local WalkState state;
+    state.Reset(program);
     bool changed = true;
     while (changed) {
         changed = false;
         for (auto blockIt = program.BlockOrder().rbegin(); blockIt != program.BlockOrder().rend(); ++blockIt) {
-            const bool single = once.contains(*blockIt);
+            const bool single = state.Once(*blockIt);
             auto& instructions = (*blockIt)->Instructions();
             auto it = instructions.end();
             while (it != instructions.begin()) {
@@ -377,7 +567,7 @@ MaskedSelectEliminationStats MaskedSelectEliminator::Eliminate(IrProgram& progra
                 IrValue* inst = *it;
                 if (!isSelect(inst->Opcode()) || inst->ArgumentCount() != 3u || !inst->HasUses()) continue;
                 const IrValue* mask = inst->Argument(0)->Resolve();
-                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !unobservedWhereMasked(program, once, *inst, mask))) continue;
+                if (!alwaysTrue(mask, program.WaveSize()) && (!single || !unobservedWhereMasked(program, state, *inst, mask))) continue;
                 inst->ReplaceAllUsesWith(inst->Argument(1));
                 inst->Invalidate();
                 inst->SetParent(nullptr);

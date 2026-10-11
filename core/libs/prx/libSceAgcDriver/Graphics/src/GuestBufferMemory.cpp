@@ -1526,6 +1526,8 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
         }
     }
     for (auto& mirror : mirrors) {
+        static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
+        if (trace) std::fprintf(stderr, "[resident-heap] export 0x%llx+0x%llx for %s 0x%llx+0x%zx force=%u spans=%zu\n", static_cast<unsigned long long>(mirror->base), static_cast<unsigned long long>(mirror->bytes), GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()), static_cast<unsigned long long>(address), bytes, static_cast<unsigned>(force), mirror->pendingWrites.size());
         for (const auto& [begin, end] : mirror->pendingWrites) {
             const auto offset = static_cast<std::size_t>(begin - mirror->base);
             const auto length = static_cast<std::size_t>(end - begin);

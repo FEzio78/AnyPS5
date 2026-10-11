@@ -279,7 +279,7 @@ std::vector<std::byte> Texture::ReadColorPlane(const GuestTextureResource& descr
     return Graphics::ReadColorPlane(context, storageSource != nullptr ? storageSource->Image() : image, layout, descriptor, descriptor.baseLevel);
 }
 
-Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
+Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context), depthCompare(depthCompare) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
@@ -510,28 +510,162 @@ bool Texture::CanCopyFrom(const StorageTexture& source, const GuestTextureResour
     return descriptor.baseAddress == from.baseAddress && descriptor.pipeBankXor == from.pipeBankXor && descriptor.width == from.width && descriptor.height == from.height && descriptor.dimension == from.dimension && descriptor.tileMode == from.tileMode && descriptor.mipCount <= from.mipCount && descriptor.depthOrLastArray == from.depthOrLastArray && BytesPerElement(descriptor.format) == BytesPerElement(from.format) && BlockWidth(descriptor.format) == BlockWidth(from.format);
 }
 
-Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components) : context(context), storageSource(source) {
+bool Texture::CanDepthCopyFrom(const Context& context, const StorageTexture& source, const GuestTextureResource& descriptor) {
+    if (!CanCopyFrom(source, descriptor) || descriptor.dimension == TextureDimension::k3D || descriptor.mipCount != source.Descriptor().mipCount) return false;
+    const auto format = ResolveTextureFormat(descriptor.format);
+    if (format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16_UNORM) return false;
+    const auto sourceFormat = StorageFormatForGuest(context, source.Descriptor().format);
+    if (sourceFormat != format) return false;
+    VkFormatProperties properties{};
+    context.formatProperties(context.physical, format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM, &properties);
+    return (properties.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) == (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+}
+
+namespace {
+
+struct DepthCompareCounters {
+    std::atomic<std::uint64_t> gpu{0};
+    std::atomic<std::uint64_t> snapshot{0};
+    std::atomic<std::uint64_t> copied{0};
+    std::atomic<std::uint64_t> skipped{0};
+    std::atomic<std::int64_t> reported{0};
+};
+
+DepthCompareCounters& DepthCounts() {
+    static DepthCompareCounters counts;
+    return counts;
+}
+
+void ReportDepthCounts() {
+    static const bool enabled = std::getenv("APS5_PROFILE_IMAGES") != nullptr || std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!enabled) return;
+    auto& counts = DepthCounts();
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = counts.reported.load();
+    if (now - last < 10000 || !counts.reported.compare_exchange_strong(last, now)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[depth-compare] served GPU copies %llu, snapshots %llu; copies made %llu, skipped by version %llu (cumulative)\n", static_cast<unsigned long long>(counts.gpu.load()), static_cast<unsigned long long>(counts.snapshot.load()), static_cast<unsigned long long>(counts.copied.load()), static_cast<unsigned long long>(counts.skipped.load()));
+}
+
+}
+
+void Texture::NoteDepthCompareUse() const {
+    if (!depthCompare) return;
+    (HasDepthCopy() ? DepthCounts().gpu : DepthCounts().snapshot).fetch_add(1, std::memory_order_relaxed);
+    ReportDepthCounts();
+}
+
+bool Texture::RefreshDepthCopy() {
+    if (!HasDepthCopy()) return false;
+    ImageProfile::Scope timing(ImageProfile::Source, "depth compare GPU copy");
+    const auto& descriptor = depthDescriptor;
+    const auto geometry = DescribeSurface(descriptor);
+    timing.Describe({descriptor.baseAddress, geometry.guestBytes, descriptor.format, descriptor.width, descriptor.height, 0, 0});
+    if (depthSourceVersion == storageSource->Version()) {
+        timing.Reason("depth compare version unchanged");
+        DepthCounts().skipped.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+    auto* recorder = Recorder::Active();
+    std::unique_ptr<CommandBatch> batch;
+    const auto commands = recorder != nullptr ? recorder->Commands() : (batch = std::make_unique<CommandBatch>(context))->Handle();
+    if (recorder != nullptr) {
+        recorder->Keep(storageSource);
+        recorder->Keep(owned);
+        recorder->Keep(depthCopyBuffer, depthCopyBuffer->Size());
+        const std::array<std::pair<VkImage, bool>, 2> images{{{storageSource->Image(), false}, {image, true}}};
+        recorder->NoteAccess(Recorder::CommandClass::Copy, {{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
+    }
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+    VkImageMemoryBarrier destination{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    destination.srcAccessMask = depthSourceVersion == UINT64_MAX ? 0 : VK_ACCESS_SHADER_READ_BIT;
+    destination.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    destination.oldLayout = depthSourceVersion == UINT64_MAX ? VK_IMAGE_LAYOUT_UNDEFINED : layout;
+    destination.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    destination.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    destination.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    destination.image = image;
+    destination.subresourceRange = {VK_IMAGE_ASPECT_DEPTH_BIT, 0, descriptor.mipCount, 0, geometry.imageLayers};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &destination);
+    std::vector<VkBufferImageCopy> regions;
+    for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+        for (std::uint32_t level = 0; level < descriptor.mipCount; ++level) {
+            const auto& mip = geometry.mips[level];
+            VkBufferImageCopy region{};
+            region.bufferOffset = geometry.LinearLayerOffset(layer) + mip.linearOffset;
+            region.bufferRowLength = mip.pitchBytes / BytesPerElement(descriptor.format);
+            region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, level, geometry.CopyLayer(layer), 1};
+            region.imageExtent = {std::max(descriptor.width >> level, 1u), std::max(descriptor.height >> level, 1u), 1};
+            regions.push_back(region);
+        }
+    }
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, storageSource->Image(), VK_IMAGE_LAYOUT_GENERAL, depthCopyBuffer->Handle(), static_cast<std::uint32_t>(regions.size()), regions.data());
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+    for (auto& region : regions) region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_DEPTH_BIT;
+    context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, depthCopyBuffer->Handle(), image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, static_cast<std::uint32_t>(regions.size()), regions.data());
+    destination.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    destination.dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    destination.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+    destination.newLayout = layout;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &destination);
+    if (batch) batch->SubmitAndWait();
+    depthSourceVersion = storageSource->Version();
+    DepthCounts().copied.fetch_add(1, std::memory_order_relaxed);
+    return true;
+}
+
+Texture::Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, bool depthCompare) : context(context), storageSource(source), depthCompare(depthCompare) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     PhaseTimer timer;
     try {
         Require(source != nullptr && CanCopyFrom(*source, descriptor), "storage image does not match the sampled texture");
-        const auto vkFormat = SampledTextureFormat(context, descriptor.format);
+        auto vkFormat = SampledTextureFormat(context, descriptor.format);
         const auto geometry = DescribeSurface(descriptor);
+        if (depthCompare) {
+            Require(CanDepthCopyFrom(context, *source, descriptor), "storage image cannot supply a depth compare copy");
+            vkFormat = vkFormat == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM;
+            VkImageCreateInfo info{VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO};
+            info.flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0;
+            info.imageType = ImageTypeFor(descriptor.dimension);
+            info.format = vkFormat;
+            info.extent = {descriptor.width, descriptor.height, 1};
+            info.mipLevels = descriptor.mipCount;
+            info.arrayLayers = geometry.imageLayers;
+            info.samples = VK_SAMPLE_COUNT_1_BIT;
+            info.tiling = VK_IMAGE_TILING_OPTIMAL;
+            info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &info, nullptr, &image), "vkCreateImage depth copy");
+            owned = std::make_shared<OwnedImage>(context, image, VK_NULL_HANDLE);
+            VkMemoryRequirements requirements{};
+            context.Function<PFN_vkGetImageMemoryRequirements>("vkGetImageMemoryRequirements")(context.device, image, &requirements);
+            VkMemoryAllocateInfo allocation{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            allocation.allocationSize = requirements.size;
+            allocation.memoryTypeIndex = context.MemoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+            Check(context.Function<PFN_vkAllocateMemory>("vkAllocateMemory")(context.device, &allocation, nullptr, &owned->memory), "vkAllocateMemory depth copy");
+            Check(context.Function<PFN_vkBindImageMemory>("vkBindImageMemory")(context.device, image, owned->memory, 0), "vkBindImageMemory depth copy");
+            const auto bufferBytes = geometry.sliceLinearBytes * geometry.layers;
+            depthDescriptor = descriptor;
+            depthCopyBuffer = std::make_shared<DeviceBuffer>(context, bufferBytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+            allocationBytes = requirements.size + bufferBytes;
+            countedBytes = allocationBytes;
+            SampledMemoryCounter().fetch_add(countedBytes, std::memory_order_relaxed);
+            RefreshDepthCopy();
+        }
         APS5_LOG_OUT("Texture address=0x%llx %ux%u mips=%u viewed from storage image (vk=%d)", static_cast<unsigned long long>(descriptor.baseAddress), descriptor.width, descriptor.height, descriptor.mipCount, static_cast<int>(vkFormat));
         // Storage images stay in the general layout; the view samples them there.
-        layout = VK_IMAGE_LAYOUT_GENERAL;
+        layout = depthCompare ? VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL : VK_IMAGE_LAYOUT_GENERAL;
         const auto viewLevelCount = std::min(descriptor.lastLevel, descriptor.mipCount - 1u) - descriptor.baseLevel + 1u;
         const auto viewLayerCount = std::min(geometry.imageLayers, source->ImageLayers()) - descriptor.baseArray;
         if (descriptor.dimension == TextureDimension::kCube) {
             Require(viewLayerCount % 6u == 0, "guest cube texture view does not contain a multiple of 6 array slices");
         }
         VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
-        viewInfo.image = source->Image();
+        viewInfo.image = depthCompare ? image : source->Image();
         viewInfo.viewType = ViewTypeFor(descriptor.dimension, viewLayerCount);
         viewInfo.format = vkFormat;
         viewFormat = vkFormat;
-        viewInfo.components = components;
-        viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
+        viewInfo.components = depthCompare ? VkComponentMapping{} : components;
+        viewInfo.subresourceRange = {depthCompare ? VK_IMAGE_ASPECT_DEPTH_BIT : VK_IMAGE_ASPECT_COLOR_BIT, descriptor.baseLevel, viewLevelCount, descriptor.baseArray, viewLayerCount};
         VkImageViewMinLodCreateInfoEXT minLod{VK_STRUCTURE_TYPE_IMAGE_VIEW_MIN_LOD_CREATE_INFO_EXT};
         ChainMinLod(context, descriptor, viewInfo, minLod);
         Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "vkCreateImageView storage view");

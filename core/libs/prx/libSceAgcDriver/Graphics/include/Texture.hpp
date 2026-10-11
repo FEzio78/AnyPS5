@@ -23,6 +23,7 @@ namespace AgcDriver::Graphics {
 class ResidentColor;
 class CommandBatch;
 class StorageTexture;
+class DeviceBuffer;
 struct HostImport;
 
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
@@ -60,9 +61,14 @@ public:
     // A view of a storage image's own VkImage: the sampled texture follows the image's content, so a
     // compute pass writing it and the next pass sampling it share one image and copy nothing.
     // CanCopyFrom says whether the two descriptors address the same surface compatibly.
-    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components);
+    Texture(const Context& context, const std::shared_ptr<StorageTexture>& source, const GuestTextureResource& descriptor, VkComponentMapping components, bool depthCompare = false);
     Texture(const Context& context, VkImage depthImage, VkFormat depthFormat, VkImageAspectFlags aspect, VkComponentMapping components);
     static bool CanCopyFrom(const StorageTexture& source, const GuestTextureResource& descriptor);
+    static bool CanDepthCopyFrom(const Context& context, const StorageTexture& source, const GuestTextureResource& descriptor);
+    bool RefreshDepthCopy();
+    void NoteDepthCompareUse() const;
+    bool HasDepthCopy() const { return depthCopyBuffer != nullptr; }
+    VkImage Image() const { return image; }
     ~Texture();
     Texture(const Texture&) = delete;
     Texture& operator=(const Texture&) = delete;
@@ -109,6 +115,10 @@ private:
     VkFormat viewFormat = VK_FORMAT_UNDEFINED;
     std::shared_ptr<ResidentColor> source;
     std::shared_ptr<StorageTexture> storageSource;
+    bool depthCompare = false;
+    GuestTextureResource depthDescriptor{};
+    std::shared_ptr<DeviceBuffer> depthCopyBuffer;
+    std::uint64_t depthSourceVersion = UINT64_MAX;
     std::unique_ptr<CommandBatch> upload;
 };
 

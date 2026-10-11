@@ -564,7 +564,8 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // memory first.
     imageTiming.Describe({address, guestBytes, resource.format, resource.width, resource.height, words[0], words[3]});
     auto source = ImageProfile::Measure(ImageProfile::Source, "find pending", [&] { return StorageTexture::FindPending(address, guestBytes); });
-    if (source != nullptr && (depthCompare || !Texture::CanCopyFrom(*source, resource) || MetadataMoved(*source, resource))) source.reset();
+    if (source == nullptr && depthCompare) source = StorageTexture::FindLive(address, guestBytes);
+    if (source != nullptr && (!(depthCompare ? Texture::CanDepthCopyFrom(context, *source, resource) : Texture::CanCopyFrom(*source, resource)) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
@@ -628,7 +629,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     if (!keys.has_value()) keys = scanKeys();
     if (disabled) {
-        if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components);
+        if (source != nullptr) return std::make_shared<Texture>(context, source, resource, components, depthCompare);
         std::vector<std::byte> snapshot(bytes);
         ReadTextureSurface(resource, *keys, snapshot);
         return std::make_shared<Texture>(context, *context.detiler, resource, components, snapshot, depthCompare);
@@ -670,13 +671,14 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
-            if ((source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
+            if ((depthCompare ? source == it->source : source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
                 if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
                 reportTextureCounters();
-                imageTiming.Reason("cached storage view");
+                imageTiming.Reason(depthCompare ? "cached depth compare GPU view" : "cached storage view");
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
@@ -714,11 +716,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, generation};
     if (source != nullptr) {
-        imageTiming.Reason("new storage view");
+        imageTiming.Reason(depthCompare ? "new depth compare GPU view" : "new storage view");
         entry.source = source;
         entry.sourceVersion = source->Version();
-        entry.texture = std::make_shared<Texture>(context, source, resource, components);
-        entry.accounted = source->Cached() ? 0u : heldBytes(*source);
+        entry.texture = std::make_shared<Texture>(context, source, resource, components, depthCompare);
+        entry.accounted = entry.texture->AllocationBytes() + (source->Cached() ? 0u : heldBytes(*source));
         counters.fromStorage.fetch_add(1, std::memory_order_relaxed);
     } else {
         // Snapshot before the upload so a write racing with it is caught by the next comparison.
@@ -980,9 +982,9 @@ std::uint64_t SampledTextureCacheBudget(const Context& context) {
     return sampledBudget(context, cache);
 }
 
-std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words) {
+std::shared_ptr<Texture> CachedSampledTexture(const Context& context, std::span<const std::uint32_t> words, bool depthCompare) {
     const auto resource = DecodeTextureResource(words);
-    return cachedTexture(context, words, resource, ViewComponents(resource));
+    return cachedTexture(context, words, resource, ViewComponents(resource), 0, depthCompare);
 }
 
 bool SampledTexturesShareEntry(std::span<const std::uint32_t> first, std::span<const std::uint32_t> second) {
@@ -2400,6 +2402,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             return finish(fast, false);
         }
     }
+    for (const auto& texture : textures) {
+        if (texture != nullptr) {
+            texture->RefreshDepthCopy();
+            texture->NoteDepthCompareUse();
+        }
+    }
     pendingSerialSeen = EpochRevalidate() && StorageTexture::PendingSerial() == serialBefore ? serialBefore : 0;
     return finish(fast, true);
 }
@@ -3178,6 +3186,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     if (it == cache.entries.end() || it->texture != record.texture) return nullptr;
     if (it->source == nullptr) it->generation = record.generation;
     touchTexture(cache, it);
+    record.texture->RefreshDepthCopy();
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});
     imageTiming.Reason("hit");
     outcome.hit = true;
@@ -3232,6 +3241,7 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+            texture->NoteDepthCompareUse();
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
                 const auto range = texture->SampledViewRange(firstLayer);
                 const bool singleLevel = range.levels == 1u && range.layers == 1u && resource.baseLevel == 0u && EffectiveMinLod(resource) == 0.0f;
@@ -3674,7 +3684,10 @@ std::vector<std::pair<VkImage, bool>> ShaderResources::StorageImages() const {
         if (storageTextures[index] != nullptr) images.emplace_back(storageTextures[index]->Image(), storageWritten[index]);
     }
     for (const auto& texture : textures) {
-        if (texture != nullptr && texture->StorageSource() != nullptr) images.emplace_back(texture->StorageSource()->Image(), false);
+        if (texture != nullptr && texture->StorageSource() != nullptr) {
+            images.emplace_back(texture->StorageSource()->Image(), false);
+            if (texture->HasDepthCopy()) images.emplace_back(texture->Image(), false);
+        }
     }
     return images;
 }

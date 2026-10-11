@@ -3206,7 +3206,7 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
             SetImportWatch(base, mode == 1 ? ImportWatch::Unwatch : ImportWatch::Watch);
             const bool imported = mode != 0;
             if (imported && base.hostImportAlignment == 0) continue;
-            
+
             auto context = base;
             if (!imported) context.hostImportAlignment = 0;
             context.singlePassStorage = mode == 1 && base.singlePassStorage;
@@ -3229,7 +3229,7 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
             std::byte* memory = nullptr;
 #ifdef _WIN32
             if (mode == 2) {
-                memory = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+                memory = static_cast<std::byte*>(AllocateWatched(bytes, 65536));
                 Require(memory != nullptr, "shared plane edge test cannot reserve memory");
                 const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
                 Require(section != nullptr, "shared plane edge test cannot create a mapping");
@@ -3312,10 +3312,13 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
                 AgcDriver::GuestMemory::BumpCollectEpoch();
                 image->Refresh();
                 recorder.Sync();
-                const auto actual = ReadColorPlane(context, image->Image(), VK_IMAGE_LAYOUT_GENERAL, resource, 0);
+                auto plane = resource;
+                plane.dimension = TextureDimension::k2D;
+                plane.depthOrLastArray = 0;
+                const auto actual = ReadColorPlane(context, image->Image(), VK_IMAGE_LAYOUT_GENERAL, plane, 0);
                 const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-                Texture reference(context, detiler, resource, identity, wanted);
-                const auto referenceBytes = reference.ReadColorPlane(resource);
+                Texture reference(context, detiler, plane, identity, std::span<const std::byte>(wanted).first(static_cast<std::size_t>(geometry.layerBytes)));
+                const auto referenceBytes = reference.ReadColorPlane(plane);
                 const auto mismatch = std::mismatch(referenceBytes.begin(), referenceBytes.end(), actual.begin(), actual.end());
                 if (mismatch.first != referenceBytes.end()) {
                     const auto pixel = static_cast<std::size_t>(mismatch.first - referenceBytes.begin()) / elementBytes;

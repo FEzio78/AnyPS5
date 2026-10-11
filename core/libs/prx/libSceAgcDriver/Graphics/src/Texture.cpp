@@ -1589,6 +1589,8 @@ bool StorageTexture::Refresh() {
             }
         }
     }
+    static const bool traceMerge = std::getenv("APS5_TRACE_STORAGE_MERGE") != nullptr;
+    if (traceMerge) std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, generationBaseline.size(), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
     if (unchanged) {
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
@@ -1622,6 +1624,7 @@ bool StorageTexture::Refresh() {
     // unit's stamps say nothing, so it is stored.
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
+        if (originalValid || generationBaseline.size() == guestBytes) return false;
         if (compared) return stampedBlocks.at(unit) == GuestMemory::BlockWritten;
         if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
         const auto begin = layerBegin(unit);
@@ -1839,8 +1842,6 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     return true;
 }
 
-constexpr std::uint64_t GenerationBaselineBytes = 1ull << 20;
-
 void StorageTexture::upload(const std::vector<bool>* layers) {
     ImageProfile::Scope imageTiming(ImageProfile::StorageUpload, uploadReason);
     imageTiming.Describe({descriptor.baseAddress, guestBytes, descriptor.format, descriptor.width, descriptor.height});
@@ -1856,7 +1857,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (guestBytes > GenerationBaselineBytes || !guestBytesSettled()) generationBaseline.clear();
+        if (!guestBytesSettled()) generationBaseline.clear();
         else if (whole) {
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
@@ -2995,6 +2996,7 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
     constexpr std::uint64_t block = 65536;
     const auto accessEnd = address + bytes;
     for (const auto& texture : images) {
+        if (texture->originalValid || texture->generationBaseline.size() == texture->guestBytes) return false;
         for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {
             if (!texture->layerPending[layer]) continue;
             const auto begin = std::max(address, texture->layerBegin(layer));
@@ -3910,6 +3912,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> keep;
     std::vector<bool> skippedLayer(trackedLayers, false);
     bool skippedAny = false;
+    bool mergeCpu = false;
+    const bool baselineAvailable = originalValid || generationBaseline.size() == guestBytes;
     std::size_t skipped = 0;
     std::uint64_t firstStored = descriptor.baseAddress + guestBytes;
     std::uint64_t lastStored = descriptor.baseAddress;
@@ -3953,7 +3957,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
-                continue;
+                if (!baselineAvailable) continue;
+                mergeCpu = true;
             }
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
             else keep.emplace_back(from, to);
@@ -4005,7 +4010,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         settle(true);
         return;
     }
-    if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+    const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+    static const bool traceMerge = std::getenv("APS5_TRACE_STORAGE_MERGE") != nullptr;
+    if (traceMerge) std::fprintf(stderr, "[storage-merge] store image=0x%llx+0x%llx blockUnits=%d tracked=%d compared=%d baseline=%d merge=%d conflicts=%zu ranges=%zu\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), blockUnits, tracked, compared, baselineAvailable, mergeCpu, skipped, keep.size());
+    if (import != nullptr && !mergeCpu) {
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
@@ -4154,7 +4162,8 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const bool wasValid = originalValid;
     if (!wasValid) {
         FlushHeapMirrorWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true);
-        GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+        if (mergeCpu) original = generationBaseline;
+        else GuestMemory::ReadCommitted(descriptor.baseAddress, original);
     }
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4229,7 +4238,19 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     for (const auto& [from, to] : keep) {
         const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
         const auto length = static_cast<std::size_t>(to - from);
-        if (!StoreHeapMirrorResults(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length))) GuestMemory::WriteChangedCommitted(from, current.subspan(offset, length), std::span<const std::byte>(original).subspan(offset, length));
+        const auto result = current.subspan(offset, length);
+        const auto baseline = std::span<const std::byte>(original).subspan(offset, length);
+        if (mergeCpu) {
+            std::vector<std::byte> guest(length);
+            GuestMemory::ReadCommitted(from, guest);
+            auto merged = guest;
+            for (std::size_t i = 0; i < length; ++i) {
+                if (result[i] != baseline[i] && guest[i] == baseline[i]) merged[i] = result[i];
+            }
+            if (!StoreHeapMirrorResults(from, merged, guest)) GuestMemory::WriteChangedCommitted(from, merged, guest);
+        } else {
+            if (!StoreHeapMirrorResults(from, result, baseline)) GuestMemory::WriteChangedCommitted(from, result, baseline);
+        }
         std::memcpy(original.data() + offset, current.data() + offset, length);
     }
     // The texels now hold the whole image, so later reads must see them rather than a fast clear

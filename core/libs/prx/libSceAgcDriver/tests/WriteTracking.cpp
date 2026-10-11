@@ -84,7 +84,19 @@ void CheckSharedBlock() {
 
     const auto many = TrackerGeneration();
     for (int store = 0; store < 6; ++store) MarkWritten(base + Block + static_cast<std::uint64_t>(store) * 64, 4);
-    Require(StoredOver(boundary, static_cast<std::size_t>(sharedSecond), many), "forgotten driver stores are taken as missing the range");
+    Require(!StoredOver(boundary, static_cast<std::size_t>(sharedSecond), many), "many driver stores outside a shared range count as overlapping it");
+    Require(StoredOver(base + Block, 4, many), "the oldest of many driver stores was forgotten");
+    Require(!StoredOver(base + Block + 4, 60, many), "the gap between driver stores reads as overwritten");
+    const auto broad = MarkWritten(base + Block, 256);
+    const auto narrow = MarkWritten(base + Block + 64, 64);
+    Require(!StoredOver(base + Block, 64, broad), "a narrow overwrite refreshed the preceding interval");
+    Require(StoredOver(base + Block + 64, 64, broad), "a narrow overwrite lost its generation");
+    Require(!StoredOver(base + Block + 128, 128, broad), "a narrow overwrite refreshed the following interval");
+    Require(StoredOver(base + Block, 64, many) && StoredOver(base + Block + 128, 128, many), "splitting a driver interval lost its older fragments");
+    Require(!StoredOver(base + Block, 256, narrow), "split intervals newer than their latest write were reported");
+    MarkWritten(base + Block + 32, 160);
+    Require(StoredOver(base + Block + 32, 160, narrow), "a write crossing multiple driver intervals was lost");
+    Require(!StoredOver(base + Block, 32, narrow) && !StoredOver(base + Block + 192, 64, narrow), "a crossing write refreshed bytes outside its boundaries");
 
     const auto beforeCpu = CollectWrites(base, 3 * Block);
     static_cast<volatile std::uint8_t*>(memory)[Block + 8] = 0x22;

@@ -854,9 +854,7 @@ struct WriteTracker {
     };
     struct DriverPieces {
         std::uint32_t whole = 0;
-        std::uint32_t dropped = 0;
-        std::uint32_t next = 0;
-        std::array<DriverPiece, 4> pieces{};
+        std::vector<DriverPiece> pieces;
     };
     std::unordered_map<std::uint64_t, DriverPieces> driverPieces;
 
@@ -890,9 +888,16 @@ struct WriteTracker {
             return;
         }
         auto& entry = driverPieces[block];
-        auto& slot = entry.pieces[entry.next++ % entry.pieces.size()];
-        entry.dropped = std::max(entry.dropped, slot.generation);
-        slot = {stampGeneration, from, to};
+        auto& pieces = entry.pieces;
+        const auto first = std::lower_bound(pieces.begin(), pieces.end(), from, [](const DriverPiece& piece, std::uint32_t offset) { return piece.end <= offset; });
+        const auto last = std::lower_bound(first, pieces.end(), to, [](const DriverPiece& piece, std::uint32_t offset) { return piece.begin < offset; });
+        std::array<DriverPiece, 3> replacement{};
+        std::size_t count = 0;
+        if (first != last && first->begin < from) replacement[count++] = {first->generation, first->begin, from};
+        replacement[count++] = {stampGeneration, from, to};
+        if (first != last && (last - 1)->end > to) replacement[count++] = {(last - 1)->generation, to, (last - 1)->end};
+        const auto position = pieces.erase(first, last);
+        pieces.insert(position, replacement.begin(), replacement.begin() + count);
     }
 
     std::uint32_t stampOf(std::uint64_t block) const {
@@ -1434,7 +1439,7 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
         const auto found = tracker.driverPieces.find(block);
         if (found == tracker.driverPieces.end()) return true;
         const auto& entry = found->second;
-        if (entry.whole > generation || entry.dropped > generation) return true;
+        if (entry.whole > generation) return true;
         const auto begin = tracker.blockBegin(block);
         const auto from = std::max(address, begin) - begin;
         const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;

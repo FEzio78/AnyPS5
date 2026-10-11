@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILER_SHADERDISKCACHE_HPP
 
 #include "CompiledVariant.hpp"
+#include "IntermediateRepresentation/IrMetadata/ResourcePlan.hpp"
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -12,7 +13,7 @@
 
 namespace ShaderRecompiler::ShaderDiskCache {
 
-inline constexpr std::uint32_t FormatVersion = 24;
+inline constexpr std::uint32_t FormatVersion = 25;
 
 enum class LoadStatus {
     Loaded,
@@ -22,6 +23,8 @@ enum class LoadStatus {
 };
 
 struct Counters {
+    std::uint64_t planHits = 0;
+    std::uint64_t planMisses = 0;
     std::uint64_t hits = 0;
     std::uint64_t misses = 0;
     std::uint64_t writes = 0;
@@ -33,6 +36,7 @@ struct Counters {
 
 [[nodiscard]] std::uint64_t SourceVersion();
 
+void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key);
 
 [[nodiscard]] std::string EntryName(std::span<const std::byte> key);
@@ -42,6 +46,13 @@ void EncodeResult(const RecompileResult& result, std::vector<std::byte>& out);
 
 [[nodiscard]] std::vector<std::byte> EncodeEntry(std::span<const std::byte> key, const CompiledVariant& variant);
 [[nodiscard]] LoadStatus DecodeEntry(std::span<const std::byte> file, std::span<const std::byte> key, CompiledVariant& variant);
+
+void EncodePlan(const IrResourcePlan& plan, std::vector<std::byte>& out);
+[[nodiscard]] bool DecodePlan(std::span<const std::byte> bytes, IrResourcePlan& plan);
+[[nodiscard]] std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan);
+[[nodiscard]] LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan);
+[[nodiscard]] bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan);
+void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan);
 
 [[nodiscard]] bool Enabled();
 [[nodiscard]] std::filesystem::path EntryDirectory();

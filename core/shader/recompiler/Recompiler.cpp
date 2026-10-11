@@ -147,11 +147,20 @@ std::shared_ptr<const PreparedControlFlow> ShaderPreparationContext::AcquireFron
     return prepared;
 }
 
+namespace {
+std::atomic<std::uint64_t> resourceTranslations{0};
+}
+
+std::uint64_t ResourceTranslationCount() {
+    return resourceTranslations.load(std::memory_order_relaxed);
+}
+
 IrProgram PrepareResourceProgram(const RecompileRequest& request) {
     return PrepareResourceProgram(request, nullptr);
 }
 
 IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation) {
+    resourceTranslations.fetch_add(1, std::memory_order_relaxed);
     ShaderPreparationContext local;
     const auto frontend = (preparation != nullptr ? *preparation : local).AcquireFrontend(request);
     const auto stageKind = toShaderStageKind(request.shader.stage);
@@ -350,10 +359,21 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         std::lock_guard lock(source->mutex);
         if (source->plan == nullptr) {
             if (FailureMemo() && source->planFailure) std::rethrow_exception(source->planFailure);
+            std::vector<std::byte> planKey;
+            const bool disk = ShaderDiskCache::Enabled() && !DebugProbeActive();
+            if (disk) {
+                ShaderDiskCache::BuildPlanKey(request, HostSubgroupSize(request), planKey);
+                IrResourcePlan loaded;
+                if (ShaderDiskCache::LoadPlan(planKey, loaded)) {
+                    source->plan = std::make_shared<const IrResourcePlan>(std::move(loaded));
+                    return source;
+                }
+            }
             try {
                 ResourceProgram resource(request, preparation);
                 source->plan = std::move(resource.plan);
                 source->program = std::move(resource.program);
+                if (disk) ShaderDiskCache::StorePlan(std::move(planKey), source->plan);
             } catch (...) {
                 if (FailureMemo()) source->planFailure = std::current_exception();
                 throw;

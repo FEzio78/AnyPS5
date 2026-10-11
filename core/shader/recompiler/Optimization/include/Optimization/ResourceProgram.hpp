@@ -18,6 +18,7 @@ private:
     std::shared_ptr<const PreparedControlFlow> frontend;
 };
 
+[[nodiscard]] std::uint64_t ResourceTranslationCount();
 [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request);
 [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation);
 [[nodiscard]] std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request);

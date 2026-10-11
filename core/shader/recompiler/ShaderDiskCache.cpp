@@ -3,6 +3,7 @@
 #include "ShaderCacheDirectory.hpp"
 #include "ThreadOwned.hpp"
 #include "Optimization/ResourceMaterializer.hpp"
+#include "Optimization/ResourceProgram.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -29,6 +30,7 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
+#include <unordered_map>
 
 namespace ShaderRecompiler {
 
@@ -203,7 +205,8 @@ public:
     template<typename TValue, typename TDecode>
     void List(std::vector<TValue>& values, std::size_t minimum, TDecode&& decode) {
         const auto count = Count(minimum);
-        values.assign(count, TValue{});
+        values.clear();
+        values.resize(count);
         for (auto& value : values) {
             if (!ok) break;
             decode(*this, value);
@@ -656,7 +659,261 @@ void decodeAllocation(Reader& reader, CompiledBindingLayout& allocation) {
     reader.Value(allocation.pushConstantSizeBytes);
 }
 
+
+void encodePlan(Writer& writer, const IrResourcePlan& plan) {
+    writer.Value(plan.stage);
+    writer.Value(plan.shaderHash);
+    writer.Value(plan.userDataBase);
+    writer.Value(plan.userDataCount);
+    writer.Value(plan.srgbDecodeFormats);
+    std::unordered_map<const IrValue*, std::uint32_t> values{{nullptr, 0}};
+    std::unordered_map<const IrBlock*, std::uint32_t> blocks{{nullptr, 0}};
+    for (std::size_t i = 0; i < plan.valueStorage.size(); ++i) values.emplace(plan.valueStorage[i].get(), i + 1);
+    for (std::size_t i = 0; i < plan.blockStorage.size(); ++i) blocks.emplace(plan.blockStorage[i].get(), i + 1);
+    writer.List(plan.blockStorage, [](Writer& out, const auto& block) { out.Value(block->Id()); });
+    writer.List(plan.valueStorage, [&](Writer& out, const auto& value) {
+        out.Value(value->Opcode());
+        out.Value(value->Type());
+        out.Value(value->Id());
+        out.Value(value->template Flags<std::uint64_t>());
+        out.Value(value->HasImmediate());
+        out.Value(value->ImmediateU64());
+        out.Value(value->Register().bank);
+        out.Value(value->Register().index);
+        out.Value<std::uint64_t>(value->ArgumentCount());
+        for (std::size_t i = 0; i < value->ArgumentCount(); ++i) {
+            out.Value(values.at(value->Argument(i)));
+            if (value->IsPhi()) out.Value(blocks.at(value->PhiBlock(i)));
+        }
+    });
+    writer.List(plan.memoryInfo, [](Writer& out, const MemoryInfo& memory) {
+        out.Value(memory.kind);
+        out.Value(memory.resource);
+        out.Value(memory.sampler);
+        out.Value(memory.offset);
+        out.Value(memory.secondaryOffset);
+        out.Value(memory.dmask);
+        out.Value(memory.dataDwords);
+        out.Value(memory.dataBits);
+        out.Value(memory.componentIndex);
+        out.Value(memory.componentCount);
+        out.Value(memory.dataFormat);
+        out.Value(memory.numberFormat);
+        out.Value(memory.imageSampleFlags);
+        out.Value(memory.imageDimension);
+        out.Value(memory.imageAddressComponents);
+        out.Value(memory.addressIsFull);
+        out.Value(memory.dataSigned);
+        out.Value(memory.typed);
+        out.Value(memory.formatted);
+        out.Value(memory.d16);
+        out.Value(memory.imageHasMip);
+        out.Value(memory.imageR128);
+        out.Value(memory.imagePacked);
+        out.Value(memory.imageByElements);
+        out.Value(memory.idxen);
+        out.Value(memory.offen);
+        out.Value(memory.planningOnly);
+        out.Value(memory.coherent);
+        out.Value(memory.gpuDescriptor);
+        out.Value(memory.flushDenormals);
+    });
+    writer.List(plan.descriptorSources, [&](Writer& out, const DescriptorSource& source) {
+        for (const auto* value : source.dwords) out.Value(values.at(value));
+        out.Value(source.dwordCount);
+        out.Value(source.indirectImage.has_value());
+        if (source.indirectImage) {
+            const auto& indirect = *source.indirectImage;
+        out.Value(indirect.materialSource);
+        out.Value(indirect.heapSource);
+        out.Value(indirect.selectorStride);
+        out.Value(indirect.selectorOffset);
+        out.Value(indirect.keyArg);
+        out.Value(indirect.entryOffset);
+        out.Value(indirect.countSource);
+        out.Value(indirect.hasMaterial);
+        out.Value(indirect.addressHeap);
+        out.Value(indirect.countSigned);
+        }
+    });
+    writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
+        out.Value(values.at(block.condition));
+        out.Values(std::span<const std::uint32_t>(block.successors));
+        out.Values(std::span<const std::uint32_t>(block.sources));
+    });
+    writer.Values(std::span<const std::uint32_t>(plan.materializationSources));
+    writer.List(plan.srtReads, [&](Writer& out, const SrtRead& read) {
+        out.Value(values.at(read.value));
+        out.Value(read.flatOffset);
+    });
+    writer.Values(std::span<const std::uint32_t>(plan.guardedSrtSlots));
+    writer.Value(plan.srtGuardOffset);
+    writer.Values(std::span<const std::uint8_t>(plan.cleanFlatSlots));
+    writer.Values(std::span<const std::uint8_t>(plan.pureFlatSlots));
+    writer.Value(plan.requiresSpecializationMemory);
+    writer.Value(plan.srtPlanComplete);
+    writer.Value(plan.resourceTrackingComplete);
+    CompiledShaderInfo info;
+    info.info = plan.info;
+    encodeInfo(writer, info);
+    const auto& fill = plan.uniformFill.fill;
+    writer.Value(fill.kind);
+    writer.Value(fill.resource);
+    for (const auto stride : fill.groupStride) writer.Value(stride);
+    writer.Value(fill.words);
+    writer.Value(fill.value);
+    for (const auto* value : plan.uniformFill.values) writer.Value(values.at(value));
+}
+
+void decodePlan(Reader& reader, IrResourcePlan& plan) {
+    reader.Value(plan.stage);
+    reader.Value(plan.shaderHash);
+    reader.Value(plan.userDataBase);
+    reader.Value(plan.userDataCount);
+    reader.Value(plan.srgbDecodeFormats);
+    reader.List(plan.blockStorage, 4, [](Reader& in, auto& block) { block = std::make_unique<IrBlock>(in.Get<std::uint32_t>()); });
+    struct ValueRecord {
+        std::unique_ptr<IrValue> value;
+        std::vector<std::uint32_t> arguments;
+        std::vector<std::uint32_t> blocks;
+    };
+    std::vector<ValueRecord> records;
+    reader.List(records, 41, [](Reader& in, ValueRecord& record) {
+        const auto opcode = in.Get<IrOpcode>();
+        const auto type = in.Get<IrType>();
+        const auto id = in.Get<std::uint32_t>();
+        if (opcode >= IrOpcode::Count || (static_cast<std::uint32_t>(type) >> 26u) != 0u) throw std::runtime_error("invalid cached plan value");
+        record.value = std::make_unique<IrValue>(opcode, type, id);
+        record.value->SetFlags(in.Get<std::uint64_t>());
+        const bool immediate = in.Get<bool>();
+        const auto bits = in.Get<std::uint64_t>();
+        if (immediate) record.value->SetImmediateU64(bits);
+        const auto bank = in.Get<RegisterBank>();
+        const auto index = in.Get<std::uint32_t>();
+        if (bank > RegisterBank::UserData) throw std::runtime_error("invalid cached plan register");
+        record.value->SetRegister({bank, index});
+        if (opcode == IrOpcode::Phi) {
+            struct Operand { std::uint32_t value = 0, block = 0; };
+            std::vector<Operand> operands;
+            in.List(operands, 8, [](Reader& input, Operand& operand) { input.Value(operand.value); input.Value(operand.block); });
+            for (const auto& operand : operands) {
+                record.arguments.push_back(operand.value);
+                record.blocks.push_back(operand.block);
+            }
+        } else {
+            in.Values(record.arguments);
+        }
+    });
+    const auto valueFor = [&](std::uint32_t index) -> IrValue* {
+        if (!reader.Ok() || index > records.size()) throw std::runtime_error("invalid cached plan value reference");
+        return index == 0 ? nullptr : records[index - 1].value.get();
+    };
+    for (auto& record : records) {
+        for (std::size_t i = 0; i < record.arguments.size(); ++i) {
+            auto* value = valueFor(record.arguments[i]);
+            if (record.value->IsPhi()) {
+                const auto block = record.blocks[i];
+                if (block == 0 || block > plan.blockStorage.size()) throw std::runtime_error("invalid cached plan phi block");
+                record.value->AddPhiOperand(plan.blockStorage[block - 1].get(), value);
+            } else {
+                record.value->AddArgument(value);
+            }
+        }
+    }
+    reader.List(plan.memoryInfo, 1, [](Reader& in, MemoryInfo& memory) {
+        in.Value(memory.kind);
+        in.Value(memory.resource);
+        in.Value(memory.sampler);
+        in.Value(memory.offset);
+        in.Value(memory.secondaryOffset);
+        in.Value(memory.dmask);
+        in.Value(memory.dataDwords);
+        in.Value(memory.dataBits);
+        in.Value(memory.componentIndex);
+        in.Value(memory.componentCount);
+        in.Value(memory.dataFormat);
+        in.Value(memory.numberFormat);
+        in.Value(memory.imageSampleFlags);
+        in.Value(memory.imageDimension);
+        in.Value(memory.imageAddressComponents);
+        in.Value(memory.addressIsFull);
+        in.Value(memory.dataSigned);
+        in.Value(memory.typed);
+        in.Value(memory.formatted);
+        in.Value(memory.d16);
+        in.Value(memory.imageHasMip);
+        in.Value(memory.imageR128);
+        in.Value(memory.imagePacked);
+        in.Value(memory.imageByElements);
+        in.Value(memory.idxen);
+        in.Value(memory.offen);
+        in.Value(memory.planningOnly);
+        in.Value(memory.coherent);
+        in.Value(memory.gpuDescriptor);
+        in.Value(memory.flushDenormals);
+    });
+    reader.List(plan.descriptorSources, 37, [&](Reader& in, DescriptorSource& source) {
+        for (auto*& value : source.dwords) value = valueFor(in.Get<std::uint32_t>());
+        in.Value(source.dwordCount);
+        if (source.dwordCount > source.dwords.size()) throw std::runtime_error("invalid cached descriptor width");
+        if (in.Get<bool>()) {
+            auto& indirect = source.indirectImage.emplace();
+        in.Value(indirect.materialSource);
+        in.Value(indirect.heapSource);
+        in.Value(indirect.selectorStride);
+        in.Value(indirect.selectorOffset);
+        in.Value(indirect.keyArg);
+        in.Value(indirect.entryOffset);
+        in.Value(indirect.countSource);
+        in.Value(indirect.hasMaterial);
+        in.Value(indirect.addressHeap);
+        in.Value(indirect.countSigned);
+        }
+    });
+    reader.List(plan.controlFlow, 20, [&](Reader& in, ResourceBlock& block) {
+        block.condition = valueFor(in.Get<std::uint32_t>());
+        in.Values(block.successors);
+        in.Values(block.sources);
+    });
+    reader.Values(plan.materializationSources);
+    reader.List(plan.srtReads, 8, [&](Reader& in, SrtRead& read) {
+        read.value = valueFor(in.Get<std::uint32_t>());
+        in.Value(read.flatOffset);
+    });
+    reader.Values(plan.guardedSrtSlots);
+    reader.Value(plan.srtGuardOffset);
+    reader.Values(plan.cleanFlatSlots);
+    reader.Values(plan.pureFlatSlots);
+    reader.Value(plan.requiresSpecializationMemory);
+    reader.Value(plan.srtPlanComplete);
+    reader.Value(plan.resourceTrackingComplete);
+    CompiledShaderInfo info;
+    decodeInfo(reader, info);
+    plan.info = std::move(info.info);
+    auto& fill = plan.uniformFill.fill;
+    reader.Value(fill.kind);
+    reader.Value(fill.resource);
+    for (auto& stride : fill.groupStride) reader.Value(stride);
+    reader.Value(fill.words);
+    reader.Value(fill.value);
+    for (auto*& value : plan.uniformFill.values) value = valueFor(reader.Get<std::uint32_t>());
+    for (auto& record : records) plan.valueStorage.push_back(std::move(record.value));
+    const auto checkSource = [&](std::uint32_t index) {
+        if (index >= plan.descriptorSources.size()) throw std::runtime_error("invalid cached descriptor source");
+    };
+    for (const auto index : plan.materializationSources) checkSource(index);
+    for (const auto& block : plan.controlFlow) {
+        for (const auto index : block.sources) checkSource(index);
+        for (const auto index : block.successors) if (index >= plan.controlFlow.size()) throw std::runtime_error("invalid cached control flow");
+    }
+    for (const auto& buffer : plan.info.buffers) checkSource(buffer.source);
+    for (const auto& image : plan.info.images) checkSource(image.source);
+    for (const auto& sampler : plan.info.samplers) checkSource(sampler.source);
+    if (!plan.srtPlanComplete || !plan.resourceTrackingComplete) throw std::runtime_error("incomplete cached plan");
+}
+
 constexpr std::string_view NeutralSwitches[] = {
+    "APS5_NO_PLAN_DISK_CACHE",
     "APS5_PROFILE_DRAW",
     "APS5_DUMP_IR",
     "APS5_NO_CODE_HASH_KEY",
@@ -780,6 +1037,28 @@ public:
         return loaded;
     }
 
+    bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+        std::vector<std::byte> file;
+        const auto name = "plan-" + EntryName(key);
+        const bool loaded = ReadWholeFile(directory / name, file) && DecodePlanEntry(file, key, plan) == LoadStatus::Loaded;
+        (loaded ? planHits : planMisses).fetch_add(1, std::memory_order_relaxed);
+        if (!loaded && !file.empty()) {
+            const auto failures = loadFailures.fetch_add(1, std::memory_order_relaxed);
+            if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s; rebuilding resource plan\n", name.c_str());
+        }
+        if (loaded) bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+        report(false);
+        return loaded;
+    }
+
+    void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
+        {
+            std::lock_guard lock(mutex);
+            jobs.push_back({std::move(key), nullptr, std::move(plan)});
+        }
+        wake.notify_one();
+    }
+
     void Store(std::vector<std::byte> key, std::shared_ptr<const CompiledVariant> variant) {
         {
             std::lock_guard lock(mutex);
@@ -795,6 +1074,8 @@ public:
 
     Counters Totals() const {
         Counters counters;
+        counters.planHits = planHits.load(std::memory_order_relaxed);
+        counters.planMisses = planMisses.load(std::memory_order_relaxed);
         counters.hits = hits.load(std::memory_order_relaxed);
         counters.misses = misses.load(std::memory_order_relaxed);
         counters.writes = writes.load(std::memory_order_relaxed);
@@ -809,6 +1090,7 @@ private:
     struct Job {
         std::vector<std::byte> key;
         std::shared_ptr<const CompiledVariant> variant;
+        std::shared_ptr<const IrResourcePlan> plan;
     };
 
     void run() {
@@ -835,11 +1117,12 @@ private:
     }
 
     void write(const Job& job) {
-        const auto file = EncodeEntry(job.key, *job.variant);
-        if (WriteFileAtomically(directory / EntryName(job.key), file)) {
-            writes.fetch_add(1, std::memory_order_relaxed);
+        const auto file = job.plan ? EncodePlanEntry(job.key, *job.plan) : EncodeEntry(job.key, *job.variant);
+        const auto path = directory / ((job.plan ? "plan-" : "") + EntryName(job.key));
+        if (WriteFileAtomically(path, file)) {
+            if (!job.plan) writes.fetch_add(1, std::memory_order_relaxed);
             bytesWritten.fetch_add(file.size(), std::memory_order_relaxed);
-            evictToEntry(*job.variant, directory / EntryName(job.key), job.key.size(), file);
+            if (job.variant) evictToEntry(*job.variant, path, job.key.size(), file);
         } else {
             const auto failures = writeFailures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 4) std::fprintf(stderr, "[shader-disk-cache] cannot write %s\n", (directory / EntryName(job.key)).string().c_str());
@@ -888,11 +1171,13 @@ private:
         const auto totals = Totals();
         const auto loadNs = loadNanoseconds.load(std::memory_order_relaxed);
         const auto delta = [](std::uint64_t after, std::uint64_t before) { return static_cast<unsigned long long>(after - before); };
-        if (totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures) return;
+        if (totals.planHits == reported.planHits && totals.planMisses == reported.planMisses && totals.hits == reported.hits && totals.misses == reported.misses && totals.writes == reported.writes && totals.loadFailures == reported.loadFailures && totals.writeFailures == reported.writeFailures) return;
         std::fprintf(stderr, "[shader-disk-cache] (10 s): %llu hits, %llu misses, %llu writes (%.1f MiB), %llu load failures, %llu write failures; %.1f MiB read in %.1f ms (totals: %llu hits, %llu misses, %llu writes)\n",
                      delta(totals.hits, reported.hits), delta(totals.misses, reported.misses), delta(totals.writes, reported.writes), static_cast<double>(totals.bytesWritten - reported.bytesWritten) / (1024.0 * 1024.0),
                      delta(totals.loadFailures, reported.loadFailures), delta(totals.writeFailures, reported.writeFailures), static_cast<double>(totals.bytesRead - reported.bytesRead) / (1024.0 * 1024.0), static_cast<double>(loadNs - reportedLoadNs) / 1e6,
                      static_cast<unsigned long long>(totals.hits), static_cast<unsigned long long>(totals.misses), static_cast<unsigned long long>(totals.writes));
+        std::fprintf(stderr, "[shader-plan-cache] totals: %llu hits, %llu misses; resource translations: %llu\n",
+                     static_cast<unsigned long long>(totals.planHits), static_cast<unsigned long long>(totals.planMisses), static_cast<unsigned long long>(ResourceTranslationCount()));
         reported = totals;
         reportedLoadNs = loadNs;
     }
@@ -904,6 +1189,7 @@ private:
     std::condition_variable idle;
     std::deque<Job> jobs;
     bool writing = false;
+    std::atomic<std::uint64_t> planHits{0}, planMisses{0};
     std::atomic<std::uint64_t> hits{0}, misses{0}, writes{0}, loadFailures{0}, writeFailures{0}, bytesRead{0}, bytesWritten{0}, loadNanoseconds{0};
     std::atomic<std::int64_t> lastReport{0};
     std::mutex reportMutex;
@@ -940,6 +1226,75 @@ void BuildKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, s
     writer.Value(request.layout.pushConstantSizeBytes);
     const auto& switches = switchKey();
     key.insert(key.end(), switches.begin(), switches.end());
+}
+
+void BuildPlanKey(const RecompileRequest& request, std::uint32_t hostSubgroupSize, std::vector<std::byte>& key) {
+    auto source = request;
+    source.layout = {};
+    BuildKey(source, hostSubgroupSize, key);
+    Writer writer(key);
+    writer.Value<std::uint32_t>(0x504c414eu);
+}
+
+void EncodePlan(const IrResourcePlan& plan, std::vector<std::byte>& out) {
+    Writer writer(out);
+    encodePlan(writer, plan);
+}
+
+bool DecodePlan(std::span<const std::byte> bytes, IrResourcePlan& plan) {
+    try {
+        if (bytes.size() > (64u << 20u)) return false;
+        Reader reader(bytes);
+        IrResourcePlan decoded;
+        decodePlan(reader, decoded);
+        if (!reader.Done()) return false;
+        std::vector<std::byte> canonical;
+        EncodePlan(decoded, canonical);
+        if (!std::ranges::equal(bytes, canonical)) return false;
+        plan = std::move(decoded);
+        return true;
+    } catch (const std::exception&) {
+        return false;
+    }
+}
+
+std::vector<std::byte> EncodePlanEntry(std::span<const std::byte> key, const IrResourcePlan& plan) {
+    std::vector<std::byte> payload;
+    EncodePlan(plan, payload);
+    const FileHeader header{FileMagic, FormatVersion, SourceVersion(), key.size(), payload.size(), HashBytes(key), HashBytes(payload)};
+    std::vector<std::byte> file(sizeof(header) + key.size() + payload.size());
+    std::memcpy(file.data(), &header, sizeof(header));
+    std::memcpy(file.data() + sizeof(header), key.data(), key.size());
+    std::memcpy(file.data() + sizeof(header) + key.size(), payload.data(), payload.size());
+    return file;
+}
+
+LoadStatus DecodePlanEntry(std::span<const std::byte> file, std::span<const std::byte> key, IrResourcePlan& plan) {
+    if (file.size() < sizeof(FileHeader)) return LoadStatus::Rejected;
+    FileHeader header;
+    std::memcpy(&header, file.data(), sizeof(header));
+    if (header.magic != FileMagic || header.format != FormatVersion || header.sourceVersion != SourceVersion()) return LoadStatus::Rejected;
+    const auto body = file.size() - sizeof(header);
+    if (header.keyBytes > body || header.payloadBytes != body - header.keyBytes) return LoadStatus::Rejected;
+    const auto storedKey = file.subspan(sizeof(header), static_cast<std::size_t>(header.keyBytes));
+    const auto payload = file.subspan(sizeof(header) + static_cast<std::size_t>(header.keyBytes));
+    if (HashBytes(storedKey) != header.keyHash || HashBytes(payload) != header.payloadHash) return LoadStatus::Rejected;
+    if (!std::ranges::equal(storedKey, key)) return LoadStatus::KeyMismatch;
+    return DecodePlan(payload, plan) ? LoadStatus::Loaded : LoadStatus::Rejected;
+}
+
+bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
+    const auto* disabled = std::getenv("APS5_NO_PLAN_DISK_CACHE");
+    if (disabled && *disabled != '\0' && std::strcmp(disabled, "0") != 0) return false;
+    auto& instance = store();
+    return instance.Enabled() && instance.LoadPlan(key, plan);
+}
+
+void StorePlan(std::vector<std::byte> key, std::shared_ptr<const IrResourcePlan> plan) {
+    const auto* disabled = std::getenv("APS5_NO_PLAN_DISK_CACHE");
+    if (disabled && *disabled != '\0' && std::strcmp(disabled, "0") != 0) return;
+    auto& instance = store();
+    if (instance.Enabled()) instance.StorePlan(std::move(key), std::move(plan));
 }
 
 std::string EntryName(std::span<const std::byte> key) {

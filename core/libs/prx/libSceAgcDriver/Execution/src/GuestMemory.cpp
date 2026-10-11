@@ -1173,7 +1173,12 @@ namespace {
 struct WriteJournal {
     static constexpr std::size_t Capacity = 16384;
     std::mutex mutex;
-    std::array<std::pair<std::uint64_t, std::uint64_t>, Capacity> ranges{};
+    struct Entry {
+        std::uint64_t begin;
+        std::uint64_t end;
+        const void* owner;
+    };
+    std::array<Entry, Capacity> ranges{};
     std::uint64_t serial = 0;
 };
 
@@ -1190,22 +1195,22 @@ std::uint64_t WriteJournalSerial() {
     return journal.serial;
 }
 
-void JournalWrite(std::uint64_t address, std::size_t bytes) {
+void JournalWrite(std::uint64_t address, std::size_t bytes, const void* owner) {
     if (bytes == 0) return;
     auto& journal = Journal();
     std::lock_guard lock(journal.mutex);
-    journal.ranges[journal.serial % WriteJournal::Capacity] = {address, address + bytes};
+    journal.ranges[journal.serial % WriteJournal::Capacity] = {address, address + bytes, owner};
     ++journal.serial;
 }
 
-bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes) {
+bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes, const void* exceptOwner) {
     auto& journal = Journal();
     std::lock_guard lock(journal.mutex);
     if (journal.serial < serial || journal.serial - serial > WriteJournal::Capacity) return true;
     const auto end = address + bytes;
     for (auto entry = serial; entry < journal.serial; ++entry) {
-        const auto& [begin, finish] = journal.ranges[entry % WriteJournal::Capacity];
-        if (begin < end && address < finish) return true;
+        const auto& [begin, finish, owner] = journal.ranges[entry % WriteJournal::Capacity];
+        if (begin < end && address < finish && (exceptOwner == nullptr || owner != exceptOwner)) return true;
     }
     return false;
 }
@@ -1304,6 +1309,11 @@ bool UnchangedSinceAll(std::span<const UnchangedQuery> queries) {
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     JournalWrite(address, bytes);
     if (bytes == 0) return 0;
+    struct FinishedWrite {
+        std::uint64_t address;
+        std::size_t bytes;
+        ~FinishedWrite() { JournalWrite(address, bytes); }
+    } finished{address, bytes};
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
         ++tracker.generation;

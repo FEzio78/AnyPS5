@@ -3190,6 +3190,7 @@ void sharedPlaneEdgeTests(const Device& device, Recorder& recorder) {
 }
 
 void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
+    Require(ImageProfile::Enabled(), "shared unit merge regressions require APS5_PROFILE_IMAGES=1");
     const auto& base = device.GetContext();
     struct Case {
         std::uint32_t format, width, height;
@@ -3290,7 +3291,30 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
                 RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
                 image->MarkDirty();
             };
+            const auto requireUnstampedRefresh = [&] {
+                using namespace ImageProfile;
+                Scope root(Images, "pending unstamped refresh regression", true);
+                const auto reads = pending[MemoryRead].calls;
+                const auto compares = pending[MemoryCompare].calls;
+                const auto captures = pending[StorageBaselineCapture].calls;
+                const auto syncs = pending[HookSync].calls;
+                const auto submissions = recorder.Submissions();
+                const auto version = image->Version();
+                for (int refresh = 0; refresh < 3; ++refresh) {
+                    AgcDriver::GuestMemory::BumpCollectEpoch();
+                    Require(image->Refresh(), "an unstamped pending tracked image was refreshed");
+                }
+                Require(image->Version() == version && recorder.Submissions() == submissions, "unstamped pending refresh submitted recorded GPU work");
+                Require(pending[MemoryRead].calls == reads && pending[MemoryCompare].calls == compares, "unstamped pending refresh read or compared guest bytes");
+                Require(pending[StorageBaselineCapture].calls == captures && pending[HookSync].calls == syncs, "unstamped pending refresh captured a baseline or synced through the hook");
+            };
             writeImage();
+            if (mode == 2 && test.format == 56) {
+                Require(StorageTexture::FlushPending(resource.baseAddress, 65536, nullptr, "mixed pending regression"), "mixed pending regression did not store its first unit");
+                Require(StorageTexture::FindPending(resource.baseAddress, geometry.guestBytes) == image, "mixed pending regression lost the other pending units");
+                Require(recorder.PendingWriteOverlaps(resource.baseAddress, 65536), "mixed pending regression has no recorded guest write");
+                requireUnstampedRefresh();
+            }
             image->WriteBack();
             recorder.Sync();
             std::vector<std::byte> gpuBytes(static_cast<std::size_t>(geometry.guestBytes));
@@ -3314,23 +3338,7 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
                 if (change == 2) std::fill_n(expected.begin(), elementBytes, std::byte{0});
                 std::memcpy(staging->Bytes().data(), expected.data(), expected.size());
                 writeImage();
-                if (mode != 1) {
-                    using namespace ImageProfile;
-                    Scope root(Images, "pending unstamped refresh regression", true);
-                    const auto reads = pending[MemoryRead].calls;
-                    const auto compares = pending[MemoryCompare].calls;
-                    const auto captures = pending[StorageBaselineCapture].calls;
-                    const auto syncs = pending[HookSync].calls;
-                    const auto submissions = recorder.Submissions();
-                    const auto version = image->Version();
-                    for (int refresh = 0; refresh < 3; ++refresh) {
-                        AgcDriver::GuestMemory::BumpCollectEpoch();
-                        Require(image->Refresh(), "an unstamped pending tracked image was refreshed");
-                    }
-                    Require(image->Version() == version && recorder.Submissions() == submissions, "unstamped pending refresh submitted recorded GPU work");
-                    Require(pending[MemoryRead].calls == reads && pending[MemoryCompare].calls == compares, "unstamped pending refresh read or compared guest bytes");
-                    Require(pending[StorageBaselineCapture].calls == captures && pending[HookSync].calls == syncs, "unstamped pending refresh captured a baseline or synced through the hook");
-                }
+                if (mode != 1) requireUnstampedRefresh();
                 recorder.Sync();
                 const auto neighbor = test.offset != 0 && test.format == 5 ? test.offset - 0x300 - 64 : test.offset + geometry.guestBytes;
                 Require(neighbor + 64 <= bytes, "shared unit merge neighbor exceeds allocation");

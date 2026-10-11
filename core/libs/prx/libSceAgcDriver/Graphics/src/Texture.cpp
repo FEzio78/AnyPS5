@@ -1599,7 +1599,11 @@ bool StorageTexture::Refresh() {
         }
     }
     static const bool traceMerge = std::getenv("APS5_TRACE_STORAGE_MERGE") != nullptr;
-    if (traceMerge) std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu validBaselines=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, generationBaseline.size(), generationBaseline.size(), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
+    if (traceMerge) {
+        std::size_t baselineBytes = 0;
+        for (const auto& [begin, saved] : generationBaseline) baselineBytes += saved.size();
+        std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu baselineBlocks=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, baselineBytes, generationBaseline.size(), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
+    }
     if (unchanged) {
         ImageProfile::Scope validityTiming(ImageProfile::StorageBaselineValidity, "refresh unchanged");
         ++Profile().storageReused;
@@ -1867,6 +1871,12 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
             forgetBaselines(layer);
+            const auto begin = layerBegin(layer);
+            const auto bytes = static_cast<std::size_t>(layerBytes(layer));
+            if (!GuestMemory::Watched(begin, bytes)) {
+                const auto saved = std::span<const std::byte>(original).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), bytes);
+                generationBaseline[begin].assign(saved.begin(), saved.end());
+            }
         }
         captureTrackedBaselines(0, trackedLayers);
         refreshGeneration();
@@ -2997,7 +3007,7 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
     constexpr std::uint64_t block = 65536;
     const auto accessEnd = address + bytes;
     for (const auto& texture : images) {
-        if (texture->originalValid || !texture->generationBaseline.empty()) return false;
+        if (texture->originalValid) return false;
         for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {
             if (!texture->layerPending[layer]) continue;
             const auto begin = std::max(address, texture->layerBegin(layer));
@@ -3005,6 +3015,9 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
             if (end <= begin) continue;
             if (texture->layerGeneration[layer] == 0) return false;
             for (auto at = begin & ~(block - 1); at < end; at += block) {
+                const auto baselineBegin = std::max(at, texture->layerBegin(layer));
+                const auto baselineEnd = std::min(at + block, texture->layerBegin(layer) + texture->layerBytes(layer));
+                if (!texture->baselineFor(baselineBegin, baselineEnd).empty()) return false;
                 const auto from = std::max(at, begin);
                 const auto to = std::min(at + block, end);
                 if (!GuestMemory::WrittenSince(from, static_cast<std::size_t>(to - from), texture->layerGeneration[layer])) return false;
@@ -3988,8 +4001,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
     }
     std::vector<std::uint8_t> changedBlocks(spanBlocks);
-    const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks);
+    std::vector<std::uint8_t> cpuBlocks(spanBlocks);
+    const bool tracked = GuestMemory::ChangedBlocks(firstStored, static_cast<std::size_t>(lastStored - firstStored), generations, changedBlocks, cpuBlocks);
     const bool compared = !tracked && compareUntracked(firstStored, static_cast<std::size_t>(lastStored - firstStored), changedBlocks);
+    if (compared) cpuBlocks = changedBlocks;
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         if (!layers[layer]) continue;
         const auto begin = layerBegin(layer);
@@ -4003,11 +4018,12 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             const auto to = std::min(at + block, end);
             if (from >= to) continue;
             const bool edge = from != at || to != at + block;
-            if (changedBlocks[static_cast<std::size_t>((at - spanBegin) / block)] == GuestMemory::BlockWritten && (compared || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && !unchangedSinceBaseline(from, to)) {
+            const auto index = static_cast<std::size_t>((at - spanBegin) / block);
+            if (changedBlocks[index] == GuestMemory::BlockWritten && (compared || !edge || GuestMemory::StoredOver(from, static_cast<std::size_t>(to - from), layerGeneration[layer])) && (cpuBlocks[index] == 0 || !unchangedSinceBaseline(from, to))) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
-                if (baselineFor(from, to).empty()) continue;
+                if (cpuBlocks[index] == 0 || baselineFor(from, to).empty()) continue;
                 mergeCpu = true;
             }
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;

@@ -1858,6 +1858,27 @@ unsigned long long CodeOffset(const void* address) {
 
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
+
+void readCommittedBytes(std::uint64_t address, std::span<std::byte> destination, const void* caller) {
+    const TimedAccess timed(CounterRead, destination.size());
+    CountReadCaller(caller);
+    if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
+        std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
+        return;
+    }
+    std::memset(destination.data(), 0, destination.size());
+    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+}
+
+bool equalsCommittedBytes(std::uint64_t address, std::span<const std::byte> bytes) {
+    const TimedAccess timed(CounterCompare, bytes.size());
+    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
+    for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
+        if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
+    }
+    return true;
+}
+
 }
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
@@ -1886,42 +1907,32 @@ void Read(std::uint64_t address, std::span<std::byte> destination, std::size_t a
 
 void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryRead, "read committed and sync");
+    imageTiming.Describe({address, destination.size()});
     if (destination.empty()) return;
     FlushGpuWrites(address, destination.size());
-    ReadCommittedUnsynced(address, destination);
+    readCommittedBytes(address, destination, __builtin_return_address(0));
 }
 
 void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
     Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryRead, "read committed without sync");
     imageTiming.Describe({address, destination.size()});
     if (destination.empty()) return;
-    const TimedAccess timed(CounterRead, destination.size());
-    CountReadCaller(__builtin_return_address(0));
-    if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
-        std::memcpy(destination.data(), reinterpret_cast<const void*>(address), destination.size());
-        return;
-    }
-    std::memset(destination.data(), 0, destination.size());
-    for (const auto& [begin, end] : CommittedRanges(address, destination.size())) std::memcpy(destination.data() + (begin - address), reinterpret_cast<const void*>(begin), static_cast<std::size_t>(end - begin));
+    readCommittedBytes(address, destination, __builtin_return_address(0));
 }
 
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryCompare, "compare committed and sync");
+    imageTiming.Describe({address, bytes.size()});
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());
-    return EqualsCommittedUnsynced(address, bytes);
+    return equalsCommittedBytes(address, bytes);
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
     Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryCompare, "compare committed without sync");
     imageTiming.Describe({address, bytes.size()});
     if (bytes.empty()) return true;
-    const TimedAccess timed(CounterCompare, bytes.size());
-    if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;
-    for (const auto& [begin, end] : CommittedRanges(address, bytes.size())) {
-        if (std::memcmp(reinterpret_cast<const void*>(begin), bytes.data() + (begin - address), static_cast<std::size_t>(end - begin)) != 0) return false;
-    }
-    return true;
+    return equalsCommittedBytes(address, bytes);
 }
 
 Compare CompareMapped(std::uint64_t address, std::span<const std::byte> bytes) {

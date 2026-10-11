@@ -6,6 +6,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <string>
+#include <unordered_map>
+#include <vector>
 
 namespace AgcDriver::GpuMutexProfile {
 
@@ -80,6 +82,12 @@ public:
             double total = 0, max = 0;
             std::uint64_t calls = 0;
             Sample slowest;
+            struct Program {
+                double ms = 0;
+                std::uint64_t calls = 0;
+                std::array<double, Count> phaseMs{};
+            };
+            std::unordered_map<std::uint64_t, Program> programs;
         };
         static thread_local Window window;
         window.total += ms;
@@ -88,6 +96,10 @@ public:
             window.max = ms;
             window.slowest = sample;
         }
+        auto& program = window.programs[sample.program];
+        program.ms += ms;
+        ++program.calls;
+        for (std::size_t i = 0; i < Count; ++i) program.phaseMs[i] += sample.rows[i].ms;
         if (now - window.at < std::chrono::seconds(10)) return;
         const auto& slow = window.slowest;
         std::string phases;
@@ -99,6 +111,22 @@ public:
             phases += text;
         }
         ProfilePrint_nid_no_patch("[gpu-mutex] q0x%x %llu holds %.1fms (10 s), slowest %.3fms program=0x%llx groups=%ux%ux%u spirv=%zu words; inclusive phases:%s\n", GuestMemory::CurrentPacket().queue, static_cast<unsigned long long>(window.calls), window.total, window.max, static_cast<unsigned long long>(slow.program), slow.groups[0], slow.groups[1], slow.groups[2], slow.words, phases.c_str());
+        std::vector<std::pair<std::uint64_t, const typename decltype(window.programs)::mapped_type*>> ranked;
+        for (const auto& [address, entry] : window.programs) ranked.emplace_back(address, &entry);
+        std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second->ms > b.second->ms; });
+        std::string top;
+        for (std::size_t rank = 0; rank < std::min<std::size_t>(5, ranked.size()); ++rank) {
+            const auto& [address, entry] = ranked[rank];
+            std::snprintf(text, sizeof(text), " 0x%llx %llux %.1fms (%.3f each:", static_cast<unsigned long long>(address), static_cast<unsigned long long>(entry->calls), entry->ms, entry->ms / static_cast<double>(entry->calls));
+            top += text;
+            for (std::size_t i = 0; i < Count; ++i) {
+                if (entry->phaseMs[i] < 0.05 * entry->ms) continue;
+                std::snprintf(text, sizeof(text), " %s %.1f", Names[i], entry->phaseMs[i]);
+                top += text;
+            }
+            top += ")";
+        }
+        ProfilePrint_nid_no_patch("[gpu-mutex-programs] q0x%x top holds by program (10 s, inclusive phases >= 5%%):%s\n", GuestMemory::CurrentPacket().queue, top.c_str());
         window = Window{};
     }
     Dispatch(const Dispatch&) = delete;

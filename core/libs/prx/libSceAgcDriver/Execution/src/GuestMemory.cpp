@@ -1083,10 +1083,60 @@ void stampWrittenRun(void* context, std::uintptr_t begin, std::uintptr_t end) {
 }
 #endif
 
+#ifdef _WIN32
+// The committed runs of partly committed ranges (resident heap mirrors), by range and arena commit
+// generation: a walk of such a range asks the kernel about each run without first failing over
+// the whole range and querying every region again. APS5_NO_SPARSE_RUN_CACHE=1 queries every walk.
+struct SparseRuns {
+    std::uint64_t first = 0;
+    std::uint64_t stop = 0;
+    std::uint64_t generation = 0;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
+};
+
+struct SparseRunCache {
+    std::array<SparseRuns, 64> entries{};
+    std::size_t next = 0;
+    std::uint64_t hits = 0;
+    std::uint64_t queried = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+thread_local SparseRunCache sparseRunCache;
+
+bool sparseRunCacheEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_SPARSE_RUN_CACHE") == nullptr;
+    return enabled;
+}
+
+void reportSparseRuns() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto& cache = sparseRunCache;
+    if (!profile || std::chrono::steady_clock::now() - cache.reported < std::chrono::seconds(10)) return;
+    AgcDriver::ProfilePrint_nid_no_patch("[sparse-collect] thread walks of partly committed ranges (10 s): %llu from cached runs, %llu queried\n", static_cast<unsigned long long>(cache.hits), static_cast<unsigned long long>(cache.queried));
+    cache.hits = cache.queried = 0;
+    cache.reported = std::chrono::steady_clock::now();
+}
+#endif
+
 bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, StampKind kind, bool armedOnly = false) {
     ++tracker.generation;
 #ifdef _WIN32
     static_cast<void>(armedOnly);
+    static const bool residentSparse = std::getenv("APS5_RESIDENT_HEAP_MIRRORS") != nullptr;
+    if (residentSparse && sparseRunCacheEnabled()) {
+        const auto generation = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+        for (const auto& entry : sparseRunCache.entries) {
+            if (entry.generation != generation || entry.first != first || entry.stop != stop || entry.runs.empty()) continue;
+            ++sparseRunCache.hits;
+            reportSparseRuns();
+            const auto runs = entry.runs;
+            for (const auto& [begin, end] : runs) {
+                if (!walkWrites(tracker, begin, end, kind, armedOnly)) return false;
+            }
+            return true;
+        }
+    }
     constexpr std::uint64_t page = 4096;
     // One resetting walk: the kernel reports and clears a page's dirty bit together, a write landing
     // after the walk passed a page is reported by the next walk, and a clean page is not touched by the
@@ -1100,17 +1150,26 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         DWORD granularity = 4096;
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, singlePass)) {
             // Uncommitted pages inside the range make the call fail; such ranges are compared instead.
-            static const bool residentSparse = std::getenv("APS5_RESIDENT_HEAP_MIRRORS") != nullptr;
             if (residentSparse) {
+                const auto generation = GuestArena::GuestArenaCommitGeneration_nid_postfix();
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> runs;
                 for (auto at = cursor; at < stop;) {
                     MEMORY_BASIC_INFORMATION memory{};
                     if (VirtualQuery(reinterpret_cast<const void*>(at), &memory, sizeof(memory)) != sizeof(memory)) return false;
                     const auto end = std::min(stop, reinterpret_cast<std::uint64_t>(memory.BaseAddress) + memory.RegionSize);
                     if (end <= at || (at == cursor && end == stop && memory.State != MEM_RESERVE)) return false;
-                    if (memory.State == MEM_COMMIT) {
-                        if (!walkWrites(tracker, at, end, kind, armedOnly)) return false;
-                    } else if (memory.State != MEM_RESERVE) return false;
+                    if (memory.State == MEM_COMMIT) runs.emplace_back(at, end);
+                    else if (memory.State != MEM_RESERVE) return false;
                     at = end;
+                }
+                for (const auto& [begin, end] : runs) {
+                    if (!walkWrites(tracker, begin, end, kind, armedOnly)) return false;
+                }
+                if (sparseRunCacheEnabled() && cursor == first && !runs.empty() && generation == GuestArena::GuestArenaCommitGeneration_nid_postfix()) {
+                    auto& cache = sparseRunCache;
+                    cache.entries[cache.next++ % cache.entries.size()] = {first, stop, generation, std::move(runs)};
+                    ++cache.queried;
+                    reportSparseRuns();
                 }
                 return true;
             }

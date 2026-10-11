@@ -3091,10 +3091,13 @@ void sharedPlaneEdgeTests(const Device& device, Recorder& recorder) {
     };
     constexpr Case cases[]{{18, 1920, 1080, 0x2000}, {5, 3840, 2160, 0xa000}};
     for (const auto& test : cases) {
-        for (const bool imported : {false, true}) {
+        for (const int mode : {0, 1, 2}) {
+            const bool imported = mode != 0;
             if (imported && base.hostImportAlignment == 0) continue;
+            if (mode == 2 && !base.singlePassStorage) continue;
             auto context = base;
             if (!imported) context.hostImportAlignment = 0;
+            context.singlePassStorage = mode == 2;
             TextureDetiler detiler(context);
             context.detiler = &detiler;
             GuestTextureResource resource{};

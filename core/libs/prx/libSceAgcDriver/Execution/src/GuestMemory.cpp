@@ -880,14 +880,12 @@ struct WriteTracker {
         const auto begin = blockBegin(block);
         const auto from = static_cast<std::uint32_t>(std::max(address, begin) - begin);
         const auto to = static_cast<std::uint32_t>(std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin);
+        auto& entry = driverPieces[block];
         if (from == 0 && to == WriteBlockBytes) {
-            if (const auto found = driverPieces.find(block); found != driverPieces.end()) {
-                found->second = DriverPieces{};
-                found->second.whole = stampGeneration;
-            }
+            entry.pieces.clear();
+            entry.whole = stampGeneration;
             return;
         }
-        auto& entry = driverPieces[block];
         auto& pieces = entry.pieces;
         const auto first = std::lower_bound(pieces.begin(), pieces.end(), from, [](const DriverPiece& piece, std::uint32_t offset) { return piece.end <= offset; });
         const auto last = std::lower_bound(first, pieces.end(), to, [](const DriverPiece& piece, std::uint32_t offset) { return piece.begin < offset; });

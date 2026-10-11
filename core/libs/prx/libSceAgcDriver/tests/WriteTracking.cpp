@@ -115,6 +115,10 @@ void CheckOwnStore() {
     std::memset(memory, 0x11, 2 * Block);
     const auto synced = CollectWrites(base, 2 * Block);
     Require(synced != 0, "the own-store block is not collected");
+    const auto whole = MarkWritten(base, Block);
+    MarkWritten(base + 64, 4);
+    Require(StoredOver(base, 4, synced), "a partial store lost an earlier whole-block generation");
+    Require(!StoredOver(base, 4, whole), "a partial store refreshed the rest of a whole-block write");
 
     std::array<std::byte, 8192> bytes{};
     bytes.fill(std::byte{0x44});

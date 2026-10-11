@@ -12,8 +12,8 @@
 namespace AgcDriver::Graphics::ImageProfile {
 
 using Clock = std::chrono::steady_clock;
-enum Phase { Images, Revalidate, Sampled, Storage, Fast, Lookup, CacheLock, Source, Collect, Keys, Flush, Compare, Read, TextureCreate, StorageLookup, StorageRefresh, StorageCreate, StorageUpload, StorageCpuUpload, Baseline, MemoryRead, MemoryCompare, StorageWriteBack, StandaloneWait, HookSync, BoundKeeps, Count };
-inline constexpr std::array<const char*, Count> Names{"B images", "revalidate", "sampled element", "storage element", "fast proof", "sampled lookup", "cache lock", "storage source", "collect writes", "dcc keys", "pending flush", "snapshot compare", "snapshot read", "sampled create/upload", "storage lookup", "storage refresh", "storage create", "storage upload", "storage CPU upload", "capture baseline", "guest read", "guest compare", "storage writeback", "standalone submit/wait", "hook sync", "bound kept bytes"};
+enum Phase { Images, Revalidate, Sampled, Storage, Fast, Lookup, CacheLock, Source, Collect, Keys, Flush, Compare, Read, TextureCreate, StorageLookup, StorageRefresh, StorageCreate, StorageUpload, StorageCpuUpload, Baseline, MemoryRead, MemoryCompare, StorageWriteBack, StandaloneWait, HookSync, BoundKeeps, StorageStampScan, StorageTrackedCompare, StorageBaselineStamp, StorageBaselineValidity, StorageBaselineCapture, Count };
+inline constexpr std::array<const char*, Count> Names{"B images", "revalidate", "sampled element", "storage element", "fast proof", "sampled lookup", "cache lock", "storage source", "collect writes", "dcc keys", "pending flush", "snapshot compare", "snapshot read", "sampled create/upload", "storage lookup", "storage refresh", "storage create", "storage upload", "storage CPU upload", "capture baseline", "guest read", "guest compare", "storage writeback", "standalone submit/wait", "hook sync", "bound kept bytes", "storage stamp scan", "storage tracked compare", "storage baseline stamp", "storage baseline validity", "storage baseline capture"};
 
 struct Surface {
     std::uint64_t address = 0, bytes = 0;

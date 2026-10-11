@@ -1494,6 +1494,7 @@ bool StorageTexture::Refresh() {
             return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
         };
         const auto scanBlocks = [&] {
+            ImageProfile::Scope stampTiming(ImageProfile::StorageStampScan, "refresh blocks");
             blockGenerations(generations);
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
@@ -1504,6 +1505,8 @@ bool StorageTexture::Refresh() {
                 const auto begin = std::max(descriptor.baseAddress, firstBlock + index * 65536);
                 const auto end = std::min(descriptor.baseAddress + guestBytes, firstBlock + (index + 1) * 65536);
                 std::array<std::uint8_t, 1> block{};
+                ImageProfile::Scope compareTiming(ImageProfile::StorageTrackedCompare, "clipped stamped block");
+                compareTiming.Describe({begin, end - begin, descriptor.format, descriptor.width, descriptor.height});
                 if (!compareUntracked(begin, static_cast<std::size_t>(end - begin), block) || block[0] != GuestMemory::BlockUnchanged) continue;
                 stampedBlocks[index] = GuestMemory::BlockUnchanged;
                 cpuBlocks[index] = 0;
@@ -1596,10 +1599,13 @@ bool StorageTexture::Refresh() {
     static const bool traceMerge = std::getenv("APS5_TRACE_STORAGE_MERGE") != nullptr;
     if (traceMerge) std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu validBaselines=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, generationBaseline.size(), static_cast<std::size_t>(std::count(generationBaselineValid.begin(), generationBaselineValid.end(), true)), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
     if (unchanged) {
+        ImageProfile::Scope validityTiming(ImageProfile::StorageBaselineValidity, "refresh unchanged");
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layerPending[layer] || hasBaseline(layer)) continue;
             generationBaseline.resize(static_cast<std::size_t>(guestBytes));
             const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
+            ImageProfile::Scope baselineTiming(ImageProfile::StorageBaselineCapture, "refresh missing baseline");
+            baselineTiming.Describe({layerBegin(layer), layerBytes(layer), descriptor.format, descriptor.width, descriptor.height});
             GuestMemory::ReadCommitted(layerBegin(layer), std::span(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
             generationBaselineValid[layer] = true;
         }
@@ -1874,10 +1880,14 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     if (layers != nullptr && ((!blockUnits && trackedLayers != arrayLayers) || std::all_of(layers->begin(), layers->end(), [](bool selected) { return selected; }))) layers = nullptr;
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
+        ImageProfile::Scope stampTiming(ImageProfile::StorageBaselineStamp, "upload generations");
         const bool whole = !selectedOnly || layers == nullptr;
         const bool settled = guestBytesSettled();
         generationBaseline.resize(static_cast<std::size_t>(guestBytes));
-        if (settled && whole) GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
+        if (settled && whole) {
+            ImageProfile::Scope baselineTiming(ImageProfile::StorageBaselineCapture, "upload whole baseline");
+            GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
+        }
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
@@ -1890,7 +1900,11 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             if (!GuestMemory::Watched(begin, bytes)) {
                 std::memcpy(saved.data(), original.data() + offset, bytes);
                 generationBaselineValid[layer] = true;
-            } else if (settled) GuestMemory::ReadCommitted(begin, saved);
+            } else if (settled) {
+                ImageProfile::Scope baselineTiming(ImageProfile::StorageBaselineCapture, "upload unit baseline");
+                baselineTiming.Describe({begin, bytes, descriptor.format, descriptor.width, descriptor.height});
+                GuestMemory::ReadCommitted(begin, saved);
+            }
         }
         refreshGeneration();
     };

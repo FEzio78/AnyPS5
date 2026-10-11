@@ -72,6 +72,7 @@ void CheckWaitEpochRecorder(Graphics::Recorder& recorder, std::string_view mode)
     }
     WaitMemoryTests::Wait(MakeWaitPacket(label), 0, mode == "late" ? 3 : 1);
     const auto bytes = ThreadCollectedBytes();
+    const auto hits = CollectMemoStatistics().hits;
     const auto outcomes = WaitMemoryTests::Outcomes();
     Check(outcomes.fromRecorder == 1, "wait was not satisfied from the recorder");
     if (mode == "recorder-cpu") {
@@ -81,9 +82,8 @@ void CheckWaitEpochRecorder(Graphics::Recorder& recorder, std::string_view mode)
     } else {
         Check(CollectEpoch() == epoch, "recorder-written wait ended the collect epoch");
         CollectWrites(base, Block);
-        Check(ThreadCollectedBytes() == bytes, "collect after recorder wait missed the memo");
+        Check(ThreadCollectedBytes() == bytes && CollectMemoStatistics().hits == hits + 1, "collect after recorder wait missed the memo");
     }
     recorder.Sync();
     DriverDetail::Driver::Get().Shutdown();
 }
-

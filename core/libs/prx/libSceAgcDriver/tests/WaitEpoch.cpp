@@ -73,9 +73,9 @@ void CheckCpu(std::string_view mode) {
         if (mode == "before-driver") StoreOwnBytes(label + 64, Value);
         WaitMemoryTests::Wait(MakeWaitPacket(label));
     }
-    Check(CollectEpoch() != epoch, "CPU signal did not end the collect epoch");
     CollectWrites(base, Block);
     Check(!UnchangedSince(base, Block, old), "collect after the CPU signal hid the surface store");
+    Check(CollectEpoch() != epoch, "CPU signal did not end the collect epoch");
     Check(WaitMemoryTests::Counts().waits == 1, "CPU wait bump was not counted");
 }
 
@@ -96,6 +96,7 @@ void CheckDriver(std::string_view mode) {
         StoreOwnBytes(label, wide);
     }
     const auto bytes = ThreadCollectedBytes();
+    const auto hits = CollectMemoStatistics().hits;
     if (mode == "wide") {
         const std::array<std::uint32_t, 9> packet{0xc0079300u, 0x13u, static_cast<std::uint32_t>(label), static_cast<std::uint32_t>(label >> 32u), 7, 0, 0xffffffffu, 0xffffffffu, 0};
         WaitMemoryTests::Wait(packet);
@@ -104,7 +105,7 @@ void CheckDriver(std::string_view mode) {
     }
     Check(CollectEpoch() == epoch, "driver-written wait ended the collect epoch");
     CollectWrites(base, Block);
-    Check(ThreadCollectedBytes() == bytes, "second surface collect missed the memo");
+    Check(ThreadCollectedBytes() == bytes && CollectMemoStatistics().hits == hits + 1, "second surface collect missed the memo");
     Check(WaitMemoryTests::Counts().waitsSkipped == 1, "driver wait skip was not counted");
 }
 

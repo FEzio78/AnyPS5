@@ -897,9 +897,6 @@ if(BUILD_TESTING)
             set_tests_properties(agc_wait_epoch_${waitEpochMode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
         endif()
     endforeach()
-endif()
-
-if(BUILD_TESTING)
     set_tests_properties(agc_wait_epoch_late PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_LABEL_TRUST_LATE=1")
 endif()
 

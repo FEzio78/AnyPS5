@@ -1019,10 +1019,6 @@ bool collectMemoEnabled() {
     return !disabled;
 }
 
-// The per-thread memo ring (see WriteTracker::Memo): sized for several dispatches' surfaces in a
-// submission. Only occupied entries of the current epoch are searched, newest first. A thread
-// that never bumps resets the ring for every collect, as intended. APS5_COLLECT_MEMO_ENTRIES=64
-// restores the old capacity; values from 1 through 256 are accepted (256 by default).
 // APS5_SHARED_COLLECT_MEMO=1 uses the tracker's shared ring under its mutex instead.
 struct ThreadCollectMemo {
     std::array<WriteTracker::Memo, 256> entries{};

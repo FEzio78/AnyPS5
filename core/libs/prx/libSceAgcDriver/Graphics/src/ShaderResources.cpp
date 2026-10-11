@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -1511,6 +1512,7 @@ void ShaderResources::buildComplete() {
         // storage elements of one mip chain share the previous element's image.
         {
             ImageProfile::Scope imageTiming(ImageProfile::Images, "build complete", true);
+            GpuMutexProfile::Scope mutexImageTiming(GpuMutexProfile::Images);
             previousSampled = {};
             for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
             for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));

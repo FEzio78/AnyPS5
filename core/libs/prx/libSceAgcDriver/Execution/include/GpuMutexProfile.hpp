@@ -16,8 +16,8 @@ inline bool Enabled() {
     return enabled;
 }
 
-enum Phase : std::size_t { Labels, Device, Acquire, Verify, Flush, Collect, Changed, Compare, Snapshots, Writeback, StoreWalk, StoreMask, StoreStamp, ResidentStore, Count };
-inline constexpr std::array<const char*, Count> Names{"labels", "device", "acquire", "verify", "flush", "collect", "changed", "compare", "snapshots", "writeback", "store-walk", "store-mask", "store-stamp", "resident-store"};
+enum Phase : std::size_t { Labels, Device, Acquire, Verify, Flush, Collect, Changed, Compare, Snapshots, Writeback, StoreWalk, StoreMask, StoreStamp, ResidentStore, Complete, Images, Record, Count };
+inline constexpr std::array<const char*, Count> Names{"labels", "device", "acquire", "verify", "flush", "collect", "changed", "compare", "snapshots", "writeback", "store-walk", "store-mask", "store-stamp", "resident-store", "complete", "images", "record"};
 struct Row {
     double ms = 0;
     double maxMs = 0;

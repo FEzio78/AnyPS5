@@ -565,6 +565,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     imageTiming.Describe({address, guestBytes, resource.format, resource.width, resource.height, words[0], words[3]});
     auto source = ImageProfile::Measure(ImageProfile::Source, "find pending", [&] { return StorageTexture::FindPending(address, guestBytes); });
     if (source == nullptr && depthCompare) source = StorageTexture::FindLive(address, guestBytes);
+    if (depthCompare) CaptureTrace::Log("depth-compare-source sampled=%llx format=%u width=%u height=%u source=%llx sourceFormat=%u sourceWidth=%u sourceHeight=%u sourceLayers=%u sourceMips=%u", static_cast<unsigned long long>(address), resource.format, resource.width, resource.height, static_cast<unsigned long long>(source != nullptr ? source->Descriptor().baseAddress : 0), source != nullptr ? source->Descriptor().format : 0, source != nullptr ? source->Descriptor().width : 0, source != nullptr ? source->Descriptor().height : 0, source != nullptr ? source->ImageLayers() : 0, source != nullptr ? source->Descriptor().mipCount : 0);
     if (source != nullptr && (!(depthCompare ? Texture::CanDepthCopyFrom(context, *source, resource) : Texture::CanCopyFrom(*source, resource)) || MetadataMoved(*source, resource))) source.reset();
     std::optional<DccKeys> keys;
     bool clearThroughKeys = false;

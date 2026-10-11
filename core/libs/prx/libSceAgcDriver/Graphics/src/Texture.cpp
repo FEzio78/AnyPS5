@@ -276,7 +276,7 @@ std::vector<std::byte> Texture::ReadColorPlane(const GuestTextureResource& descr
     Require(source == nullptr, "image capture of a resident render target is not implemented");
     Require(storageSource != nullptr || owned != nullptr, "image capture of a depth image is not implemented");
     Require(storageSource != nullptr || std::getenv("APS5_DUMP_DISPATCH_IMAGES") != nullptr, "sampled image capture requires APS5_DUMP_DISPATCH_IMAGES at image creation");
-    return Graphics::ReadColorPlane(context, storageSource != nullptr ? storageSource->Image() : image, layout, descriptor, descriptor.baseLevel);
+    return Graphics::ReadColorPlane(context, storageSource != nullptr ? storageSource->Image() : image, storageSource != nullptr ? VK_IMAGE_LAYOUT_GENERAL : layout, descriptor, descriptor.baseLevel);
 }
 
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context), depthCompare(depthCompare) {
@@ -514,11 +514,17 @@ bool Texture::CanDepthCopyFrom(const Context& context, const StorageTexture& sou
     if (!CanCopyFrom(source, descriptor) || descriptor.dimension == TextureDimension::k3D || descriptor.mipCount != source.Descriptor().mipCount) return false;
     const auto format = ResolveTextureFormat(descriptor.format);
     if (format != VK_FORMAT_R32_SFLOAT && format != VK_FORMAT_R16_UNORM) return false;
-    const auto sourceFormat = StorageFormatForGuest(context, source.Descriptor().format);
-    if (sourceFormat != format) return false;
     VkFormatProperties properties{};
     context.formatProperties(context.physical, format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM, &properties);
-    return (properties.optimalTilingFeatures & (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT)) == (VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT);
+    constexpr VkFormatFeatureFlags required = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_TRANSFER_DST_BIT | VK_FORMAT_FEATURE_TRANSFER_SRC_BIT;
+    if ((properties.optimalTilingFeatures & required) != required) return false;
+    if (context.imageFormatProperties == nullptr) return false;
+    VkImageFormatProperties imageProperties{};
+    const auto depthFormat = format == VK_FORMAT_R32_SFLOAT ? VK_FORMAT_D32_SFLOAT : VK_FORMAT_D16_UNORM;
+    const auto flags = descriptor.dimension == TextureDimension::kCube ? VK_IMAGE_CREATE_CUBE_COMPATIBLE_BIT : 0u;
+    const auto result = context.imageFormatProperties(context.physical, depthFormat, ImageTypeFor(descriptor.dimension), VK_IMAGE_TILING_OPTIMAL, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT, flags, &imageProperties);
+    const auto geometry = DescribeSurface(descriptor);
+    return result == VK_SUCCESS && descriptor.width <= imageProperties.maxExtent.width && descriptor.height <= imageProperties.maxExtent.height && descriptor.mipCount <= imageProperties.maxMipLevels && geometry.imageLayers <= imageProperties.maxArrayLayers;
 }
 
 namespace {
@@ -574,6 +580,7 @@ bool Texture::RefreshDepthCopy() {
         recorder->Keep(depthCopyBuffer, depthCopyBuffer->Size());
         const std::array<std::pair<VkImage, bool>, 2> images{{{storageSource->Image(), false}, {image, true}}};
         recorder->NoteAccess(Recorder::CommandClass::Copy, {{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
+        Recorder::CountBarriers(Recorder::CommandClass::Copy, 4);
     }
     RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     VkImageMemoryBarrier destination{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
@@ -610,6 +617,7 @@ bool Texture::RefreshDepthCopy() {
     if (batch) batch->SubmitAndWait();
     depthSourceVersion = storageSource->Version();
     DepthCounts().copied.fetch_add(1, std::memory_order_relaxed);
+    CaptureTrace::Log("depth-compare-copy sampled=%llx source=%llx format=%u sourceFormat=%u width=%u height=%u layers=%u mips=%u version=%llu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(storageSource->Descriptor().baseAddress), descriptor.format, storageSource->Descriptor().format, descriptor.width, descriptor.height, geometry.imageLayers, descriptor.mipCount, static_cast<unsigned long long>(depthSourceVersion));
     return true;
 }
 
@@ -2904,6 +2912,7 @@ void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count)
         if (superseded) source->reconcilePending();
     }
     if (eager) {
+        ++version;
         WriteBack();
         return;
     }

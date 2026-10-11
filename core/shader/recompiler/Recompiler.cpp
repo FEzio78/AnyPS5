@@ -503,11 +503,46 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+// The specialized module without its unused descriptor variables (their decorations, names and
+// entry-point interface entries).
+std::vector<std::uint32_t> compactDescriptors(const std::vector<std::uint32_t>& materialized) {
+    std::map<std::uint32_t, std::uint32_t> descriptorVariables;
+    std::set<std::uint32_t> usedDescriptors;
+    for (std::size_t cursor = 5; cursor < materialized.size();) {
+        const auto count = materialized[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
+        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) descriptorVariables.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
+        if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpLoad || op == spv::OpCopyObject) && count >= 4u) usedDescriptors.insert(materialized[cursor + 3u]);
+        cursor += count;
+    }
+    const auto unused = [&](std::uint32_t id) { return descriptorVariables.contains(id) && !usedDescriptors.contains(id); };
+    std::vector<std::uint32_t> compact(materialized.begin(), materialized.begin() + 5);
+    for (std::size_t cursor = 5; cursor < materialized.size();) {
+        const auto count = materialized[cursor] >> 16u;
+        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
+        if (op == spv::OpEntryPoint) {
+            const auto start = compact.size();
+            std::size_t interfaceIndex = 3u;
+            for (; interfaceIndex < count; ++interfaceIndex) {
+                const auto word = materialized[cursor + interfaceIndex];
+                if ((word & 0xffu) == 0u || (word & 0xff00u) == 0u || (word & 0xff0000u) == 0u || (word & 0xff000000u) == 0u) { ++interfaceIndex; break; }
+            }
+            compact.insert(compact.end(), materialized.begin() + cursor, materialized.begin() + cursor + interfaceIndex);
+            for (auto index = interfaceIndex; index < count; ++index) if (!unused(materialized[cursor + index])) compact.push_back(materialized[cursor + index]);
+            compact[start] = (static_cast<std::uint32_t>(compact.size() - start) << 16u) | spv::OpEntryPoint;
+        } else if (!((op == spv::OpVariable && unused(materialized[cursor + 2u])) || ((op == spv::OpDecorate || op == spv::OpName) && unused(materialized[cursor + 1u])))) {
+            compact.insert(compact.end(), materialized.begin() + cursor, materialized.begin() + cursor + count);
+        }
+        cursor += count;
+    }
+    return compact;
+}
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-// The specialized module of a substituted prepared module: specialization passes and the optimizer,
-// cached on disk by their whole input (APS5_NO_SPECIALIZED_DISK_CACHE=1 runs them every time).
+// The specialized module of a substituted prepared module (specialization passes, optimizer,
+// descriptor compaction and validation), cached on disk by its whole input
+// (APS5_NO_SPECIALIZED_DISK_CACHE=1 runs them every time).
 std::vector<std::uint32_t> SpecializeCached(const std::vector<std::uint32_t>& words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds, const SpirvTarget& target) {
-    const auto produce = [&] { return ValidateAndOptimizeSpirv(SpecializeFragmentOutputs(SpecializeSpirv(words), constants, specializedIds), target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true); };
+    const auto produce = [&] { return ValidateAndOptimizeSpirv(compactDescriptors(ValidateAndOptimizeSpirv(SpecializeFragmentOutputs(SpecializeSpirv(words), constants, specializedIds), target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true)), target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false); };
     static const bool cached = std::getenv("APS5_NO_SPECIALIZED_DISK_CACHE") == nullptr;
     if (!cached || !ShaderDiskCache::Enabled()) return produce();
     std::vector<std::byte> key;
@@ -591,40 +626,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
 #if ANYPS5_ENABLE_SPIRV_TOOLS
     materialized = SpecializeCached(materialized, constants, specializedIds, target);
 #else
-    materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
-#endif
-    std::map<std::uint32_t, std::uint32_t> descriptorVariables;
-    std::set<std::uint32_t> usedDescriptors;
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpDecorate && count == 4u && materialized[cursor + 2u] == spv::DecorationBinding) descriptorVariables.emplace(materialized[cursor + 1u], materialized[cursor + 3u]);
-        if ((op == spv::OpAccessChain || op == spv::OpInBoundsAccessChain || op == spv::OpPtrAccessChain || op == spv::OpInBoundsPtrAccessChain || op == spv::OpLoad || op == spv::OpCopyObject) && count >= 4u) usedDescriptors.insert(materialized[cursor + 3u]);
-        cursor += count;
-    }
-    const auto unused = [&](std::uint32_t id) { return descriptorVariables.contains(id) && !usedDescriptors.contains(id); };
-    std::vector<std::uint32_t> compact(materialized.begin(), materialized.begin() + 5);
-    for (std::size_t cursor = 5; cursor < materialized.size();) {
-        const auto count = materialized[cursor] >> 16u;
-        const auto op = static_cast<spv::Op>(materialized[cursor] & 0xffffu);
-        if (op == spv::OpEntryPoint) {
-            const auto start = compact.size();
-            std::size_t interfaceIndex = 3u;
-            for (; interfaceIndex < count; ++interfaceIndex) {
-                const auto word = materialized[cursor + interfaceIndex];
-                if ((word & 0xffu) == 0u || (word & 0xff00u) == 0u || (word & 0xff0000u) == 0u || (word & 0xff000000u) == 0u) { ++interfaceIndex; break; }
-            }
-            compact.insert(compact.end(), materialized.begin() + cursor, materialized.begin() + cursor + interfaceIndex);
-            for (auto index = interfaceIndex; index < count; ++index) if (!unused(materialized[cursor + index])) compact.push_back(materialized[cursor + index]);
-            compact[start] = (static_cast<std::uint32_t>(compact.size() - start) << 16u) | spv::OpEntryPoint;
-        } else if (!((op == spv::OpVariable && unused(materialized[cursor + 2u])) || ((op == spv::OpDecorate || op == spv::OpName) && unused(materialized[cursor + 1u])))) {
-            compact.insert(compact.end(), materialized.begin() + cursor, materialized.begin() + cursor + count);
-        }
-        cursor += count;
-    }
-    materialized = std::move(compact);
-#if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, false);
+    materialized = compactDescriptors(SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds));
 #endif
     auto module = std::make_shared<SpecializedModule>();
     std::map<std::uint32_t, std::uint32_t> bindingNumbers;

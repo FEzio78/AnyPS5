@@ -320,6 +320,7 @@ private:
     void writeBack(std::uint64_t address, std::size_t bytes);
     void writeBackLayers(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
+    bool hasBaseline(std::uint32_t layer) const;
     bool guestBytesSettled() const;
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one
@@ -462,6 +463,7 @@ private:
     DccKeys refreshedKeys = DccKeys::Uncompressed;
     DccKeys refreshedFilledKeys = DccKeys::Uncompressed;
     std::vector<std::byte> generationBaseline;
+    std::vector<bool> generationBaselineValid;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;

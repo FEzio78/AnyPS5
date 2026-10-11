@@ -3264,35 +3264,55 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
             const auto elementBytes = BytesPerElement(test.format);
             std::vector<std::byte> expected(static_cast<std::size_t>(test.width) * test.height * elementBytes);
             for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<std::byte>(i * 131u % 251u + 1u);
-            auto staging = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            auto staging = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             std::memcpy(staging->Bytes().data(), expected.data(), expected.size());
             recorder.Keep(staging);
-            const auto commands = recorder.Commands();
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-            VkBufferImageCopy copy{};
-            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
-            copy.imageExtent = {test.width, test.height, 1};
-            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-            image->MarkDirty();
+            VkImageViewCreateInfo viewInfo{VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO};
+            viewInfo.image = image->Image();
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = TextureDetiler::ImageElementFormat(elementBytes);
+            viewInfo.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+            VkImageView view = VK_NULL_HANDLE;
+            Check(context.Function<PFN_vkCreateImageView>("vkCreateImageView")(context.device, &viewInfo, nullptr, &view), "shared unit merge storage view");
+            struct DestroyView {
+                const Context& context;
+                VkImageView view;
+                ~DestroyView() { context.Function<PFN_vkDestroyImageView>("vkDestroyImageView")(context.device, view, nullptr); }
+            } destroyView{context, view};
+            auto linearLayout = geometry.mips[0];
+            linearLayout.tiledSize = expected.size();
+            linearLayout.tail = false;
+            const auto writeImage = [&] {
+                const auto work = recorder.Commands();
+                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_SHADER_READ_BIT);
+                detiler.DispatchImage(work, TextureTileMode::kLinear, elementBytes, staging->Handle(), 0, view, linearLayout);
+                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_SHADER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+                image->MarkDirty();
+            };
+            writeImage();
             image->WriteBack();
             recorder.Sync();
             std::vector<std::byte> gpuBytes(static_cast<std::size_t>(geometry.guestBytes));
             AgcDriver::GuestMemory::Read(resource.baseAddress, gpuBytes);
-            for (const int change : {0, 1, 2, 3}) {
+            for (const int change : {0, 4, 1, 2, 3}) {
                 recorder.Sync();
-                std::memset(memory, 0, bytes);
-                AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+                if (change != 4) {
+                    std::memset(memory, 0, bytes);
+                    AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+                }
                 image->Refresh();
                 recorder.Sync();
                 auto wanted = gpuBytes;
+                for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<std::byte>(i * 131u % 251u + 1u);
+                if (change == 4) {
+                    std::fill(expected.begin(), expected.end(), std::byte{0x91});
+                    for (auto& value : wanted) {
+                        if (value != std::byte{0}) value = std::byte{0x91};
+                    }
+                }
                 if (change == 2) std::fill_n(expected.begin(), elementBytes, std::byte{0});
                 std::memcpy(staging->Bytes().data(), expected.data(), expected.size());
-                const auto work = recorder.Commands();
-                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(work, staging->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
-                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
-                image->MarkDirty();
+                writeImage();
                 recorder.Sync();
                 const auto neighbor = test.offset != 0 && test.format == 5 ? test.offset - 0x300 - 64 : test.offset + geometry.guestBytes;
                 Require(neighbor + 64 <= bytes, "shared unit merge neighbor exceeds allocation");

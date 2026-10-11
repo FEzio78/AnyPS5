@@ -764,6 +764,7 @@ StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, 
         trackedLayerBytes = blockUnits ? 65536 : guestBytes / trackedLayers;
         layerGeneration.assign(trackedLayers, 0);
         layerPending.assign(trackedLayers, false);
+        generationBaselineValid.assign(trackedLayers, false);
         sliceLinearBytes = geometry.sliceLinearBytes;
         const auto linearBytes = sliceLinearBytes * arrayLayers;
 
@@ -1590,8 +1591,15 @@ bool StorageTexture::Refresh() {
         }
     }
     static const bool traceMerge = std::getenv("APS5_TRACE_STORAGE_MERGE") != nullptr;
-    if (traceMerge) std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, generationBaseline.size(), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
+    if (traceMerge) std::fprintf(stderr, "[storage-merge] refresh image=0x%llx+0x%llx units=%u blockUnits=%d tracked=%d compared=%d original=%d baseline=%zu validBaselines=%zu changed=%zu pending=%zu keysChanged=%d\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), trackedLayers, blockUnits, tracked, compared, originalValid, generationBaseline.size(), static_cast<std::size_t>(std::count(generationBaselineValid.begin(), generationBaselineValid.end(), true)), static_cast<std::size_t>(std::count(changed.begin(), changed.end(), true)), static_cast<std::size_t>(std::count(layerPending.begin(), layerPending.end(), true)), keysChanged);
     if (unchanged) {
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (layerPending[layer] || hasBaseline(layer)) continue;
+            generationBaseline.resize(static_cast<std::size_t>(guestBytes));
+            const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
+            GuestMemory::ReadCommitted(layerBegin(layer), std::span(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+            generationBaselineValid[layer] = true;
+        }
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();
@@ -1624,7 +1632,7 @@ bool StorageTexture::Refresh() {
     // unit's stamps say nothing, so it is stored.
     const auto droppable = [&](std::uint32_t unit) {
         if (keysChanged && IsDccClear(keys)) return true;
-        if (originalValid || generationBaseline.size() == guestBytes) return false;
+        if (hasBaseline(unit)) return false;
         if (compared) return stampedBlocks.at(unit) == GuestMemory::BlockWritten;
         if (!tracked || layerGeneration[unit] == 0 || unit >= stampedBlocks.size() || stampedBlocks[unit] != GuestMemory::BlockWritten) return false;
         const auto begin = layerBegin(unit);
@@ -1805,7 +1813,7 @@ void StorageTexture::captureGuestBytes(const std::vector<bool>* layers) {
 }
 
 bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, std::span<std::uint8_t> changed, bool memoize) const {
-    if (!originalValid) return false;
+    if (!originalValid && generationBaseline.size() != guestBytes) return false;
     struct Exempt {
         const StorageTexture* previous;
         ~Exempt() { refreshing = previous; }
@@ -1814,20 +1822,22 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     Require(address >= descriptor.baseAddress && bytes <= guestBytes && address - descriptor.baseAddress <= guestBytes - bytes, "texture comparison exceeds its snapshot");
     Require(original.size() == guestBytes, "texture comparison has no complete snapshot");
     GuestMemory::FlushGpuWrites(address, bytes);
-    if (!originalValid) return false;
+    if (!originalValid && generationBaseline.size() != guestBytes) return false;
     constexpr std::uint64_t blockBytes = 65536;
     const auto end = address + bytes;
     const auto first = address / blockBytes;
     Require(changed.size() == (end - 1) / blockBytes - first + 1, "texture comparison block count differs");
     const auto* recorder = Recorder::Active();
     const std::array<std::uint64_t, 4> stamp{GuestMemory::CollectEpoch(), GuestMemory::TrackerGeneration(), GuestMemory::ForgetSerial(), recorder != nullptr ? recorder->NewestWriteNote(address, bytes) : 0};
-    const bool cacheable = memoize && stamp[0] != 0 && (stamp[2] & 1u) == 0 && address == descriptor.baseAddress && bytes == guestBytes;
+    const bool cacheable = memoize && (originalValid || std::all_of(generationBaselineValid.begin(), generationBaselineValid.end(), [](bool valid) { return valid; })) && stamp[0] != 0 && (stamp[2] & 1u) == 0 && address == descriptor.baseAddress && bytes == guestBytes;
     if (cacheable && comparedGuestBytes == stamp) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         return true;
     }
-    const auto saved = std::span(original).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
-    if (GuestMemory::EqualsCommittedUnsynced(address, saved)) {
+    const auto& baseline = originalValid ? original : generationBaseline;
+    const bool complete = originalValid || std::all_of(generationBaselineValid.begin(), generationBaselineValid.end(), [](bool valid) { return valid; });
+    const auto saved = std::span(baseline).subspan(static_cast<std::size_t>(address - descriptor.baseAddress), bytes);
+    if (complete && GuestMemory::EqualsCommittedUnsynced(address, saved)) {
         std::fill(changed.begin(), changed.end(), GuestMemory::BlockUnchanged);
         if (cacheable) comparedGuestBytes = stamp;
         return true;
@@ -1836,7 +1846,12 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
     for (std::size_t index = 0; index < changed.size(); ++index) {
         const auto begin = std::max(address, (first + index) * blockBytes);
         const auto stop = std::min(end, (first + index + 1) * blockBytes);
-        const auto saved = std::span(original).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), static_cast<std::size_t>(stop - begin));
+        const auto layer = static_cast<std::uint32_t>((begin - descriptor.baseAddress) / trackedLayerBytes);
+        if (!hasBaseline(layer)) {
+            changed[index] = GuestMemory::BlockMaybeWritten;
+            continue;
+        }
+        const auto saved = std::span(baseline).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), static_cast<std::size_t>(stop - begin));
         changed[index] = GuestMemory::EqualsCommittedUnsynced(begin, saved) ? GuestMemory::BlockUnchanged : GuestMemory::BlockWritten;
     }
     return true;
@@ -1857,17 +1872,22 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     const auto now = GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto stampLayers = [&](bool selectedOnly) {
         const bool whole = !selectedOnly || layers == nullptr;
-        if (!guestBytesSettled()) generationBaseline.clear();
-        else if (whole) {
-            generationBaseline.resize(static_cast<std::size_t>(guestBytes));
-            GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
-        }
+        const bool settled = guestBytesSettled();
+        generationBaseline.resize(static_cast<std::size_t>(guestBytes));
+        if (settled && whole) GuestMemory::ReadCommitted(descriptor.baseAddress, generationBaseline);
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (!whole && !(*layers)[layer]) continue;
             layerGeneration[layer] = now;
-            if (whole || generationBaseline.size() != guestBytes) continue;
-            const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
-            GuestMemory::ReadCommitted(layerBegin(layer), std::span<std::byte>(generationBaseline).subspan(offset, static_cast<std::size_t>(layerBytes(layer))));
+            generationBaselineValid[layer] = settled;
+            if (settled && whole) continue;
+            const auto begin = layerBegin(layer);
+            const auto bytes = static_cast<std::size_t>(layerBytes(layer));
+            const auto offset = static_cast<std::size_t>(begin - descriptor.baseAddress);
+            auto saved = std::span(generationBaseline).subspan(offset, bytes);
+            if (!GuestMemory::Watched(begin, bytes)) {
+                std::memcpy(saved.data(), original.data() + offset, bytes);
+                generationBaselineValid[layer] = true;
+            } else if (settled) GuestMemory::ReadCommitted(begin, saved);
         }
         refreshGeneration();
     };
@@ -2053,8 +2073,8 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
     }
     originalValid = true;
     forgetBorrowed(0, trackedLayers);
-    stampLayers(false);
     GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+    stampLayers(false);
     {
             static const bool recordCpu = [] { const auto* value = std::getenv("APS5_RECORD_CPU_STORAGE_UPLOADS"); return value != nullptr && std::strcmp(value, "1") == 0; }();
             auto self = recordCpu ? weak_from_this().lock() : nullptr;
@@ -2996,7 +3016,7 @@ bool StorageTexture::blocksKept(std::span<const std::shared_ptr<StorageTexture>>
     constexpr std::uint64_t block = 65536;
     const auto accessEnd = address + bytes;
     for (const auto& texture : images) {
-        if (texture->originalValid || texture->generationBaseline.size() == texture->guestBytes) return false;
+        if (texture->originalValid || std::any_of(texture->generationBaselineValid.begin(), texture->generationBaselineValid.end(), [](bool valid) { return valid; })) return false;
         for (std::uint32_t layer = 0; layer < texture->trackedLayers; ++layer) {
             if (!texture->layerPending[layer]) continue;
             const auto begin = std::max(address, texture->layerBegin(layer));
@@ -3881,7 +3901,13 @@ bool StorageTexture::guestBytesSettled() const {
     return recorder == nullptr || !recorder->PendingWriteOverlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
 }
 
+bool StorageTexture::hasBaseline(std::uint32_t layer) const {
+    return originalValid || (generationBaseline.size() == guestBytes && generationBaselineValid.at(layer));
+}
+
 bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const {
+    const auto layer = static_cast<std::uint32_t>((from - descriptor.baseAddress) / trackedLayerBytes);
+    if (!hasBaseline(layer)) return false;
     const auto& baseline = originalValid ? original : generationBaseline;
     if (baseline.size() != guestBytes) return false;
     const auto offset = static_cast<std::size_t>(from - descriptor.baseAddress);
@@ -3889,6 +3915,11 @@ bool StorageTexture::unchangedSinceBaseline(std::uint64_t from, std::uint64_t to
 }
 
 void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
+    struct Exempt {
+        const StorageTexture* previous;
+        ~Exempt() { refreshing = previous; }
+    } exempt{refreshing};
+    refreshing = this;
     ImageProfile::Scope imageTiming(ImageProfile::StorageWriteBack, flushReason != nullptr ? flushReason : "explicit");
     imageTiming.Describe({descriptor.baseAddress, guestBytes, descriptor.format, descriptor.width, descriptor.height});
     CaptureTrace::Log("writeback image=%llx generation=%llu reason=%s units=%zu", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(generation), flushReason, static_cast<std::size_t>(std::count(layers.begin(), layers.end(), true)));
@@ -3913,7 +3944,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     std::vector<bool> skippedLayer(trackedLayers, false);
     bool skippedAny = false;
     bool mergeCpu = false;
-    const bool baselineAvailable = originalValid || generationBaseline.size() == guestBytes;
+    const bool baselineAvailable = originalValid || std::any_of(generationBaselineValid.begin(), generationBaselineValid.end(), [](bool valid) { return valid; });
     std::size_t skipped = 0;
     std::uint64_t firstStored = descriptor.baseAddress + guestBytes;
     std::uint64_t lastStored = descriptor.baseAddress;
@@ -3957,7 +3988,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
                 skippedAny = true;
                 skippedLayer[layer] = true;
                 ++skipped;
-                if (!baselineAvailable) continue;
+                if (!hasBaseline(layer)) continue;
                 mergeCpu = true;
             }
             if (!keep.empty() && keep.back().second == from) keep.back().second = to;
@@ -3986,7 +4017,10 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const HostImport* shadowImport = nullptr;
     const auto settle = [&](bool memoizedCollect) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-            if (layers[layer]) layerPending[layer] = false;
+            if (layers[layer]) {
+                layerPending[layer] = false;
+                generationBaselineValid[layer] = false;
+            }
         }
         const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
         if (allKept || !adjacent.empty()) {
@@ -4162,8 +4196,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     const bool wasValid = originalValid;
     if (!wasValid) {
         FlushHeapMirrorWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), true);
-        if (mergeCpu) original = generationBaseline;
-        else GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+        GuestMemory::ReadCommitted(descriptor.baseAddress, original);
+        if (mergeCpu) {
+            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+                if (!generationBaselineValid[layer]) continue;
+                const auto offset = static_cast<std::size_t>(layerBegin(layer) - descriptor.baseAddress);
+                const auto bytes = static_cast<std::size_t>(layerBytes(layer));
+                std::memcpy(original.data() + offset, generationBaseline.data() + offset, bytes);
+            }
+        }
     }
     DeviceBuffer linear(context, static_cast<std::size_t>(sliceLinearBytes * arrayLayers), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     DeviceBuffer tiled(context, original.size(), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
@@ -4244,9 +4285,15 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
             std::vector<std::byte> guest(length);
             GuestMemory::ReadCommitted(from, guest);
             auto merged = guest;
+            std::size_t cpuChanged = 0, gpuChanged = 0, conflicts = 0, firstCpu = length;
             for (std::size_t i = 0; i < length; ++i) {
                 if (result[i] != baseline[i] && guest[i] == baseline[i]) merged[i] = result[i];
+                if (!traceMerge) continue;
+                if (guest[i] != baseline[i]) { ++cpuChanged; firstCpu = std::min(firstCpu, i); }
+                if (result[i] != baseline[i]) ++gpuChanged;
+                if (guest[i] != baseline[i] && result[i] != baseline[i]) ++conflicts;
             }
+            if (traceMerge) std::fprintf(stderr, "[storage-merge] bytes image=0x%llx range=0x%llx+0x%zx cpu=%zu gpu=%zu conflicts=%zu firstCpuOffset=0x%zx\n", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(from), length, cpuChanged, gpuChanged, conflicts, firstCpu);
             if (!StoreHeapMirrorResults(from, merged, guest)) GuestMemory::WriteChangedCommitted(from, merged, guest);
         } else {
             if (!StoreHeapMirrorResults(from, result, baseline)) GuestMemory::WriteChangedCommitted(from, result, baseline);

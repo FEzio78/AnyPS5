@@ -95,6 +95,11 @@ std::vector<std::uint32_t> ValidateAndOptimizeSpirv(std::span<const std::uint32_
         throw std::runtime_error("SPIR-V validation before optimization failed:\n" + diagnostics);
     }
     if (!optimize) return std::vector<std::uint32_t>(spirv.begin(), spirv.end());
+    static const std::size_t maxOptimizedWords = [] {
+        const char* text = std::getenv("APS5_SPIRV_OPT_MAX_WORDS");
+        return text != nullptr ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10)) : std::size_t{800000};
+    }();
+    if (maxOptimizedWords != 0 && spirv.size() > maxOptimizedWords) return std::vector<std::uint32_t>(spirv.begin(), spirv.end());
     spvtools::Optimizer optimizer(environment);
     optimizer.SetMessageConsumer(consumer);
     static const char* mode = std::getenv("APS5_SPIRV_OPT");

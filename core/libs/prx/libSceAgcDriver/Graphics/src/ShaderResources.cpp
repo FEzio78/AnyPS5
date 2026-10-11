@@ -3559,6 +3559,7 @@ struct MarkTimes {
     std::uint64_t readBytes = 0;
     std::uint64_t writeRanges = 0;
     std::uint64_t writeBytes = 0;
+    std::uint64_t spaceSkips = 0;
     std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
 };
 
@@ -3578,7 +3579,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         return ms;
     };
     double readsMs = 0, copyBacksMs = 0, writesMs = 0, directMs = 0;
-    std::uint64_t readRanges = 0, readBytes = 0, writeRanges = 0, writeBytes = 0;
+    std::uint64_t readRanges = 0, readBytes = 0, writeRanges = 0, writeBytes = 0, spaceSkips = 0;
     const auto report = [&] {
         if (!timed) return;
         auto& times = MarkTiming();
@@ -3592,20 +3593,28 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         times.readBytes += readBytes;
         times.writeRanges += writeRanges;
         times.writeBytes += writeBytes;
+        times.spaceSkips += spaceSkips;
         const auto now = std::chrono::steady_clock::now();
         if (now - times.reported < std::chrono::seconds(10)) return;
-        AgcDriver::ProfilePrint_nid_no_patch("[marks] %llu uses (10 s): pending reads %.0f ms (%.1f ranges, %.0f MiB per use), copy-backs %.0f ms, pending writes %.0f ms (%.1f ranges, %.1f MiB per use), direct marks %.0f ms\n", static_cast<unsigned long long>(times.calls), times.readsMs, static_cast<double>(times.readRanges) / static_cast<double>(times.calls), static_cast<double>(times.readBytes) / static_cast<double>(times.calls) / 1048576.0, times.copyBacksMs, times.writesMs, static_cast<double>(times.writeRanges) / static_cast<double>(times.calls), static_cast<double>(times.writeBytes) / static_cast<double>(times.calls) / 1048576.0, times.directMs);
+        AgcDriver::ProfilePrint_nid_no_patch("[marks] %llu uses (10 s): pending reads %.0f ms (%.1f ranges, %.0f MiB per use), copy-backs %.0f ms, pending writes %.0f ms (%.1f ranges, %.1f MiB per use), direct marks %.0f ms; address space reads already noted in the batch %llu\n", static_cast<unsigned long long>(times.calls), times.readsMs, static_cast<double>(times.readRanges) / static_cast<double>(times.calls), static_cast<double>(times.readBytes) / static_cast<double>(times.calls) / 1048576.0, times.copyBacksMs, times.writesMs, static_cast<double>(times.writeRanges) / static_cast<double>(times.calls), static_cast<double>(times.writeBytes) / static_cast<double>(times.calls) / 1048576.0, times.directMs, static_cast<unsigned long long>(times.spaceSkips));
         times.readsMs = times.copyBacksMs = times.writesMs = times.directMs = 0;
-        times.calls = times.readRanges = times.readBytes = times.writeRanges = times.writeBytes = 0;
+        times.calls = times.readRanges = times.readBytes = times.writeRanges = times.writeBytes = times.spaceSkips = 0;
         times.reported = now;
     };
     {
-        const auto reads = guestMemory.InPlaceReads();
+        const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
+        static const bool everySpaceUse = std::getenv("APS5_NO_SPACE_READ_DEDUPE") != nullptr;
+        const auto owner = everySpaceUse ? nullptr : guestMemory.SpaceOwner();
+        const auto reads = guestMemory.InPlaceReads(owner == nullptr);
         if (timed) {
             readRanges = reads.size();
             for (const auto& [begin, end] : reads) readBytes += end - begin;
         }
-        recorder.NotePendingReads(reads, guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+        recorder.NotePendingReads(reads, kind);
+        if (owner != nullptr) {
+            if (recorder.ReadsNotedBy(owner.get())) ++spaceSkips;
+            else recorder.NotePendingReads(guestMemory.SpaceReads(), kind, owner);
+        }
     }
     readsMs = elapsed();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {

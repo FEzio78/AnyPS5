@@ -262,7 +262,10 @@ public:
     // regions bound in place (`direct`), an address-based build's leased heaps included. A region
     // the GPU copies out of an import (gpuCopy) notes its read itself when the copy is recorded.
     // For the recorder's read tracking (ShaderResources::MarkGpuWrites); nothing once committed.
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const;
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(bool withSpace = true) const;
+    // The leased address space's in-place reads alone, and the space as their owner (null without one).
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> SpaceReads() const;
+    std::shared_ptr<const void> SpaceOwner() const { return space; }
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const;
 
 private:

@@ -1,3 +1,4 @@
+#include "WaitEpoch.hpp"
 #include "Triangle_frag_spv.h"
 #include "Triangle_vert_spv.h"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
@@ -5234,6 +5235,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--wait-epoch-")) {
+            CheckWaitEpochRecorder(recorder, std::string_view(argv[1]).substr(13));
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--shared-unit-merge-only") {
             sharedUnitMergeTests(device, recorder);
             return 0;

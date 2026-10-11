@@ -88,12 +88,14 @@ bool StoredOver(std::uint64_t address, std::size_t bytes, std::uint64_t generati
 // The epoch is per queue worker: BumpCollectEpoch advances the calling thread's epoch to a value no
 // other thread ever holds (one worker's walk never satisfies another's check) at the hardware
 // ordering points of its queue: the start of a submission, a WAIT_REG_MEM the CPU may have satisfied
-// (at entry, polled, timed out, or by another queue's recorded label; a label this queue recorded
-// itself orders no CPU write), a device drain, and before reaping completions outside a submission.
+// (CPU page evidence since epoch entry or an unexplained satisfying value), a device drain, and
+// before reaping completions outside a submission. Tracked driver/recorder writes with no CPU page
+// evidence keep the epoch. APS5_ALWAYS_BUMP_WAIT_EPOCH=1 restores unconditional wait bumps.
 // A thread that never bumps (the presenter, game threads inside the flush hook) gets a fresh epoch
 // for every collect: nothing is reused without an ordering point. APS5_PACKET_EPOCH=1 makes the
 // workers bump before every packet as before. CollectEpochBumps counts the bumps ([guestmem] line).
 void BumpCollectEpoch();
+bool WaitMayObserveCpuWrites(std::uint64_t address, std::size_t bytes, bool driverProduced);
 // Every range the driver stores to or the GPU is recorded to write, in order. A check proven within one
 // collect epoch (see above) stays proven while JournalTouchedSince reports no overlapping write after
 // the serial taken before it; an overflowed journal reports a touch. An owner identifies logical

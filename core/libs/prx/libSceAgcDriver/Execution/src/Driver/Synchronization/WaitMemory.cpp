@@ -126,18 +126,30 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool warned = false;
 
     struct EpochPoint {
-        bool bump = true;
+        std::uint64_t address;
+        std::size_t bytes;
+        bool driverProduced = false;
+        bool satisfied = false;
         ~EpochPoint() {
-            if (bump) bumpEpoch(&EpochBumps::waits);
+            static const bool always = [] { const char* value = std::getenv("APS5_ALWAYS_BUMP_WAIT_EPOCH"); return value != nullptr && std::atoi(value) == 1; }();
+            if (always) {
+                bumpEpoch(&EpochBumps::waitsForced);
+            } else if (!satisfied || GuestMemory::WaitMayObserveCpuWrites(address, bytes, driverProduced)) {
+                bumpEpoch(&EpochBumps::waits);
+            } else {
+                ++epochBumps().waitsSkipped;
+            }
         }
-    } epochPoint;
+    } epochPoint{awaited, awaitedBytes};
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
+        epochPoint.satisfied = true;
         ++outcomes.atEntry;
         return;
     }
     if (heldAtSubmit) return;
     if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        epochPoint.driverProduced = epochPoint.satisfied = true;
         if (writer != queue) notePendingWait(packet, queue, received);
         return;
     }
@@ -179,10 +191,10 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (unlockedHit) ++outcomes.fromRecorderUnlocked;
         if (hit->queue == queue) {
             ++outcomes.fromRecorderSameQueue;
-            if (!hit->late) epochPoint.bump = false;
         } else {
             notePendingWait(packet, queue, received);
         }
+        epochPoint.driverProduced = epochPoint.satisfied = true;
         return true;
     };
 
@@ -330,6 +342,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
         if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+            epochPoint.driverProduced = epochPoint.satisfied = true;
             if (writer != queue) notePendingWait(packet, queue, received);
             return;
         }
@@ -413,6 +426,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (warned) return;
     }
     ++outcomes.polled;
+    epochPoint.satisfied = true;
 }
 
 }

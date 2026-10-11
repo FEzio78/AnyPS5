@@ -66,6 +66,7 @@ public:
     DrawEntryCounters DrawCacheCounters();
 
 private:
+    friend struct WaitMemoryTests;
     friend class SampledReadScope;
     friend struct PendingView;
     friend struct PacketTimer;

@@ -723,6 +723,7 @@ configure_windows_unwind(agc_driver_cmask_fast_clear_tests)
 
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
+        tests/WaitEpochRecorder.cpp
         tests/ResidentHeapMirror.cpp
         tests/BdaShader.cpp
         tests/ResidentPresent.cpp
@@ -865,6 +866,34 @@ if(BUILD_TESTING)
         set_tests_properties(agc_recorder_kept_bytes PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
+endif()
+
+add_test_executable(agc_wait_epoch_tests EXCLUDE_FROM_ALL tests/WaitEpoch.cpp)
+target_include_directories(agc_wait_epoch_tests PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${CMAKE_SOURCE_DIR}/3rdparty/Vulkan-Headers/include ${CMAKE_SOURCE_DIR}/3rdparty/SPIRV-Headers/include)
+target_link_libraries(agc_wait_epoch_tests PRIVATE libSceAgcDriver libc)
+set_target_properties(agc_wait_epoch_tests PROPERTIES CXX_EXTENSIONS OFF)
+configure_windows_unwind(agc_wait_epoch_tests)
+if(BUILD_TESTING)
+    set_target_properties(agc_wait_epoch_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+    foreach(waitEpochMode cpu equal collected polled before-driver driver history adjacent wide unknown forced)
+        add_test(NAME agc_wait_epoch_${waitEpochMode} COMMAND agc_wait_epoch_tests ${waitEpochMode})
+        set_tests_properties(agc_wait_epoch_${waitEpochMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PROFILE_DRAW=1")
+        if(WIN32)
+            set_tests_properties(agc_wait_epoch_${waitEpochMode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_wait_epoch_forced PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_ALWAYS_BUMP_WAIT_EPOCH=1")
+    foreach(waitEpochMode recorder same-queue late recorder-cpu)
+        add_test(NAME agc_wait_epoch_${waitEpochMode} COMMAND agc_driver_recorder_tests --wait-epoch-${waitEpochMode})
+        set_tests_properties(agc_wait_epoch_${waitEpochMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30 ENVIRONMENT "APS5_PROFILE_DRAW=1")
+        if(WIN32)
+            set_tests_properties(agc_wait_epoch_${waitEpochMode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+endif()
+
+if(BUILD_TESTING)
+    set_tests_properties(agc_wait_epoch_late PROPERTIES ENVIRONMENT "APS5_PROFILE_DRAW=1;APS5_LABEL_TRUST_LATE=1")
 endif()
 
 add_test_executable(agc_driver_pm4_tests EXCLUDE_FROM_ALL

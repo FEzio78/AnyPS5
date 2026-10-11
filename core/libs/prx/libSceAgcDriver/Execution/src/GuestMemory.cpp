@@ -1003,6 +1003,7 @@ void watchPrivateMapping(std::uintptr_t address, std::size_t bytes, std::uint64_
 // presenter, game threads inside the flush hook), as nothing orders the CPU's writes for it.
 std::atomic<std::uint64_t> nextCollectEpoch{1};
 thread_local std::uint64_t threadCollectEpoch = 0;
+thread_local std::uint64_t threadCollectGeneration = 0;
 
 std::uint64_t currentCollectEpoch() {
     if (threadCollectEpoch != 0) return threadCollectEpoch;
@@ -1236,8 +1237,44 @@ bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_
 }
 
 void BumpCollectEpoch() {
+    threadCollectGeneration = TrackerGeneration();
     threadCollectEpoch = nextCollectEpoch.fetch_add(1, std::memory_order_relaxed) + 1;
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
+}
+
+bool WaitMayObserveCpuWrites(std::uint64_t address, std::size_t bytes, bool driverProduced) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    if (threadCollectGeneration == 0 || !tracker.watched || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address || !tracker.covers(address, bytes)) return true;
+    const auto first = address & ~(std::uint64_t{WritePageBytes} - 1);
+    const auto stop = (address + bytes + WritePageBytes - 1) & ~(std::uint64_t{WritePageBytes} - 1);
+    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return true;
+    const auto end = address + bytes;
+    for (auto block = tracker.blockOf(address); block <= tracker.blockOf(end - 1); ++block) {
+        const auto begin = tracker.blockBegin(block);
+        const auto from = std::max(address, begin) - begin;
+        const auto to = std::min<std::uint64_t>(end, begin + WriteBlockBytes) - begin;
+        const auto cpu = tracker.cpuPages.find(block);
+        for (auto page = from / WritePageBytes; page <= (to - 1) / WritePageBytes; ++page) {
+            const auto generation = cpu != tracker.cpuPages.end() ? cpu->second.pages[page] : tracker.cpuStampOf(block);
+            if (generation > threadCollectGeneration) return true;
+            if (driverProduced) continue;
+            const auto own = tracker.driverPieces.find(block);
+            if (own == tracker.driverPieces.end()) return true;
+            auto cursor = std::max<std::uint64_t>(from, page * WritePageBytes);
+            const auto finish = std::min<std::uint64_t>(to, (page + 1) * WritePageBytes);
+            if (own->second.whole != 0 && own->second.whole >= generation) continue;
+            for (const auto& piece : own->second.pieces) {
+                if (piece.end <= cursor) continue;
+                if (piece.begin > cursor || piece.generation < generation) break;
+                cursor = std::min<std::uint64_t>(finish, piece.end);
+                if (cursor == finish) break;
+            }
+            if (cursor != finish) return true;
+        }
+    }
+    return false;
 }
 
 std::uint64_t CollectEpochBumps() {

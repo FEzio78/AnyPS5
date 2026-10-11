@@ -1670,10 +1670,34 @@ void ShaderResources::noteReusable() {
     captureValidation();
     reusable = false;
     directRegions.clear();
-    if (NeedsCompletion() || HoldsLease()) return;
-    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return;
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    struct Reasons {
+        std::mutex mutex;
+        std::array<std::uint64_t, 6> counts{};
+        std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+    };
+    static Reasons reasons;
+    const auto count = [&](std::size_t reason) {
+        if (!profile) return;
+        std::lock_guard lock(reasons.mutex);
+        ++reasons.counts[reason];
+        if (std::chrono::steady_clock::now() - reasons.reported < std::chrono::seconds(10)) return;
+        const auto& c = reasons.counts;
+        AgcDriver::ProfilePrint_nid_no_patch("[reusable] builds (10 s): reusable %llu; not: bda table %llu, lease %llu, fault buffer only %llu, copied writes or no direct regions %llu, unserialed region %llu\n", static_cast<unsigned long long>(c[0]), static_cast<unsigned long long>(c[1]), static_cast<unsigned long long>(c[2]), static_cast<unsigned long long>(c[3]), static_cast<unsigned long long>(c[4]), static_cast<unsigned long long>(c[5]));
+        reasons.counts = {};
+        reasons.reported = std::chrono::steady_clock::now();
+    };
+    // A build whose only completion work is the fault-buffer check (no BDA table, no copied writes)
+    // is reusable: every recorded use registers its own check (VulkanDevice::recordDispatch), and a
+    // fault is fatal, so uses sharing the record cannot lose one. APS5_NO_FAULT_BUFFER_REUSE=1
+    // keeps such builds per use as before.
+    static const bool faultReuse = std::getenv("APS5_NO_FAULT_BUFFER_REUSE") == nullptr;
+    if (bda != nullptr && (usesBda || !faultReuse)) return count(usesBda ? 1 : 3);
+    if (guestMemory.HasCopiedWrites()) return count(4);
+    if (HoldsLease()) return count(2);
+    if (TemplateDataRefresh() && std::any_of(allocations.begin(), allocations.end(), [](const Allocation& allocation) { return allocation.buffer != nullptr && !allocation.guest && allocation.size > MaxRefreshBytes; })) return count(3);
     const auto regions = guestMemory.DirectRegions();
-    if (!regions.has_value()) return;
+    if (!regions.has_value()) return count(4);
     for (const auto& [begin, end] : *regions) {
         // No reconcile here: the upload just took these imports, and the set is about to be recorded
         // against them.
@@ -1681,9 +1705,10 @@ void ShaderResources::noteReusable() {
         // Read-only image mirrors (exe ranges) are as stable as imports; their serials have the top
         // bit set, so the two spaces never collide.
         if (serial == 0) serial = ImageMirrorSerial(context, begin, static_cast<std::size_t>(end - begin));
-        if (serial == 0) return;
+        if (serial == 0) return count(5);
         directRegions.push_back({begin, end, serial});
     }
+    count(0);
     reusable = true;
 }
 
@@ -3735,7 +3760,8 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder, const DispatchBindings* 
 
 void ShaderResources::WriteBackBuffers() {
     if (bda) bda->CheckFault();
-    if (SkipWriteBack()) return;
+    // A reusable build has no copied writes; its uses share the upload, which is never committed.
+    if (SkipWriteBack() || reusable) return;
     guestMemory.WriteBack();
 }
 

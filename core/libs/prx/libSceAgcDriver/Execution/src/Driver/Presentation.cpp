@@ -142,11 +142,24 @@ void Driver::reportPresents(double waitedMs, std::size_t inFlight) {
     static VulkanDevice::PresentStatistics previous{};
     static std::uint64_t previousFlips = 0, windowSerial = 0, previousUnsignaled = 0;
     static auto lastReport = std::chrono::steady_clock::now();
+    static auto previousPresent = std::chrono::steady_clock::time_point{};
+    static double longestGapMs = 0;
+    static std::uint64_t gapsOver100 = 0, gapsOver250 = 0;
     waits.push_back(waitedMs);
     if (waits.size() == 1) windowSerial = flipSerial.load();
     const auto now = std::chrono::steady_clock::now();
+    if (previousPresent != std::chrono::steady_clock::time_point{}) {
+        const auto gapMs = std::chrono::duration<double, std::milli>(now - previousPresent).count();
+        longestGapMs = std::max(longestGapMs, gapMs);
+        gapsOver100 += gapMs > 100.0;
+        gapsOver250 += gapMs > 250.0;
+    }
+    previousPresent = now;
     if (now - lastReport < std::chrono::seconds(10)) return;
     lastReport = now;
+    AgcDriver::ProfilePrint_nid_no_patch("[frame-gaps] longest gap between presents %.1f ms; gaps over 100 ms %llu, over 250 ms %llu (10 s)\n", longestGapMs, static_cast<unsigned long long>(gapsOver100), static_cast<unsigned long long>(gapsOver250));
+    longestGapMs = 0;
+    gapsOver100 = gapsOver250 = 0;
     std::sort(waits.begin(), waits.end());
     const auto percentile = [&](double fraction) { return waits.empty() ? 0.0 : waits[std::min(waits.size() - 1, static_cast<std::size_t>(fraction * static_cast<double>(waits.size())))]; };
     const auto counts = VulkanDevice::PresentCounts();

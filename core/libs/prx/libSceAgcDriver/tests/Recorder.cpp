@@ -3335,14 +3335,35 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
                 auto plane = resource;
                 plane.dimension = TextureDimension::k2D;
                 plane.depthOrLastArray = 0;
-                const auto actual = ReadColorPlane(context, image->Image(), VK_IMAGE_LAYOUT_GENERAL, plane, 0);
                 const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
-                Texture reference(context, detiler, plane, identity, std::span<const std::byte>(wanted).first(static_cast<std::size_t>(geometry.layerBytes)));
-                const auto referenceBytes = reference.ReadColorPlane(plane);
-                const auto mismatch = std::mismatch(referenceBytes.begin(), referenceBytes.end(), actual.begin(), actual.end());
-                if (mismatch.first != referenceBytes.end()) {
-                    const auto pixel = static_cast<std::size_t>(mismatch.first - referenceBytes.begin()) / elementBytes;
-                    throw std::runtime_error("shared unit merge " + std::to_string(test.width) + "x" + std::to_string(test.height) + " mode=" + std::to_string(mode) + " change=" + std::to_string(change) + " offset=" + std::to_string(test.offset) + " lost texel at " + std::to_string(pixel % test.width) + "," + std::to_string(pixel / test.width));
+                for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+                    Buffer readback(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+                    CommandBatch sample(context);
+                    const auto commands = sample.Handle();
+                    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+                    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    barrier.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+                    barrier.image = image->Image();
+                    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, layer, 1};
+                    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+                    VkBufferImageCopy copy{};
+                    copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, layer, 1};
+                    copy.imageExtent = {test.width, test.height, 1};
+                    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image->Image(), VK_IMAGE_LAYOUT_GENERAL, readback.Handle(), 1, &copy);
+                    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+                    sample.SubmitAndWait();
+                    const auto actual = readback.Bytes();
+                    Texture reference(context, detiler, plane, identity, std::span<const std::byte>(wanted).subspan(static_cast<std::size_t>(geometry.GuestLayerOffset(layer)), static_cast<std::size_t>(geometry.layerBytes)));
+                    const auto referenceBytes = reference.ReadColorPlane(plane);
+                    const auto mismatch = std::mismatch(referenceBytes.begin(), referenceBytes.end(), actual.begin(), actual.end());
+                    if (mismatch.first != referenceBytes.end()) {
+                        const auto pixel = static_cast<std::size_t>(mismatch.first - referenceBytes.begin()) / elementBytes;
+                        throw std::runtime_error("shared unit merge " + std::to_string(test.width) + "x" + std::to_string(test.height) + " mode=" + std::to_string(mode) + " change=" + std::to_string(change) + " offset=" + std::to_string(test.offset) + " layer=" + std::to_string(layer) + " lost texel at " + std::to_string(pixel % test.width) + "," + std::to_string(pixel / test.width));
+                    }
                 }
                 image->WriteBack();
                 recorder.Sync();

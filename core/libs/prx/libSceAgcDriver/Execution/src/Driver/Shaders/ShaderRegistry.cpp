@@ -22,11 +22,6 @@
 #include <functional>
 #include <list>
 #include <pthread.h>
-#ifndef _WIN32
-#include <sys/resource.h>
-#include <sys/syscall.h>
-#include <unistd.h>
-#endif
 #include <stdexcept>
 #include <thread>
 #include <unordered_set>
@@ -655,19 +650,8 @@ private:
         pthread_attr_destroy(&attributes);
     }
 
-    static void LowerPriority() {
-#ifdef _WIN32
-        sched_param parameter{};
-        parameter.sched_priority = -1;
-        static_cast<void>(pthread_setschedparam(pthread_self(), SCHED_OTHER, &parameter));
-#else
-        static_cast<void>(setpriority(PRIO_PROCESS, static_cast<id_t>(syscall(SYS_gettid)), 5));
-#endif
-    }
-
     static void* Main(void* argument) {
         auto& pool = *static_cast<RegistrationPreparePool*>(argument);
-        LowerPriority();
         for (;;) {
             std::function<void()> task;
             {

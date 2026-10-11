@@ -1693,7 +1693,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     if (!recorder.QueuesSampleDumps()) recorder.FlushStoresOverlapping(address, bytes);
     recorder.FlushKeyStoresOverlapping(address, bytes);
     if (!recorder.DumpSamples(import->address + (address - import->base), address)) return false;
-    recorder.NotePendingWrite(address, bytes);
+    recorder.NotePendingWrite(address, bytes, Graphics::Recorder::WriterKind::SampleDump);
     GuestMemory::MarkWritten(address, bytes);
     return true;
 }
@@ -1875,7 +1875,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
-    else recorder.NotePendingWrite(address, bytes);
+    else recorder.NotePendingWrite(address, bytes, Graphics::Recorder::WriterKind::Fill);
     GuestMemory::MarkWritten(address, bytes);
     phase(notesMs);
     return true;
@@ -2051,7 +2051,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // memory for the copy itself).
     if (AliasCopy(context, destination, source, bytes)) {
         noteWriter({}, 0);
-        recorder.NotePendingWrite(destination, bytes);
+        recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
         outcome.path = 3;
         return outcome;
     }
@@ -2113,7 +2113,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
-    recorder.NotePendingWrite(destination, bytes);
+    recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
     outcome.path = 1;
     return outcome;
 }

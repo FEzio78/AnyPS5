@@ -131,7 +131,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format);
 // or it leaves the cache. Dispatches reusing the image meanwhile skip the round trip entirely.
 class StorageTexture : public std::enable_shared_from_this<StorageTexture> {
 public:
-    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel);
+    StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, bool importRefresh = false);
     ~StorageTexture();
     StorageTexture(const StorageTexture&) = delete;
     StorageTexture& operator=(const StorageTexture&) = delete;
@@ -309,6 +309,10 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    void EnableImportRefresh() { importRefresh = true; }
+    void DisableImportRefresh() { importRefresh = false; }
+    bool ImportRefreshed() const { return importRefresh; }
+    bool ImportRefreshCurrent() const;
     static std::uint64_t SinglePassMoves();
     static std::uint64_t RefreshesProved();
     std::uint64_t GuestBytes() const;
@@ -536,6 +540,8 @@ private:
     std::uint64_t version = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
+    bool importRefresh = false;
+    std::uint64_t importSerial = 0;
     // The storage cache let the image go (Flush): a lookup makes a new image of the surface, so
     // no fill may put results into this one (guarded by the live-image registry lock).
     bool released = false;

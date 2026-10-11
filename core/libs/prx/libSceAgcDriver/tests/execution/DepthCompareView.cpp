@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/BdaFeatures.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -9,9 +10,12 @@
 #include "prx/libSceAgcDriver/Graphics/include/TextureCache.hpp"
 #include "RuntimeAbi.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
+#include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "VulkanTestDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include <bit>
 #include <SDL_loadso.h>
 #ifdef _WIN32
@@ -19,6 +23,8 @@
 #define NOMINMAX
 #endif
 #include <windows.h>
+#else
+#include <sys/mman.h>
 #endif
 #include <array>
 #include <chrono>
@@ -151,7 +157,12 @@ private:
     void release() noexcept {
         if (context.pool != VK_NULL_HANDLE) context.Function<PFN_vkDestroyCommandPool>("vkDestroyCommandPool")(context.device, context.pool, nullptr);
         context.bufferPool.reset();
-        if (context.device != VK_NULL_HANDLE) function<PFN_vkDestroyDevice>("vkDestroyDevice")(context.device, nullptr);
+        if (context.device != VK_NULL_HANDLE) {
+            ClearImageMirrors(context.device);
+            ClearHostImports(context.device);
+            DestroyShadows(context.device);
+            function<PFN_vkDestroyDevice>("vkDestroyDevice")(context.device, nullptr);
+        }
         if (instance != VK_NULL_HANDLE) function<PFN_vkDestroyInstance>("vkDestroyInstance")(instance, nullptr);
         if (library != nullptr) SDL_UnloadObject(library);
     }
@@ -232,7 +243,7 @@ void Run(const Context& context, std::uint32_t format, std::uint32_t side, std::
         Recorder recorder(context);
         recorder.Activate();
         const auto fallback = CachedSampledTexture(context, words, true);
-        Require(!fallback->HasDepthCopy() && fallback->StorageSource() == nullptr, "surface without a GPU source did not use a snapshot");
+        Require(fallback->HasDepthCopy() || fallback->StorageSource() == nullptr, "surface without an imported GPU source did not use a snapshot");
         auto sourceResource = resource;
         if (sourceFormat != 0) sourceResource.format = sourceFormat;
         auto source = CachedStorageSurface(context, sourceResource);
@@ -334,14 +345,175 @@ void Run(const Context& context, std::uint32_t format, std::uint32_t side, std::
     std::printf("depth compare equivalence passed: format %u, %ux%u, %u layers, %u levels\n", format, side, side, layers, levels);
 }
 
+
+void RunImport(const Context& context) {
+    Require(context.hostImportAlignment != 0, "import depth test requires host-imported memory");
+    auto words = Descriptor(0x100000, 22, 1024, 4, 1);
+    auto resource = DecodeTextureResource(words);
+    const auto geometry = DescribeSurface(resource);
+    const auto bytes = geometry.guestBytes;
+#ifdef _WIN32
+    auto* memory = GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536);
+    const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+    Require(section != nullptr, "cannot create imported atlas backing");
+    GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+    CloseHandle(section);
+#else
+    auto* raw = mmap(nullptr, bytes + 65536, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    Require(raw != MAP_FAILED, "cannot map imported atlas");
+    const auto begin = reinterpret_cast<std::uintptr_t>(raw);
+    const auto aligned = (begin + 65535) & ~std::uintptr_t{65535};
+    if (aligned != begin) munmap(raw, aligned - begin);
+    munmap(reinterpret_cast<void*>(aligned + bytes), begin + 65536 - aligned);
+    auto* memory = reinterpret_cast<void*>(aligned);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, bytes);
+#endif
+    Require(memory != nullptr, "cannot allocate imported atlas");
+    GuestAllocations::Mutation().Add(memory, bytes, true, true, true);
+    std::memset(memory, 0, bytes);
+    words = Descriptor(reinterpret_cast<std::uint64_t>(memory), 22, 1024, 4, 1);
+    resource = DecodeTextureResource(words);
+    const auto watch = PrepareImportWatch(context);
+    SetImportWatch(context, ImportWatch::Watch);
+    const auto* import = HostImportFor(context, resource.baseAddress, bytes);
+    Require(import != nullptr && AgcDriver::GuestMemory::Watched(resource.baseAddress, bytes), "import test requires watched memory for unchanged reuse");
+    {
+        Recorder recorder(context);
+        recorder.Activate();
+        auto input = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+        for (std::size_t i = 0; i < bytes / 4; ++i) {
+            constexpr std::array<std::uint32_t, 8> edges{0u, 0x80000000u, 1u, 0x007fffffu, 0x00800000u, 0x3f000000u, 0x3f7fffffu, 0x3f800000u};
+            const auto value = i % 257 < edges.size() ? edges[i % edges.size()] : std::bit_cast<std::uint32_t>(static_cast<float>((i * 37) % 65536) / 65535.0f);
+            std::memcpy(input->Bytes().data() + i * 4, &value, 4);
+        }
+        ShaderRecompiler::RecompileResult program;
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::SampledImage;
+        binding.role = ShaderRecompiler::DescriptorRole::GuestImages;
+        binding.binding = ShaderRecompiler::RuntimeAbi::FirstComparisonImageBinding;
+        binding.count = 1;
+        binding.imageShape = ShaderRecompiler::DescriptorImageShape::Image2DArray;
+        binding.imageSamplers = {0};
+        binding.imageDepthCompare = {true};
+        binding.guestDescriptor.assign(words.begin(), words.end());
+        program.bindings.push_back(binding);
+        const CompiledShader compiled{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+        std::unique_ptr<ShaderResources> reused;
+        std::shared_ptr<Texture> gpu;
+        std::vector<std::byte> previous;
+        for (unsigned pass = 0; pass < 5; ++pass) {
+            AgcDriver::GuestMemory::BumpCollectEpoch();
+            auto expectedKind = Recorder::WriterKind::Unknown;
+            if (pass < 3) {
+                Require(StorageTexture::FindPending(resource.baseAddress, bytes) == nullptr, "import atlas unexpectedly has a pending image");
+                if (pass == 0) Require(StorageTexture::FindLive(resource.baseAddress, bytes) == nullptr, "initial imported atlas has a resident image");
+                const auto commands = recorder.Commands();
+                RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+                if (pass < 2) {
+                    recorder.Keep(input);
+                    CopyBuffer(context, commands, input->Handle(), 0, import->buffer, resource.baseAddress - import->base, bytes);
+                    expectedKind = Recorder::WriterKind::Copy;
+                    recorder.NotePendingWrite(resource.baseAddress, bytes, expectedKind);
+                } else {
+                    context.Function<PFN_vkCmdFillBuffer>("vkCmdFillBuffer")(commands, import->buffer, resource.baseAddress - import->base, bytes, 0x3f000000);
+                    expectedKind = Recorder::WriterKind::Fill;
+                    recorder.NotePendingWrite(resource.baseAddress, bytes, expectedKind);
+                }
+                if (pass != 1) AgcDriver::GuestMemory::MarkWritten(resource.baseAddress, bytes);
+                else recorder.Submit();
+                const auto notes = recorder.PendingWritesOver(resource.baseAddress, bytes);
+                Require(!notes.empty() && notes.back().kind == expectedKind, "recorded writer kind was lost");
+                Require(Recorder::SnapshotWriteOverlaps(resource.baseAddress, bytes), "recorded buffer writer is absent from the snapshot union");
+                recorder.TraceDepthCompareWrites(resource.baseAddress, bytes, resource.format, resource.width, resource.height);
+            } else {
+                if (pass == 4) AgcDriver::GuestMemory::Unwatch(resource.baseAddress, bytes);
+                const auto value = pass == 3 ? 0x3f400000u : 0x3e800000u;
+                for (std::size_t i = 0; i < bytes / 4; ++i) std::memcpy(static_cast<std::byte*>(memory) + i * 4, &value, 4);
+            }
+            const auto versionBefore = gpu != nullptr ? gpu->StorageSource()->Version() : 0;
+            const auto waitsBefore = Recorder::ThreadHookWaits();
+            const auto readsBefore = AgcDriver::GuestMemory::ThreadCpuReadBytes();
+            const auto submitsBefore = recorder.Submissions();
+            {
+                if (reused != nullptr) {
+                    Require(reused->Revalidate(compiled), "import depth resource template did not refresh in place");
+                    gpu = reused->SampledTextures().front();
+                } else {
+                    gpu = CachedSampledTexture(context, words, true);
+                    reused = std::make_unique<ShaderResources>(context, compiled);
+                }
+                Require(gpu->HasDepthCopy() && gpu->StorageSource()->ImportRefreshed(), "import atlas fell back to a snapshot");
+                Require(gpu->StorageSource()->Version() > versionBefore, "import writer did not advance the storage version");
+                Require(!gpu->RefreshDepthCopy(), "import lookup did not copy the refreshed storage version");
+                Require(!gpu->StorageSource()->GuestSnapshotValid(), "import path kept a CPU snapshot");
+                Require(reused->ReadsImage(gpu->StorageSource()), "import resource lost its storage hazard");
+                Require(Recorder::ThreadHookWaits() == waitsBefore, "import lookup waited for the recorded producer");
+                if (pass < 4) {
+                    const auto version = gpu->StorageSource()->Version();
+                    Require(CachedSampledTexture(context, words, true) == gpu && reused->Revalidate(compiled), "unchanged import view was not reusable");
+                    Require(gpu->StorageSource()->Version() == version && !gpu->RefreshDepthCopy(), "unchanged import reuse refreshed or copied");
+                }
+                Require(AgcDriver::GuestMemory::ThreadCpuReadBytes() == readsBefore, "import depth lookup read or compared guest bytes on the CPU");
+                Require(recorder.Submissions() == submitsBefore, "import depth lookup submitted or drained recorded work");
+            }
+            recorder.Sync();
+            const auto actual = ReadDepth(context, *gpu, resource);
+            std::vector<std::byte> snapshot(bytes);
+            ReadTextureSurface(resource, DccKeys::Uncompressed, snapshot);
+            Require(AgcDriver::GuestMemory::ThreadCpuReadBytes() > readsBefore, "CPU read instrumentation did not see the snapshot path");
+            if (pass < 2) Require(std::equal(snapshot.begin(), snapshot.end(), input->Bytes().begin()), "recorded buffer write did not reach the imported atlas");
+            Texture cpu(context, *context.detiler, resource, VkComponentMapping{}, snapshot, true);
+            recorder.Sync();
+            const auto expected = ReadDepth(context, cpu, resource);
+            for (const auto& region : Regions(resource, VK_IMAGE_ASPECT_DEPTH_BIT)) {
+                for (std::uint32_t y = 0; y < region.imageExtent.height; ++y) {
+                    const auto offset = region.bufferOffset + y * region.bufferRowLength * 4;
+                    Require(std::memcmp(actual.data() + offset, expected.data() + offset, region.imageExtent.width * 4) == 0, "import depth texels differ from the snapshot path");
+                }
+            }
+            if (pass == 1) Require(actual == previous, "identical recorded buffer write changed depth texels");
+            else if (!previous.empty()) Require(actual != previous, "changed import bytes left stale depth texels");
+            previous = actual;
+        }
+        recorder.Sync();
+        ClearCachedTextures(context.device);
+        reused.reset();
+        gpu.reset();
+        recorder.Sync();
+    }
+    SetImportWatch(context, watch);
+    GuestAllocations::Mutation().Remove(memory);
+    static_cast<void>(HostImportFor(context, resource.baseAddress, bytes));
+#ifdef _WIN32
+    GuestArena::GuestArenaReset_nid_postfix(memory, bytes);
+    GuestArena::GuestArenaRelease_nid_postfix(memory, bytes);
+#else
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(memory, bytes);
+    munmap(memory, bytes);
+#endif
+    std::puts("import depth equivalence passed: recorded buffer copy/fill, journal-only write, unchanged reuse, watched and untracked CPU writes; no CPU surface reads or waits");
+}
+
 }
 
 int main() {
+    struct Shutdown {
+        ~Shutdown() {
+            AgcDriverShutdown_nid_postfix();
+            AgcDriver::StopProfileOutput_nid_no_patch();
+        }
+    } shutdown;
     try {
 #ifdef _WIN32
         _putenv_s("APS5_DUMP_DISPATCH_IMAGES", "1");
+        _putenv_s("APS5_PROFILE_IMAGES", "1");
+        _putenv_s("APS5_PROFILE_DRAW", "1");
+        _putenv_s("APS5_TRACE_DEPTH_COMPARE", "1");
 #else
         setenv("APS5_DUMP_DISPATCH_IMAGES", "1", 1);
+        setenv("APS5_PROFILE_IMAGES", "1", 1);
+        setenv("APS5_PROFILE_DRAW", "1", 1);
+        setenv("APS5_TRACE_DEPTH_COMPARE", "1", 1);
 #endif
         std::unique_ptr<Device> device;
         try {
@@ -357,6 +529,7 @@ int main() {
         TextureCache textureCache(context);
         context.textureCache = &textureCache;
         std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+        RunImport(context);
         Run(context, 22, 1024, 4, 1);
         Run(context, 22, 128, 4, 4);
         Run(context, 7, 128, 4, 4);

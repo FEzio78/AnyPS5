@@ -532,6 +532,7 @@ namespace {
 struct DepthCompareCounters {
     std::atomic<std::uint64_t> gpu{0};
     std::atomic<std::uint64_t> snapshot{0};
+    std::atomic<std::uint64_t> imported{0};
     std::atomic<std::uint64_t> copied{0};
     std::atomic<std::uint64_t> skipped{0};
     std::atomic<std::int64_t> reported{0};
@@ -549,7 +550,7 @@ void ReportDepthCounts() {
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
     auto last = counts.reported.load();
     if (now - last < 10000 || !counts.reported.compare_exchange_strong(last, now)) return;
-    AgcDriver::ProfilePrint_nid_no_patch("[depth-compare] served GPU copies %llu, snapshots %llu; copies made %llu, skipped by version %llu (cumulative)\n", static_cast<unsigned long long>(counts.gpu.load()), static_cast<unsigned long long>(counts.snapshot.load()), static_cast<unsigned long long>(counts.copied.load()), static_cast<unsigned long long>(counts.skipped.load()));
+    AgcDriver::ProfilePrint_nid_no_patch("[depth-compare] served GPU copies %llu, snapshots %llu; served from import-refreshed storage %llu; copies made %llu, skipped by version %llu (cumulative)\n", static_cast<unsigned long long>(counts.gpu.load()), static_cast<unsigned long long>(counts.snapshot.load()), static_cast<unsigned long long>(counts.imported.load()), static_cast<unsigned long long>(counts.copied.load()), static_cast<unsigned long long>(counts.skipped.load()));
 }
 
 }
@@ -557,6 +558,7 @@ void ReportDepthCounts() {
 void Texture::NoteDepthCompareUse() const {
     if (!depthCompare) return;
     (HasDepthCopy() ? DepthCounts().gpu : DepthCounts().snapshot).fetch_add(1, std::memory_order_relaxed);
+    if (HasDepthCopy() && storageSource->ImportRefreshed()) DepthCounts().imported.fetch_add(1, std::memory_order_relaxed);
     ReportDepthCounts();
 }
 
@@ -878,7 +880,7 @@ VkFormat AttachmentProxyFormat(const Context& context, VkFormat format) {
     return proxy;
 }
 
-StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel) : context(context), detiler(detiler), descriptor(descriptor) {
+StorageTexture::StorageTexture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, std::uint32_t mipLevel, bool importRefresh) : context(context), detiler(detiler), descriptor(descriptor), importRefresh(importRefresh) {
     ImageProfile::Scope imageTiming(ImageProfile::StorageCreate, "new storage image");
     imageTiming.Describe({descriptor.baseAddress, 0, descriptor.format, descriptor.width, descriptor.height});
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -1525,11 +1527,30 @@ LookupOutcomes& ThreadLookupOutcomes() {
     return outcomes;
 }
 
+bool StorageTexture::ImportRefreshCurrent() const {
+    if (!importRefresh || dirty) return true;
+    const auto bytes = static_cast<std::size_t>(guestBytes);
+    return GuestMemory::Watched(descriptor.baseAddress, bytes) && GuestMemory::UnchangedSince(descriptor.baseAddress, bytes, generation) &&
+           !GuestMemory::JournalTouchedSince(importSerial, descriptor.baseAddress, bytes, this);
+}
+
 bool StorageTexture::Refresh() {
     ImageProfile::Scope imageTiming(ImageProfile::StorageRefresh, "refresh");
     imageTiming.Describe({descriptor.baseAddress, guestBytes, descriptor.format, descriptor.width, descriptor.height});
     const bool profile = LookupOutcomes::Profiled();
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (importRefresh && !dirty && HostImportCovers(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) && ProvedKeys() == DccKeys::Uncompressed) {
+        FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "depth import refresh", PublishScope::None);
+        GuestMemory::CollectWrites(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
+        NoteProved();
+        if (uploadedKeys == DccKeys::Uncompressed && ImportRefreshCurrent()) {
+            imageTiming.Reason("depth import unchanged");
+            return true;
+        }
+        uploadReason = "depth import changed or untracked";
+        upload();
+        return false;
+    }
     if (refreshProved()) {
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
@@ -2015,12 +2036,12 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
             forgetBaselines(layer);
             const auto begin = layerBegin(layer);
             const auto bytes = static_cast<std::size_t>(layerBytes(layer));
-            if (!GuestMemory::Watched(begin, bytes)) {
+            if (!importRefresh && !GuestMemory::Watched(begin, bytes)) {
                 const auto saved = std::span<const std::byte>(original).subspan(static_cast<std::size_t>(begin - descriptor.baseAddress), bytes);
                 generationBaseline[begin].assign(saved.begin(), saved.end());
             }
         }
-        captureTrackedBaselines(0, trackedLayers);
+        if (!importRefresh) captureTrackedBaselines(0, trackedLayers);
         refreshGeneration();
     };
     uploadedKeys = ProvedClearKeys(descriptor, guestBytes, keyProof);
@@ -2032,7 +2053,7 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         // batch of its own submitted the recorder's work first and waited for all of it, 25-40 ms
         // under the GPU mutex at the movie stage. APS5_NO_RECORDED_CLEAR=1 waits as before.
         static_cast<void>(HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)));
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        if (importRefresh || GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
         else captureGuestBytes(nullptr);
         forgetBorrowed(0, trackedLayers);
         stampLayers(false);
@@ -2081,9 +2102,10 @@ void StorageTexture::upload(const std::vector<bool>* layers) {
         return;
     }
     if (const auto* import = uploadedKeys == DccKeys::Uncompressed ? HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes)) : nullptr) {
-        if (GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
+        if (importRefresh || GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) originalValid = false;
         else captureGuestBytes(layers);
         stampLayers(true);
+        importSerial = GuestMemory::WriteJournalSerial();
         // A whole-surface upload of a block-unit image goes through the windows too when a unit
         // shadow holds part of the surface (the detile then reads the slabs; a new image has no
         // layout yet); a partial one always does.
@@ -2823,7 +2845,7 @@ std::uint64_t StorageTexture::writeBackWindows(const HostImport& import, std::sp
         recorder->MarkCovered(storedAccess);
         // Only the pieces written into the import are stores a CPU reader must wait for; the
         // shadowed ones reach it through a publish, which notes its own.
-        if (!imported.empty()) recorder->NotePendingWrites(imported);
+        if (!imported.empty()) recorder->NotePendingWrites(imported, Recorder::WriterKind::StorageWriteBack);
     }
     partialWriteBacks.fetch_add(1, std::memory_order_relaxed);
     partialWriteBackBytes.fetch_add(storedBytes, std::memory_order_relaxed);
@@ -2887,6 +2909,10 @@ void StorageTexture::refreshGeneration() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    if (importRefresh) {
+        importRefresh = false;
+        if (!originalValid && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(nullptr);
+    }
     captureTrackedBaselines(first, count);
     if (count != 0) {
         const auto begin = layerBegin(first);
@@ -4332,7 +4358,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         } else {
             recorder->EndGpuTiming(timing, storedBytes);
             recorder->MarkShaderReadsCovered();
-            recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+            recorder->NotePendingWrite(firstStored, static_cast<std::size_t>(lastStored - firstStored), Recorder::WriterKind::StorageWriteBack);
         }
         countStorageWriteBack(storedBytes, true);
         if (profile) Profile().storageGpu += timer.lap();

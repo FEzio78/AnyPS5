@@ -400,7 +400,7 @@ void logLookup(const LookupRecord& record) {
     log.push_back(record);
 }
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0);
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, std::uint32_t mip, std::uint64_t guestBytes = 0, bool importRefresh = false);
 
 std::uint64_t heldBytes(const StorageTexture& image) {
     return std::max<std::uint64_t>(image.AllocationBytes(), image.GuestBytes());
@@ -450,7 +450,7 @@ StorageFailures& StorageFailed() {
 
 // The cached storage image for a sampled descriptor, or null when it cannot be made (then the
 // snapshot path serves the descriptor, as before). Every null return counts as a fallback.
-std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, const GuestTextureResource& resource, std::uint64_t guestBytes, bool importRefresh = false) {
     auto& counters = TextureCounts();
     auto& failures = StorageFailed();
     const auto surface = std::make_pair(resource.baseAddress, guestBytes);
@@ -466,7 +466,7 @@ std::shared_ptr<StorageTexture> sampledStorageSource(const Context& context, con
         }
     }
     try {
-        return cachedStorageTexture(context, {}, resource, 0, guestBytes);
+        return cachedStorageTexture(context, {}, resource, 0, guestBytes, importRefresh);
     } catch (const std::exception& error) {
         counters.storageFallbacks.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lock(failures.mutex);
@@ -564,10 +564,16 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // memory first.
     imageTiming.Describe({address, guestBytes, resource.format, resource.width, resource.height, words[0], words[3]});
     auto source = ImageProfile::Measure(ImageProfile::Source, "find pending", [&] { return StorageTexture::FindPending(address, guestBytes); });
+    const bool pendingSource = source != nullptr;
     if (source == nullptr && depthCompare) source = StorageTexture::FindLive(address, guestBytes);
     if (depthCompare) CaptureTrace::Log("depth-compare-source sampled=%llx format=%u width=%u height=%u source=%llx sourceFormat=%u sourceWidth=%u sourceHeight=%u sourceLayers=%u sourceMips=%u", static_cast<unsigned long long>(address), resource.format, resource.width, resource.height, static_cast<unsigned long long>(source != nullptr ? source->Descriptor().baseAddress : 0), source != nullptr ? source->Descriptor().format : 0, source != nullptr ? source->Descriptor().width : 0, source != nullptr ? source->Descriptor().height : 0, source != nullptr ? source->ImageLayers() : 0, source != nullptr ? source->Descriptor().mipCount : 0);
     if (source != nullptr && (!(depthCompare ? Texture::CanDepthCopyFrom(context, *source, resource) : Texture::CanCopyFrom(*source, resource)) || MetadataMoved(*source, resource))) source.reset();
+    if (source != nullptr && !pendingSource && depthCompare && SampledFromStorageEligible(context, resource, guestBytes)) source->EnableImportRefresh();
+    if (depthCompare) {
+        if (auto* recorder = Recorder::Active()) recorder->TraceDepthCompareWrites(address, bytes, resource.format, resource.width, resource.height);
+    }
     std::optional<DccKeys> keys;
+    bool sourceRefreshed = false;
     bool clearThroughKeys = false;
     if (source != nullptr && resource.dccAddress != 0 && IsDccClear(source->FilledKeys())) {
         keys = scanKeys();
@@ -590,18 +596,18 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     // import, recorded behind the producer, so no bytes are read or compared on the CPU and nothing
     // waits for the producer. A fast-cleared surface (keys) is viewed only through an image whose own
     // descriptor carries the DCC address (below); it stays a snapshot otherwise, its texels not read.
-    if (!depthCompare && source == nullptr && !clearThroughKeys && SampledFromStorageEligible(context, resource, guestBytes)) {
+    if (source == nullptr && !clearThroughKeys && SampledFromStorageEligible(context, resource, guestBytes)) {
 
         keys = scanKeys();
         if (*keys == DccKeys::Uncompressed) {
-            source = ImageProfile::Measure(ImageProfile::Source, "eligible imported surface", [&] { return sampledStorageSource(context, resource, guestBytes); });
+            source = ImageProfile::Measure(ImageProfile::Source, "eligible imported surface", [&] { return sampledStorageSource(context, resource, guestBytes, depthCompare); });
         } else if (ClearedViewEnabled() && StorageClearAvailable(context, resource.format, *keys)) {
             // A fast-cleared surface is viewed as well, through its image cleared on the GPU (the
             // lookup's Refresh, see StorageTexture::upload), when the image's own descriptor names
             // the same DCC metadata so the refresh sees the keys. A snapshot of the clear texels
             // (filled and uploaded on the CPU, then replaced by a view once results are pending: two
             // 4K uploads per clear at the movie stage) serves the surface otherwise, as before.
-            auto candidate = sampledStorageSource(context, resource, guestBytes);
+            auto candidate = sampledStorageSource(context, resource, guestBytes, depthCompare);
             if (candidate != nullptr && candidate->Descriptor().dccAddress == resource.dccAddress) source = std::move(candidate);
         }
         // The lookup's Refresh may have flushed another image's results over the memory (which
@@ -609,15 +615,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         // flush, as it does behind its own. APS5_NO_KEYS_RESCAN=1 keeps the keys scanned above.
         static const bool rescan = std::getenv("APS5_NO_KEYS_RESCAN") == nullptr;
         if (rescan && source == nullptr) keys.reset();
+        sourceRefreshed = source != nullptr && source->ImportRefreshed();
     }
+    if (source != nullptr && depthCompare && !Texture::CanDepthCopyFrom(context, *source, resource)) source.reset();
     // Pages of the surface written since they were last collected are stamped now, before any
     // UnchangedSince (here and on a cache hit) looks at them: the checks only compare stamped blocks,
     // so a write the game made since the last walk is invisible until a collect stamps its page. The
     // walk is memoized per packet, so a texture viewed from a storage image repeats it for free.
     auto generation = GuestMemory::CollectWrites(address, bytes);
-    if (source != nullptr && !GuestMemory::UnchangedSince(address, bytes, source->Generation())) {
+    if (source != nullptr && ((!sourceRefreshed && source->ImportRefreshed()) ||
+        ((!sourceRefreshed || GuestMemory::Watched(address, bytes)) && !GuestMemory::UnchangedSince(address, bytes, source->Generation())))) {
         // The CPU wrote the memory while results were pending: Refresh merges them the usual way.
         source->Refresh();
+        sourceRefreshed = source->ImportRefreshed();
     }
     // Results stored to guest memory just now are stamped newer than `generation`; a snapshot read
     // after them is current at the generation of a second (memoized) collect. The store marks the
@@ -673,7 +683,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             // written meanwhile is taken in by refreshing the image. A fast clear the image cannot
             // see (keys, and no pending results to prefer) ends the view: a snapshot holds the clear.
             if ((depthCompare ? source == it->source : source == nullptr || source == it->source) && (source != nullptr || *keys == DccKeys::Uncompressed) && StorageImageServesKeys(*it->source, resource.dccAddress)) {
-                if (!GuestMemory::UnchangedSince(address, bytes, it->source->Generation())) it->source->Refresh();
+                if (!sourceRefreshed && (!it->source->ImportRefreshCurrent() || !GuestMemory::UnchangedSince(address, bytes, it->source->Generation()))) it->source->Refresh();
                 it->texture->RefreshDepthCopy();
                 it->keys = *keys;
                 touchTexture(cache, it);
@@ -876,21 +886,21 @@ GuestTextureResource StorageSurface(const Context& context, const GuestTextureRe
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
-std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes);
+std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool importRefresh);
 
-std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool importRefresh) {
     ImageProfile::Scope imageTiming(ImageProfile::StorageLookup, "lookup");
     imageTiming.Describe({viewed.baseAddress, guestBytes, viewed.format, viewed.width, viewed.height, words.empty() ? 0u : words[0], words.size() < 4 ? 0u : words[3]});
-    if (!DepthSurfaceAt(viewed.baseAddress)) return cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
-    auto image = cachedGuestStorageTexture(context, words, viewed, mip, guestBytes);
+    if (!DepthSurfaceAt(viewed.baseAddress)) return cachedGuestStorageTexture(context, words, viewed, mip, guestBytes, importRefresh);
+    auto image = cachedGuestStorageTexture(context, words, viewed, mip, guestBytes, importRefresh);
     CopyDepthPlaneToImage(context, viewed, image->Image());
     image->MarkDirty();
     return image;
 }
 
-std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes) {
+std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& viewed, std::uint32_t mip, std::uint64_t guestBytes, bool importRefresh) {
     static const bool disabled = std::getenv("APS5_NO_TEXTURE_CACHE") != nullptr;
-    if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip);
+    if (disabled) return std::make_shared<StorageTexture>(context, *context.detiler, viewed, mip, importRefresh);
     static_cast<void>(words);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
     const bool profile = LookupOutcomes::Profiled();
@@ -911,6 +921,8 @@ std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context
         it = cache.entries.end();
     }
     if (it != cache.entries.end()) {
+        if (importRefresh) it->texture->EnableImportRefresh();
+        else it->texture->DisableImportRefresh();
         it->texture->Refresh();
         cache.entries.splice(cache.entries.begin(), cache.entries, it);
         counters.storageHits.fetch_add(1, std::memory_order_relaxed);
@@ -922,7 +934,7 @@ std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
-    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip)};
+    CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip, importRefresh)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,
     // so an eviction or a failed view before it ran cannot destroy a referenced image.
@@ -1984,6 +1996,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         surface.collected = GuestMemory::CollectWrites(address, bytes);
         if (surface.collected == 0) return fail(FastFail::Collect);
         const auto* source = surface.source;
+        if (source != nullptr && !source->ImportRefreshCurrent()) return fail(FastFail::Changed);
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
             // below is the record's too): the scan repeats on every call, as before.
@@ -2043,6 +2056,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             countKeysProven(true);
         }
         if (!unchanged) query(address, address + bytes, image, nullptr, {i, true, false});
+        if (!image->ImportRefreshCurrent()) return fail(FastFail::Changed);
         if (!image->Cached()) return fail(FastFail::Evicted);
         queries.push_back({address, bytes, image->Generation()});
         images.push_back(image);
@@ -2110,7 +2124,7 @@ bool ShaderResources::fastRevalidateEach() {
         if (surface.source != nullptr) {
             // The view follows the image: it needs the image current with guest memory, as the
             // lookup's Refresh would make it.
-            if (!StorageImageCached(context, surface.source) || !GuestMemory::UnchangedSince(address, bytes, surface.source->Generation())) return false;
+            if (!surface.source->ImportRefreshCurrent() || !StorageImageCached(context, surface.source) || !GuestMemory::UnchangedSince(address, bytes, surface.source->Generation())) return false;
         } else if (!GuestMemory::UnchangedSince(address, bytes, surface.generation)) {
             return false;
         }
@@ -2139,7 +2153,7 @@ bool ShaderResources::fastRevalidateEach() {
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
         if (GuestMemory::CollectWrites(address, bytes) == 0) return false;
         if (PendingStorageOverlaps(address, bytes, image)) return false;
-        if (!StorageImageCached(context, image)) return false;
+        if (!image->ImportRefreshCurrent() || !StorageImageCached(context, image)) return false;
         if (!GuestMemory::UnchangedSince(address, bytes, image->Generation())) return false;
     }
     // Every check passed: snapshot textures are current at the collects issued before them. Storage
@@ -3171,7 +3185,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // keys and stays valid while they are unchanged); a change is the full lookup's to judge.
     if (keys != record.entryKeys) { imageTiming.Reason("dcc keys changed"); return nullptr; }
     if (record.source != nullptr) {
-        if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
+        if (!record.source->ImportRefreshCurrent() || !StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
         if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
@@ -3650,7 +3664,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         }
     }
     elapsed();
-    recorder.NotePendingWrites(guestMemory.Writes());
+    recorder.NotePendingWrites(guestMemory.Writes(), usesBda ? Recorder::WriterKind::AddressBased : Recorder::WriterKind::Buffer);
     writesMs = elapsed();
     guestMemory.MarkDirectWrites();
     directMs = elapsed();

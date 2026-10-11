@@ -2574,7 +2574,7 @@ void Recorder::OnComplete(std::function<void()> action) {
     writeBackCompletions.fetch_add(1, std::memory_order_acq_rel);
 }
 
-bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value) {
+bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel, int value, WriterKind kind) {
     CaptureTrace::Log("buffer-write batch=%llu address=%llx bytes=%zu label=%d", static_cast<unsigned long long>(submissions + 1), static_cast<unsigned long long>(address), bytes, ownLabel);
     if (bytes == 0) return false;
     GuestMemory::JournalWrite(address, bytes);
@@ -2583,6 +2583,7 @@ bool Recorder::noteWrite(std::uint64_t address, std::size_t bytes, bool ownLabel
     open->writes.emplace_back(address, end);
     open->writeNotes.push_back(++writeNoteCount);
     open->writeValues.push_back(static_cast<std::int16_t>(value));
+    open->writeKinds.push_back(ownLabel ? WriterKind::Label : kind);
     if (!ownLabel) markOverwritten(address, end);
     // A poller waiting on this range learns that the open batch may now hold its producer.
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
@@ -2610,6 +2611,7 @@ void Recorder::noteWriteOn(Batch& batch, std::uint64_t address, std::size_t byte
     batch.writes.emplace_back(address, address + bytes);
     batch.writeNotes.push_back(++writeNoteCount);
     batch.writeValues.push_back(-1);
+    batch.writeKinds.push_back(ownLabel ? WriterKind::Label : WriterKind::Unknown);
     if (!ownLabel) markOverwritten(address, address + bytes);
     if (activeRecorder == this) writeGeneration.fetch_add(1, std::memory_order_release);
     if (!SnapshotCovers(address, address + bytes)) publishPendingWrites();
@@ -2623,8 +2625,8 @@ void Recorder::markOverwritten(std::uint64_t address, std::uint64_t end) {
     for (auto it = labels.lower_bound(address >= 3 ? address - 3 : 0); it != labels.end() && it->first < end; ++it) it->second.overwritten = true;
 }
 
-void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
-    if (!noteWrite(address, bytes)) return;
+void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes, WriterKind kind) {
+    if (!noteWrite(address, bytes, false, -1, kind)) return;
     publishPendingWrites();
     // The note precedes this thread's vkQueueSubmit and the label another queue polls for; the
     // fence makes that order hold without relying on x86 store ordering.
@@ -2632,19 +2634,41 @@ void Recorder::NotePendingWrite(std::uint64_t address, std::size_t bytes) {
 }
 
 void Recorder::NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value) {
-    if (!noteWrite(address, bytes, false, value)) return;
+    if (!noteWrite(address, bytes, false, value, WriterKind::Fill)) return;
     publishPendingWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
 }
 
-void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+void Recorder::NotePendingWrites(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, WriterKind kind) {
     bool publish = false;
     for (const auto& [begin, end] : ranges) {
-        if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin))) publish = true;
+        if (end > begin && noteWrite(begin, static_cast<std::size_t>(end - begin), false, -1, kind)) publish = true;
     }
     if (!publish) return;
     publishPendingWrites();
     std::atomic_thread_fence(std::memory_order_seq_cst);
+}
+
+void Recorder::TraceDepthCompareWrites(std::uint64_t address, std::size_t bytes, std::uint32_t format, std::uint32_t width, std::uint32_t height) const {
+    static const bool enabled = std::getenv("APS5_TRACE_DEPTH_COMPARE") != nullptr;
+    if (!enabled || bytes == 0) return;
+    static std::map<std::tuple<std::uint64_t, std::size_t, WriterKind>, unsigned> samples;
+    constexpr std::array names{"unknown", "buffer stores/copy-back", "BDA/address-based stores/copy-back", "buffer fill", "buffer copy", "storage image write-back", "image shadow publish", "CMASK materialization", "sample counter dump", "label store"};
+    const auto scan = [&](const Batch& batch, bool unsubmitted) {
+        for (std::size_t i = 0; i < batch.writes.size(); ++i) {
+            const auto& range = batch.writes[i];
+            if (range.first >= address + bytes || range.second <= address) continue;
+            const auto key = std::make_tuple(address, bytes, batch.writeKinds[i]);
+            if (samples.size() >= 1024 && !samples.contains(key)) samples.clear();
+            auto& count = samples[key];
+            if (count >= 4) continue;
+            ++count;
+            std::fprintf(stderr, "[depth-compare-writer] surface=0x%llx+0x%zx format=%u %ux%u writer=%s range=0x%llx..0x%llx note=%llu batch=%llu queue=0x%x state=%s\n", static_cast<unsigned long long>(address), bytes, format, width, height, names[static_cast<std::size_t>(batch.writeKinds[i])], static_cast<unsigned long long>(range.first), static_cast<unsigned long long>(range.second), static_cast<unsigned long long>(batch.writeNotes[i]), static_cast<unsigned long long>(unsubmitted ? submissions + 1 : batch.serial), batch.queue, unsubmitted ? "open" : "submitted");
+        }
+    };
+    if (open != nullptr) scan(*open, true);
+    for (const auto& batch : inFlight) scan(*batch, false);
+    for (const auto* batch : finishing) scan(*batch, false);
 }
 
 void Recorder::publishPendingWrites() const {
@@ -2730,7 +2754,7 @@ std::vector<Recorder::PendingWrite> Recorder::PendingWritesOver(std::uint64_t ad
     const auto end = address + bytes;
     const auto scan = [&](const Batch& batch) {
         for (std::size_t i = 0; i < batch.writes.size(); ++i) {
-            if (address < batch.writes[i].second && batch.writes[i].first < end) found.push_back({batch.writes[i].first, batch.writes[i].second, batch.writeNotes[i], batch.writeValues[i]});
+            if (address < batch.writes[i].second && batch.writes[i].first < end) found.push_back({batch.writes[i].first, batch.writes[i].second, batch.writeNotes[i], batch.writeValues[i], batch.writeKinds[i]});
         }
     };
     if (open != nullptr) scan(*open);

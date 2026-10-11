@@ -21,6 +21,8 @@ namespace {
 // APS5_PAD_SCRIPT="cross@30+6,down@300+0.2": pad buttons held from a time after start (seconds) for a
 // duration, ORed into the published state, so an unattended run can press buttons whatever the
 // window focus.
+std::uint32_t ButtonNamed(const std::string& name);
+
 struct ScriptedPress {
     std::uint32_t button = 0;
     double from = 0;
@@ -32,7 +34,6 @@ const std::vector<ScriptedPress>& ScriptedPresses() {
         std::vector<ScriptedPress> parsed;
         const char* text = std::getenv("APS5_PAD_SCRIPT");
         if (text == nullptr) return parsed;
-        const std::pair<const char*, Pad::PadButton> names[] = {{"cross", Pad::PadButton::Cross}, {"circle", Pad::PadButton::Circle}, {"square", Pad::PadButton::Square}, {"triangle", Pad::PadButton::Triangle}, {"options", Pad::PadButton::Options}, {"up", Pad::PadButton::Up}, {"down", Pad::PadButton::Down}, {"left", Pad::PadButton::Left}, {"right", Pad::PadButton::Right}, {"l1", Pad::PadButton::L1}, {"r1", Pad::PadButton::R1}};
         std::string script = text;
         std::size_t cursor = 0;
         while (cursor < script.size()) {
@@ -42,24 +43,56 @@ const std::vector<ScriptedPress>& ScriptedPresses() {
             const auto at = entry.find('@');
             const auto plus = entry.find('+', at == std::string::npos ? 0 : at);
             if (at == std::string::npos || plus == std::string::npos) throw std::runtime_error("APS5_PAD_SCRIPT entry '" + entry + "' is not button@seconds+seconds");
-            const auto name = entry.substr(0, at);
-            const auto found = std::find_if(std::begin(names), std::end(names), [&](const auto& candidate) { return name == candidate.first; });
-            if (found == std::end(names)) throw std::runtime_error("APS5_PAD_SCRIPT names an unknown button '" + name + "'");
             const auto from = std::strtod(entry.c_str() + at + 1, nullptr);
-            parsed.push_back({static_cast<std::uint32_t>(found->second), from, from + std::strtod(entry.c_str() + plus + 1, nullptr)});
+            parsed.push_back({ButtonNamed(entry.substr(0, at)), from, from + std::strtod(entry.c_str() + plus + 1, nullptr)});
         }
         return parsed;
     }();
     return presses;
 }
 
+std::uint32_t ButtonNamed(const std::string& name) {
+    const std::pair<const char*, Pad::PadButton> names[] = {{"cross", Pad::PadButton::Cross}, {"circle", Pad::PadButton::Circle}, {"square", Pad::PadButton::Square}, {"triangle", Pad::PadButton::Triangle}, {"options", Pad::PadButton::Options}, {"up", Pad::PadButton::Up}, {"down", Pad::PadButton::Down}, {"left", Pad::PadButton::Left}, {"right", Pad::PadButton::Right}, {"l1", Pad::PadButton::L1}, {"r1", Pad::PadButton::R1}};
+    const auto found = std::find_if(std::begin(names), std::end(names), [&](const auto& candidate) { return name == candidate.first; });
+    if (found == std::end(names)) throw std::runtime_error("scripted pad input names an unknown button '" + name + "'");
+    return static_cast<std::uint32_t>(found->second);
+}
+
+// APS5_PAD_COMMAND_FILE=<path>: a controlling script writes "<button> <seconds>" lines there; each
+// line holds the button from when it is read, and the file is removed once read.
+std::vector<ScriptedPress>& CommandedPresses() {
+    static std::vector<ScriptedPress> presses;
+    return presses;
+}
+
+void ReadPadCommands(double seconds) {
+    static const char* path = std::getenv("APS5_PAD_COMMAND_FILE");
+    static auto nextPoll = std::chrono::steady_clock::time_point{};
+    if (path == nullptr) return;
+    const auto now = std::chrono::steady_clock::now();
+    if (now < nextPoll) return;
+    nextPoll = now + std::chrono::milliseconds(100);
+    std::FILE* file = std::fopen(path, "rb");
+    if (file == nullptr) return;
+    char line[128];
+    while (std::fgets(line, sizeof(line), file) != nullptr) {
+        char name[32]{};
+        double duration = 0;
+        if (std::sscanf(line, "%31s %lf", name, &duration) == 2) CommandedPresses().push_back({ButtonNamed(name), seconds, seconds + duration});
+    }
+    std::fclose(file);
+    std::remove(path);
+}
+
 std::uint32_t ScriptedButtons() {
     static const auto started = std::chrono::steady_clock::now();
-    const auto& presses = ScriptedPresses();
-    if (presses.empty()) return 0;
     const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    ReadPadCommands(seconds);
     std::uint32_t buttons = 0;
-    for (const auto& press : presses) {
+    for (const auto& press : ScriptedPresses()) {
+        if (press.from <= seconds && seconds < press.until) buttons |= press.button;
+    }
+    for (const auto& press : CommandedPresses()) {
         if (press.from <= seconds && seconds < press.until) buttons |= press.button;
     }
     return buttons;

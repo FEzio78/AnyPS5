@@ -1,3 +1,4 @@
+#include <cstdio>
 #include <algorithm>
 #include <array>
 #include <cstddef>
@@ -104,6 +105,7 @@ int APS5_VABI sceVideoOutSetFlipRate(int handle, int rate) try {
     }
     std::lock_guard lock(cfg->mutex);
     cfg->Check();
+    if (cfg->flipRate != rate) std::fprintf(stderr, "[videoout] flip rate %d: at most one flip every %d vblanks (%.2f Hz)\n", rate, rate + 1, 60000.0 / 1001.0 / (rate + 1));
     cfg->flipRate = rate;
     return 0;
 } catch (const ProcessShutdown&) {

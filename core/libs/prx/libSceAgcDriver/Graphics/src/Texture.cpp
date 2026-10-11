@@ -238,6 +238,47 @@ std::uint64_t SampledTextureMemory() {
     return SampledMemoryCounter().load(std::memory_order_relaxed);
 }
 
+std::vector<std::byte> ReadColorPlane(const Context& context, VkImage image, VkImageLayout layout, const GuestTextureResource& descriptor, std::uint32_t mip) {
+    Require(image != VK_NULL_HANDLE, "image capture has no color image");
+    Require(descriptor.dimension == TextureDimension::k2D && descriptor.baseArray == 0u && descriptor.depthOrLastArray == 0u && descriptor.mipCount == 1u && mip == 0u,
+            "image capture outside single-level 2D color planes is not implemented");
+    Require(!IsBlockCompressed(descriptor.format) && !IsConvertedTextureFormat(descriptor.format), "image capture of compressed or converted formats is not implemented");
+    const auto bytes = static_cast<std::uint64_t>(descriptor.width) * descriptor.height * BytesPerElement(descriptor.format);
+    Buffer readback(context, bytes, VK_BUFFER_USAGE_TRANSFER_DST_BIT);
+    CommandBatch batch(context);
+    const auto commands = batch.Handle();
+    VkImageMemoryBarrier barrier{VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+    barrier.srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.oldLayout = layout;
+    barrier.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier.image = image;
+    barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 1u, 0u, 1u};
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    VkBufferImageCopy region{};
+    region.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, mip, 0u, 1u};
+    region.imageExtent = {descriptor.width, descriptor.height, 1u};
+    context.Function<PFN_vkCmdCopyImageToBuffer>("vkCmdCopyImageToBuffer")(commands, image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, readback.Handle(), 1, &region);
+    barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barrier.dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
+    barrier.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+    barrier.newLayout = layout;
+    context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
+    RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
+    batch.SubmitAndWait();
+    const auto data = readback.Bytes();
+    return {data.begin(), data.end()};
+}
+
+std::vector<std::byte> Texture::ReadColorPlane(const GuestTextureResource& descriptor) const {
+    Require(source == nullptr, "image capture of a resident render target is not implemented");
+    Require(storageSource != nullptr || owned != nullptr, "image capture of a depth image is not implemented");
+    Require(storageSource != nullptr || std::getenv("APS5_DUMP_DISPATCH_IMAGES") != nullptr, "sampled image capture requires APS5_DUMP_DISPATCH_IMAGES at image creation");
+    return Graphics::ReadColorPlane(context, storageSource != nullptr ? storageSource->Image() : image, layout, descriptor, descriptor.baseLevel);
+}
+
 Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTextureResource& descriptor, VkComponentMapping components, std::span<const std::byte> snapshot, bool depthCompare) : context(context) {
 
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -277,6 +318,7 @@ Texture::Texture(const Context& context, TextureDetiler& detiler, const GuestTex
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
         imageInfo.usage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+        if (std::getenv("APS5_DUMP_DISPATCH_IMAGES") != nullptr) imageInfo.usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
         imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
         imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
         Check(context.Function<PFN_vkCreateImage>("vkCreateImage")(context.device, &imageInfo, nullptr, &image), "vkCreateImage");

@@ -36,6 +36,7 @@ bool StorageFormatAvailable(const Context& context, std::uint32_t guestFormat);
 bool StorageClearAvailable(const Context& context, std::uint32_t guestFormat, DccKeys keys);
 std::uint64_t SampledTextureMemory();
 bool ClearKeepsDenormals(const Context& context, VkFormat format);
+std::vector<std::byte> ReadColorPlane(const Context& context, VkImage image, VkImageLayout layout, const GuestTextureResource& descriptor, std::uint32_t mip);
 
 // A sampled texture's own VkImage with its memory, shared with the recorder while a recorded upload
 // still writes it (see the snapshot constructor), so the texture may go before the batch completes.
@@ -82,6 +83,7 @@ public:
     bool ViewsStorageImage() const { return storageSource != nullptr; }
     const StorageTexture* StorageSource() const { return storageSource.get(); }
     const std::shared_ptr<StorageTexture>& SharedStorageSource() const { return storageSource; }
+    std::vector<std::byte> ReadColorPlane(const GuestTextureResource& descriptor) const;
     // The last key scan of the sampled surface (ProvedClearKeys), for surfaces whose keys are not
     // the source image's own (snapshots, views over other metadata); one per cache entry, so every
     // object binding the texture shares it. Under GuestMemory::GpuMutex only.

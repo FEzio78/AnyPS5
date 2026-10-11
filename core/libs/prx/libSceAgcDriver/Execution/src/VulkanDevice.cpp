@@ -35,6 +35,7 @@
 #include <charconv>
 #include <condition_variable>
 #include <fstream>
+#include <filesystem>
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
@@ -58,6 +59,67 @@
 
 namespace AgcDriver {
 namespace {
+
+std::string BeginDispatchImageCapture(Graphics::Recorder& recorder, const Graphics::ShaderResources& resources, std::uint64_t address, std::uint32_t x, std::uint32_t y, std::uint32_t z, bool indirect) {
+    struct Settings {
+        std::vector<std::uint64_t> addresses;
+        std::filesystem::path directory;
+        std::uint64_t limit = 16u;
+        bool all = false;
+    };
+    static const auto settings = [] {
+        Settings result;
+        const auto* filter = std::getenv("APS5_DUMP_DISPATCH_IMAGES");
+        if (filter == nullptr) return result;
+        std::string_view list(filter);
+        result.all = list == "all";
+        while (!result.all && !list.empty()) {
+            const auto comma = list.find(',');
+            auto entry = list.substr(0, comma);
+            if (entry.starts_with("0x")) entry.remove_prefix(2);
+            std::uint64_t value = 0;
+            const auto parsed = std::from_chars(entry.data(), entry.data() + entry.size(), value, 16);
+            Graphics::Require(parsed.ec == std::errc{} && parsed.ptr == entry.data() + entry.size(), "invalid APS5_DUMP_DISPATCH_IMAGES shader address");
+            result.addresses.push_back(value);
+            if (comma == std::string_view::npos) break;
+            list.remove_prefix(comma + 1);
+            Graphics::Require(!list.empty(), "empty APS5_DUMP_DISPATCH_IMAGES shader address");
+        }
+        Graphics::Require(result.all || !result.addresses.empty(), "APS5_DUMP_DISPATCH_IMAGES requires shader addresses or all");
+        if (const auto* limit = std::getenv("APS5_DUMP_DISPATCH_IMAGES_LIMIT")) {
+            const std::string_view text(limit);
+            const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result.limit);
+            Graphics::Require(parsed.ec == std::errc{} && parsed.ptr == text.data() + text.size() && result.limit != 0u, "invalid APS5_DUMP_DISPATCH_IMAGES_LIMIT");
+        }
+        const auto* directory = std::getenv("APS5_DUMP_DISPATCH_IMAGES_DIR");
+        result.directory = directory != nullptr ? directory : "dispatch-images";
+        return result;
+    }();
+    if (!settings.all && std::ranges::find(settings.addresses, address) == settings.addresses.end()) return {};
+    static std::map<std::uint64_t, std::uint64_t> counts;
+    auto& count = counts[address];
+    if (count >= settings.limit) return {};
+    ++count;
+    static std::uint64_t sequence = 0;
+    char name[96];
+    std::snprintf(name, sizeof(name), "%06llu_cs_%llx_%04llu", static_cast<unsigned long long>(++sequence), static_cast<unsigned long long>(address), static_cast<unsigned long long>(count));
+    std::filesystem::create_directories(settings.directory);
+    const auto prefix = (settings.directory / name).string();
+    recorder.Sync();
+    resources.DumpImages(prefix + "_before");
+    std::ofstream metadata(prefix + "_dispatch.txt");
+    metadata << "shader=0x" << std::hex << address << std::dec << "\ngroups=" << x << ',' << y << ',' << z << "\nindirect=" << indirect << '\n';
+    metadata.flush();
+    Graphics::Require(static_cast<bool>(metadata), "cannot write dispatch image capture dispatch metadata");
+    return prefix;
+}
+
+void EndDispatchImageCapture(Graphics::Recorder& recorder, const Graphics::ShaderResources& resources, const std::string& prefix) {
+    if (prefix.empty()) return;
+    recorder.Sync();
+    resources.DumpImages(prefix + "_after");
+    std::fprintf(stderr, "[dispatch-images] %s\n", prefix.c_str());
+}
 
 void check(VkResult result, const char* operation) {
     if (result == VK_ERROR_DEVICE_LOST) Graphics::ReportDeviceLost(operation);
@@ -3903,7 +3965,9 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
+    const auto capturePrefix = BeginDispatchImageCapture(recorder, *resources, programAddress, record.x, record.y, record.z, indirect);
     recordDispatch(record);
+    EndDispatchImageCapture(recorder, *resources, capturePrefix);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);
     APS5_LOG_OUT_DEBUG("Dispatch recorded groups=%s", groupsText);
@@ -4074,7 +4138,9 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto capturePrefix = BeginDispatchImageCapture(*state->recorder, *hit->resources, programAddress, record.x, record.y, record.z, indirect);
     recordDispatch(record);
+    EndDispatchImageCapture(*state->recorder, *hit->resources, capturePrefix);
     if (profile) counters.recordNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - recordStart).count()), std::memory_order_relaxed);
     timing.Mark("command_record");
     timer.phase(PhaseRecord);

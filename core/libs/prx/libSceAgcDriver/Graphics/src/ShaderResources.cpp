@@ -14,6 +14,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/TextureTiling.hpp"
@@ -2740,6 +2741,33 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     }
     allocations.push_back({address, size, true, nullptr, ShaderRecompiler::DescriptorRole::ShaderData, written});
     return allocations.size() - 1;
+}
+
+void ShaderResources::DumpImages(const std::string& prefix) const {
+    std::ofstream metadata(prefix + ".tsv");
+    Require(static_cast<bool>(metadata), "cannot open dispatch image capture metadata");
+    metadata << "kind\tindex\taddress\twidth\theight\tguest_format\tvk_format\ttile_mode\tmip\tbytes\tfile\n";
+    const auto save = [&](const char* kind, std::size_t index, const GuestTextureResource& descriptor, VkFormat format, std::uint32_t mip, const std::vector<std::byte>& bytes) {
+        const auto path = prefix + "_" + kind + "_" + std::to_string(index) + ".raw";
+        std::ofstream file(path, std::ios::binary);
+        file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        Require(static_cast<bool>(file), "cannot write dispatch image capture plane");
+        metadata << kind << '\t' << index << '\t' << std::hex << descriptor.baseAddress << std::dec << '\t' << descriptor.width << '\t' << descriptor.height
+                 << '\t' << descriptor.format << '\t' << format << '\t' << static_cast<int>(descriptor.tileMode) << '\t' << mip << '\t' << bytes.size() << '\t' << path << '\n';
+    };
+    for (std::size_t index = 0; index < textures.size(); ++index) {
+        Require(index < validatedTextures.size() && validatedTextures[index].valid && !validatedTextures[index].depth, "sampled image capture without color resource metadata is not implemented");
+        const auto& descriptor = validatedTextures[index].resource;
+        save("reference", index, descriptor, textures[index]->ViewFormat(), descriptor.baseLevel, textures[index]->ReadColorPlane(descriptor));
+    }
+    for (std::size_t index = 0; index < storageTextures.size(); ++index) {
+        const auto& texture = *storageTextures[index];
+        const auto& descriptor = texture.Descriptor();
+        save(storageWritten[index] ? "output" : "storage", index, descriptor, StorageFormatForGuest(context, descriptor.format), storageMips[index],
+             ReadColorPlane(context, texture.Image(), VK_IMAGE_LAYOUT_GENERAL, descriptor, storageMips[index]));
+    }
+    metadata.flush();
+    Require(static_cast<bool>(metadata), "cannot write dispatch image capture metadata");
 }
 
 std::string ShaderResources::Describe() const {

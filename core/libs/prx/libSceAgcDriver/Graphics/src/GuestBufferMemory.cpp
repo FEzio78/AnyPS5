@@ -548,7 +548,13 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         retireImport(context.device, state, found, lease);
     }
     const auto alignment = context.hostImportAlignment;
-    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0 || state.failed.contains(base)) return nullptr;
+    static const bool traceRefusals = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
+    const auto refuse = [&](const char* why) -> const HostImport* {
+        if (traceRefusals) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx refused: %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), why);
+        return nullptr;
+    };
+    if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return refuse("alignment");
+    if (state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
     // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
     // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
@@ -580,7 +586,8 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
         MEMORY_BASIC_INFORMATION info{};
         if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0 || info.State != MEM_COMMIT || (info.Protect & (PAGE_NOACCESS | PAGE_GUARD)) != 0) {
             state.failed.insert(base);
-            return nullptr;
+            if (traceRefusals) std::fprintf(stderr, "[gpu]   at 0x%llx state 0x%lx protect 0x%lx type 0x%lx\n", static_cast<unsigned long long>(cursor), info.State, info.Protect, info.Type);
+            return refuse("pages not committed or not accessible");
         }
         const auto protection = info.Protect & 0xffu;
         const bool pageWritable = (info.Type == MEM_PRIVATE || info.Type == MEM_IMAGE) && (protection == PAGE_READWRITE || protection == PAGE_EXECUTE_READWRITE || protection == PAGE_WRITECOPY || protection == PAGE_EXECUTE_WRITECOPY);
@@ -592,7 +599,7 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     }
     if (!writable && readOnly) {
         state.failed.insert(base);
-        return nullptr;
+        return refuse("read-only");
     }
     if (!writable) {
         if (refused.BaseAddress != nullptr) {

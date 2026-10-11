@@ -104,6 +104,9 @@ std::atomic<std::uint64_t> forgetCalls{0};
 std::atomic<std::uint64_t> forgetSerial{0};
 std::atomic<std::uint64_t> forgetBytes{0};
 std::atomic<std::uint64_t> collectMemoHits{0};
+std::atomic<std::uint64_t> collectMemoMisses{0};
+std::atomic<std::uint64_t> collectMemoEvictions{0};
+std::atomic<std::uint64_t> collectMemoEpochMissPeak{0};
 std::atomic<std::uint64_t> collectEpochBumps{0};
 std::atomic<std::uint64_t> unwatchSerial{0};
 // Walks that reported at least one written page (the ones the probe pass used to double), and the
@@ -335,7 +338,8 @@ public:
         for (std::size_t i = 0; i < MemoryCounterCount; ++i) {
             AgcDriver::ProfilePrint_nid_no_patch(" %s %llu calls %.0f MiB %.1f s", MemoryCounterNames[i], static_cast<unsigned long long>(totals[i][0]), totals[i][1] / 1048576.0, totals[i][2] / 1e9);
         }
-        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, collect epochs %llu", static_cast<unsigned long long>(collectMemoHits.load()), static_cast<unsigned long long>(collectEpochBumps.load()));
+        const auto memo = CollectMemoStatistics();
+        AgcDriver::ProfilePrint_nid_no_patch(" collect-memo hits %llu, misses %llu, evictions %llu, epoch miss peak %llu, capacity %zu, collect epochs %llu", static_cast<unsigned long long>(memo.hits), static_cast<unsigned long long>(memo.misses), static_cast<unsigned long long>(memo.evictions), static_cast<unsigned long long>(memo.epochMissPeak), memo.capacity, static_cast<unsigned long long>(collectEpochBumps.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" collect-dirty %llu tracker waits %llu / %llu", static_cast<unsigned long long>(collectDirty.load()), static_cast<unsigned long long>(trackerWaits.load()), static_cast<unsigned long long>(trackerAcquisitions.load()));
         AgcDriver::ProfilePrint_nid_no_patch(" | arena 0x%llx+0x%llx image 0x%llx+0x%llx forgets %llu (%.0f MiB)", static_cast<unsigned long long>(PagesBase()), static_cast<unsigned long long>(PagesSize()), static_cast<unsigned long long>(ImagePagesBase()), static_cast<unsigned long long>(ImagePagesSize()), static_cast<unsigned long long>(forgetCalls.load()), forgetBytes.load() / 1048576.0);
         {
@@ -1015,15 +1019,48 @@ bool collectMemoEnabled() {
     return !disabled;
 }
 
-// The per-thread memo ring (see WriteTracker::Memo): sized to a packet's working set (a dispatch
-// collects each of its few dozen image surfaces in stage A and again in stage B). Entries of a
-// thread that never bumps its epoch never match (each collect gets a fresh epoch), as intended.
+// The per-thread memo ring (see WriteTracker::Memo): sized for several dispatches' surfaces in a
+// submission. Only occupied entries of the current epoch are searched, newest first. A thread
+// that never bumps resets the ring for every collect, as intended. APS5_COLLECT_MEMO_ENTRIES=64
+// restores the old capacity; values from 1 through 256 are accepted (256 by default).
 // APS5_SHARED_COLLECT_MEMO=1 uses the tracker's shared ring under its mutex instead.
 struct ThreadCollectMemo {
-    std::array<WriteTracker::Memo, 64> entries{};
+    std::array<WriteTracker::Memo, 256> entries{};
     std::size_t next = 0;
+    std::size_t count = 0;
+    std::uint64_t epoch = 0, unwatched = 0, misses = 0;
+
+    void prepare(std::uint64_t currentEpoch, std::uint64_t serial) {
+        if (epoch == currentEpoch && unwatched == serial) return;
+        epoch = currentEpoch;
+        unwatched = serial;
+        next = count = misses = 0;
+    }
 };
 thread_local ThreadCollectMemo threadCollectMemo;
+
+std::size_t collectMemoCapacity() {
+    static const std::size_t capacity = [] {
+        const char* value = std::getenv("APS5_COLLECT_MEMO_ENTRIES");
+        const auto parsed = value != nullptr ? std::strtoul(value, nullptr, 10) : 256;
+        return parsed > 0 && parsed <= 256 ? static_cast<std::size_t>(parsed) : std::size_t{256};
+    }();
+    return capacity;
+}
+
+bool profileCollectMemo() {
+    static const bool enabled = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return enabled;
+}
+
+void noteMemoMiss(std::uint64_t epoch, std::uint64_t serial) {
+    if (!profileCollectMemo()) return;
+    collectMemoMisses.fetch_add(1, std::memory_order_relaxed);
+    threadCollectMemo.prepare(epoch, serial);
+    const auto misses = ++threadCollectMemo.misses;
+    auto peak = collectMemoEpochMissPeak.load(std::memory_order_relaxed);
+    while (peak < misses && !collectMemoEpochMissPeak.compare_exchange_weak(peak, misses, std::memory_order_relaxed)) {}
+}
 
 bool sharedCollectMemo() {
     static const bool shared = std::getenv("APS5_SHARED_COLLECT_MEMO") != nullptr;
@@ -1135,7 +1172,11 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     if (useMemo && !sharedCollectMemo()) {
         // An entry exists only for a completed walk of an in-arena range, so the tracker is
         // initialized and watched; nothing below the lock needs asking.
-        for (const auto& entry : threadCollectMemo.entries) {
+        threadCollectMemo.prepare(epoch, unwatched);
+        auto index = threadCollectMemo.next;
+        for (std::size_t i = 0; i < threadCollectMemo.count; ++i) {
+            index = (index == 0 ? collectMemoCapacity() : index) - 1;
+            const auto& entry = threadCollectMemo.entries[index];
             if (entry.epoch == epoch && entry.unwatched == unwatched && entry.begin <= first && stop <= entry.end) {
                 // The current generation, not the memoized one: blocks stamped since (MarkWritten, an
                 // overlapping collect) were written before this caller reads, and an older value would
@@ -1157,6 +1198,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
             }
         }
     }
+    if (useMemo) noteMemoMiss(epoch, unwatchSerial.load(std::memory_order_relaxed));
     const TimedAccess timed(CounterCollect, bytes);
 #ifndef _WIN32
     if (useMemo && threadCollectEpoch != 0 && bytes <= WriteBlockBytes) {
@@ -1172,8 +1214,17 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
     // Only a completed walk is remembered; a failed one (uncommitted pages) returned 0 above.
     if (collectMemoEnabled()) {
         const auto serial = unwatchSerial.load(std::memory_order_relaxed);
-        if (sharedCollectMemo()) tracker.memo[tracker.nextMemo++ % tracker.memo.size()] = {first, stop, epoch, serial};
-        else threadCollectMemo.entries[threadCollectMemo.next++ % threadCollectMemo.entries.size()] = {first, stop, epoch, serial};
+        auto* entry = static_cast<WriteTracker::Memo*>(nullptr);
+        if (sharedCollectMemo()) {
+            entry = &tracker.memo[tracker.nextMemo++ % tracker.memo.size()];
+        } else {
+            threadCollectMemo.prepare(epoch, serial);
+            entry = &threadCollectMemo.entries[threadCollectMemo.next];
+            threadCollectMemo.next = (threadCollectMemo.next + 1) % collectMemoCapacity();
+            threadCollectMemo.count = std::min(threadCollectMemo.count + 1, collectMemoCapacity());
+        }
+        if (profileCollectMemo() && entry->epoch == epoch && entry->unwatched == serial) collectMemoEvictions.fetch_add(1, std::memory_order_relaxed);
+        *entry = {first, stop, epoch, serial};
     }
     return tracker.generation;
 }
@@ -1279,6 +1330,10 @@ bool WaitMayObserveCpuWrites(std::uint64_t address, std::size_t bytes, bool driv
 
 std::uint64_t CollectEpochBumps() {
     return collectEpochBumps.load(std::memory_order_relaxed);
+}
+
+CollectMemoStats CollectMemoStatistics() {
+    return {collectMemoHits.load(std::memory_order_relaxed), collectMemoMisses.load(std::memory_order_relaxed), collectMemoEvictions.load(std::memory_order_relaxed), collectMemoEpochMissPeak.load(std::memory_order_relaxed), sharedCollectMemo() ? Tracker().memo.size() : collectMemoCapacity()};
 }
 
 std::uint64_t CollectEpoch() {

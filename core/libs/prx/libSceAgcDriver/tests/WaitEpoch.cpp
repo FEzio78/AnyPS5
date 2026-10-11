@@ -31,18 +31,19 @@ void Check(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(reason);
 }
 
-std::uint64_t Allocate() {
+std::uint64_t Allocate(std::size_t blocks = 3) {
+    const auto bytes = blocks * Block;
 #ifdef _WIN32
-    auto* memory = GuestArena::GuestArenaAllocate_nid_postfix(3 * Block, Block);
-    GuestArena::GuestArenaCommit_nid_postfix(memory, 3 * Block, PAGE_READWRITE, 3 * Block);
+    auto* memory = GuestArena::GuestArenaAllocate_nid_postfix(bytes, Block);
+    GuestArena::GuestArenaCommit_nid_postfix(memory, bytes, PAGE_READWRITE, bytes);
 #else
-    auto* memory = mmap(nullptr, 3 * Block, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    auto* memory = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     Check(memory != MAP_FAILED, "watched allocation failed");
-    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, 3 * Block);
+    GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(memory, bytes);
 #endif
     const auto base = reinterpret_cast<std::uint64_t>(memory);
-    std::memset(memory, 0, 3 * Block);
-    Check(CollectWritesUncached(base, 3 * Block) != 0, "allocation is not watched");
+    std::memset(memory, 0, bytes);
+    Check(CollectWritesUncached(base, bytes) != 0, "allocation is not watched");
     return base;
 }
 
@@ -107,6 +108,34 @@ void CheckDriver(std::string_view mode) {
     Check(WaitMemoryTests::Counts().waitsSkipped == 1, "driver wait skip was not counted");
 }
 
+void CheckMemo() {
+    constexpr std::size_t surfaces = 192;
+    const auto base = Allocate(surfaces);
+    BumpCollectEpoch();
+    const auto before = CollectMemoStatistics();
+    const auto start = std::chrono::steady_clock::now();
+    for (int pass = 0; pass < 20; ++pass) {
+        for (std::size_t surface = 0; surface < surfaces; ++surface) CollectWrites(base + surface * Block, Block);
+    }
+    const auto after = CollectMemoStatistics();
+    const auto hits = after.hits - before.hits;
+    const auto misses = after.misses - before.misses;
+    const auto evictions = after.evictions - before.evictions;
+    if (after.capacity >= surfaces) {
+        Check(hits == 19 * surfaces && misses == surfaces && evictions == 0, "submission surfaces did not stay in the memo");
+    } else {
+        Check(hits == 0 && misses == 20 * surfaces && evictions == 20 * surfaces - after.capacity, "small memo eviction counters differ");
+    }
+    Check(after.epochMissPeak >= misses, "epoch miss peak lost misses");
+    BumpCollectEpoch();
+    const auto bumped = CollectMemoStatistics();
+    CollectWrites(base, Block);
+    Check(CollectMemoStatistics().misses == bumped.misses + 1, "new epoch reused a stale memo entry");
+    Check(CollectMemoStatistics().evictions == bumped.evictions, "new epoch reuse counted as eviction");
+    std::cout << "memo capacity " << after.capacity << ": hits " << hits << ", misses " << misses << ", evictions " << evictions << ", 192 surfaces x20 in "
+              << std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count() << " ms\n";
+}
+
 void CheckUnknown(bool forced) {
     const auto base = Allocate(), label = base + Block;
     *reinterpret_cast<volatile std::uint32_t*>(label) = 7;
@@ -128,6 +157,7 @@ int main(int argc, char** argv) {
         const std::string_view mode = argv[1];
         if (mode == "cpu" || mode == "equal" || mode == "collected" || mode == "polled" || mode == "before-driver") CheckCpu(mode);
         else if (mode == "driver" || mode == "history" || mode == "adjacent" || mode == "wide") CheckDriver(mode);
+        else if (mode == "memo") CheckMemo();
         else if (mode == "unknown" || mode == "forced") CheckUnknown(mode == "forced");
         else throw std::runtime_error("unknown test mode");
         DriverDetail::Driver::Get().Shutdown();

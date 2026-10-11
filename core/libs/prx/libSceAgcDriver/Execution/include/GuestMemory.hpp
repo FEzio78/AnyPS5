@@ -108,6 +108,14 @@ void JournalWrite(std::uint64_t address, std::size_t bytes, const void* owner = 
 bool JournalTouchedSince(std::uint64_t serial, std::uint64_t address, std::size_t bytes, const void* exceptOwner = nullptr);
 std::uint64_t CollectEpoch();
 std::uint64_t CollectEpochBumps();
+struct CollectMemoStats {
+    std::uint64_t hits;
+    std::uint64_t misses;
+    std::uint64_t evictions;
+    std::uint64_t epochMissPeak;
+    std::size_t capacity;
+};
+CollectMemoStats CollectMemoStatistics();
 std::uint64_t CollectWritesUncached(std::uint64_t address, std::size_t bytes);
 // The tracker's current generation (every collect and MarkWritten bumps it): a stamp taken after
 // a set of driver stores, for UnchangedSinceCollected to compare against later. Read under the

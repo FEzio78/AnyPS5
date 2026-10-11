@@ -5364,6 +5364,7 @@ int main(int argc, char** argv) {
         std::cout << "Recorder read tracking and label tests passed\n";
         return 0;
     } catch (const std::exception& error) {
+        if (argc == 2 && std::string_view(argv[1]).starts_with("--wait-epoch-")) AgcDriver::DriverDetail::Driver::Get().Shutdown();
         std::cerr << error.what() << '\n';
         return 1;
     }

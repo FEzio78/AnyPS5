@@ -70,8 +70,8 @@ void CheckWaitEpochRecorder(Graphics::Recorder& recorder, std::string_view mode)
         *reinterpret_cast<volatile std::uint32_t*>(base) = 42;
         *reinterpret_cast<volatile std::uint32_t*>(label + 64) = 99;
     }
-    const auto bytes = ThreadCollectedBytes();
     WaitMemoryTests::Wait(MakeWaitPacket(label), 0, mode == "late" ? 3 : 1);
+    const auto bytes = ThreadCollectedBytes();
     const auto outcomes = WaitMemoryTests::Outcomes();
     Check(outcomes.fromRecorder == 1, "wait was not satisfied from the recorder");
     if (mode == "recorder-cpu") {

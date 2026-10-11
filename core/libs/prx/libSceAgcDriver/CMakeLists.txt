@@ -794,7 +794,7 @@ if(BUILD_TESTING)
     foreach(storageMergeMode IN ITEMS blocks layers)
         add_test(NAME agc_storage_shared_unit_merge_${storageMergeMode} COMMAND agc_driver_recorder_tests --shared-unit-merge-only)
         set_tests_properties(agc_storage_shared_unit_merge_${storageMergeMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120
-            ENVIRONMENT "APS5_DUMP_DISPATCH_IMAGES=1;APS5_TRACE_STORAGE_MERGE=1")
+            ENVIRONMENT "APS5_DUMP_DISPATCH_IMAGES=1;APS5_TRACE_STORAGE_MERGE=1;APS5_PROFILE_IMAGES=1")
         if(storageMergeMode STREQUAL "layers")
             set_property(TEST agc_storage_shared_unit_merge_${storageMergeMode} APPEND PROPERTY ENVIRONMENT "APS5_NO_BLOCK_TRACKING=1")
         endif()

@@ -321,7 +321,9 @@ private:
     void writeBackLayers(const std::vector<bool>& layers);
     bool unchangedSinceBaseline(std::uint64_t from, std::uint64_t to) const;
     bool hasBaseline(std::uint32_t layer) const;
-    bool guestBytesSettled() const;
+    std::span<const std::byte> baselineFor(std::uint64_t from, std::uint64_t to) const;
+    void captureTrackedBaselines(std::uint32_t first, std::uint32_t count);
+    void forgetBaselines(std::uint32_t layer);
     // Tracked units as 64 KiB write-stamp blocks (`blockUnits`: a thin tiled surface at a 64 KiB
     // aligned base; APS5_NO_BLOCK_TRACKING=1 tracks array layers as above instead): a fill of one
     // layer, a CPU write or another image's store then costs the blocks it touched, moved through
@@ -462,8 +464,7 @@ private:
     std::uint64_t refreshedForgetSerial = 0;
     DccKeys refreshedKeys = DccKeys::Uncompressed;
     DccKeys refreshedFilledKeys = DccKeys::Uncompressed;
-    std::vector<std::byte> generationBaseline;
-    std::vector<bool> generationBaselineValid;
+    std::map<std::uint64_t, std::vector<std::byte>> generationBaseline;
     // DCC keys the image content was uploaded under: a fast-cleared surface starts as its clear value.
     DccKeys uploadedKeys = DccKeys::Uncompressed;
     mutable DccKeys filledKeys = DccKeys::Uncompressed;

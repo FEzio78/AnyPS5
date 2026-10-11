@@ -1888,6 +1888,13 @@ void ReadCommitted(std::uint64_t address, std::span<std::byte> destination) {
     Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryRead, "read committed and sync");
     if (destination.empty()) return;
     FlushGpuWrites(address, destination.size());
+    ReadCommittedUnsynced(address, destination);
+}
+
+void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destination) {
+    Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryRead, "read committed without sync");
+    imageTiming.Describe({address, destination.size()});
+    if (destination.empty()) return;
     const TimedAccess timed(CounterRead, destination.size());
     CountReadCaller(__builtin_return_address(0));
     if (Accessible(reinterpret_cast<const void*>(address), destination.size())) {
@@ -1906,6 +1913,8 @@ bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
 }
 
 bool EqualsCommittedUnsynced(std::uint64_t address, std::span<const std::byte> bytes) {
+    Graphics::ImageProfile::Scope imageTiming(Graphics::ImageProfile::MemoryCompare, "compare committed without sync");
+    imageTiming.Describe({address, bytes.size()});
     if (bytes.empty()) return true;
     const TimedAccess timed(CounterCompare, bytes.size());
     if (Accessible(reinterpret_cast<const void*>(address), bytes.size())) return std::memcmp(reinterpret_cast<const void*>(address), bytes.data(), bytes.size()) == 0;

@@ -52,6 +52,8 @@
 #include <thread>
 #include <vector>
 
+void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& context, AgcDriver::Graphics::Recorder& recorder);
+
 namespace {
 
 extern "C" {
@@ -4909,6 +4911,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--resident-heap-only") {
+            RunResidentHeapMirrorTests(device.GetContext(), recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--resource-presync-only") {
             resourcePresyncTests(device);
             return 0;

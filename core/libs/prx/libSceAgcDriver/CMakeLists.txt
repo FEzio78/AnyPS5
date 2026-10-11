@@ -723,6 +723,8 @@ configure_windows_unwind(agc_driver_cmask_fast_clear_tests)
 
 add_test_executable(agc_driver_recorder_tests EXCLUDE_FROM_ALL
         tests/Recorder.cpp
+        tests/ResidentHeapMirror.cpp
+        tests/BdaShader.cpp
         tests/ResidentPresent.cpp
         ${agcTriangleHeaders}
         ${agcSampleLodShaderHeader}
@@ -738,6 +740,7 @@ target_include_directories(agc_driver_recorder_tests PRIVATE
 )
 
 target_link_libraries(agc_driver_recorder_tests PRIVATE
+        shader_recompiler_agc_driver
         libkernel
         libSceAgcDriver
         SDL2-static
@@ -749,6 +752,16 @@ configure_windows_unwind(agc_driver_recorder_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_driver_recorder_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
     add_test(NAME agc_recorder COMMAND agc_driver_recorder_tests)
+    foreach(residentHeapMode IN ITEMS off on)
+        add_test(NAME agc_resident_heap_${residentHeapMode} COMMAND agc_driver_recorder_tests --resident-heap-only)
+        set_tests_properties(agc_resident_heap_${residentHeapMode} PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 60)
+        if(residentHeapMode STREQUAL "on")
+            set_tests_properties(agc_resident_heap_${residentHeapMode} PROPERTIES ENVIRONMENT "APS5_RESIDENT_HEAP_MIRRORS=1")
+        endif()
+        if(WIN32)
+            set_tests_properties(agc_resident_heap_${residentHeapMode} PROPERTIES ENVIRONMENT_MODIFICATION "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
     set_tests_properties(agc_recorder PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 180)
     if(WIN32)
         set_tests_properties(agc_recorder PROPERTIES ENVIRONMENT_MODIFICATION

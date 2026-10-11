@@ -1063,6 +1063,20 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
         DWORD granularity = 4096;
         if (!GuestArena::GuestArenaCollectWrites_nid_postfix(cursor, static_cast<std::size_t>(stop - cursor), tracker.pages.data(), &count, singlePass)) {
             // Uncommitted pages inside the range make the call fail; such ranges are compared instead.
+            static const bool residentSparse = std::getenv("APS5_RESIDENT_HEAP_MIRRORS") != nullptr;
+            if (residentSparse) {
+                for (auto at = cursor; at < stop;) {
+                    MEMORY_BASIC_INFORMATION memory{};
+                    if (VirtualQuery(reinterpret_cast<const void*>(at), &memory, sizeof(memory)) != sizeof(memory)) return false;
+                    const auto end = std::min(stop, reinterpret_cast<std::uint64_t>(memory.BaseAddress) + memory.RegionSize);
+                    if (end <= at || (at == cursor && end == stop && memory.State != MEM_RESERVE)) return false;
+                    if (memory.State == MEM_COMMIT) {
+                        if (!walkWrites(tracker, at, end, kind, armedOnly)) return false;
+                    } else if (memory.State != MEM_RESERVE) return false;
+                    at = end;
+                }
+                return true;
+            }
             return false;
         }
         if (count != 0) dirty = true;

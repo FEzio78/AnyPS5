@@ -1002,6 +1002,7 @@ private:
 // work first; then storage image results pending for the range are stored. The recorder is only
 // dereferenced under the GpuMutex (it is destroyed with its device under that lock).
 void FlushForAccess(std::uint64_t address, std::size_t bytes) {
+    if (HeapMirrorExportInProgress()) return;
     hookCalls.fetch_add(1, std::memory_order_relaxed);
     // A label this worker queued but has not recorded writes the range: in queue order the label
     // precedes this access, so the group is recorded first (it then notes the range as a pending
@@ -2999,6 +3000,7 @@ void Recorder::AfterCompletions(std::uint64_t address, std::span<const std::byte
             return;
         }
         completionStoresRun.fetch_add(1, std::memory_order_relaxed);
+        FlushHeapMirrorWrites(address, copy.size(), true);
         GuestMemory::CheckRange(reinterpret_cast<const void*>(address), copy.size(), 4, true);
         GuestMemory::StoreOwnBytes(address, copy);
     });

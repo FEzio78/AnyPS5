@@ -70,6 +70,7 @@ struct ImageMirror {
     std::uint64_t serial = 0;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> pendingWrites;
     std::shared_ptr<const GuestAllocations::Range> pendingLease;
+    std::uint64_t forgetSerial = 0;
 };
 
 // The address space. An address-based build maps every readable registered range; building that
@@ -100,6 +101,9 @@ struct GuestBufferMemory::AddressSpace {
         std::size_t last;
     };
     bool mirrored = false;
+    bool sparseMirrors = false;
+    std::uint64_t commitment = 0;
+    std::uint64_t importAlignment = 0;
     std::vector<std::size_t> writableMirrors;
     std::vector<ImageMirror*> heapMirrors;
     std::vector<HeapRun> heapRuns;
@@ -133,6 +137,14 @@ struct AddressSpaceCache {
 AddressSpaceCache& Spaces() {
     static AddressSpaceCache cache;
     return cache;
+}
+
+std::uint64_t heapCommitment() {
+#ifdef _WIN32
+    return GuestArena::GuestArenaCommitGeneration_nid_postfix();
+#else
+    return 0;
+#endif
 }
 
 bool addressSpaceCacheEnabled() {
@@ -811,6 +823,22 @@ void deferMirrorWrite(ImageMirror& mirror, std::uint64_t begin, std::uint64_t en
     for (std::size_t at = 0; at < changed.size(); ++at) if (changed[at] == 0) mirror.generations[at] = generation;
 }
 
+void prepareMirrorImport(std::uint64_t address, std::size_t bytes) {
+    if (!ResidentHeapMirrors() || exportingHeapMirrors) return;
+    std::lock_guard gpu(GuestMemory::GpuMutex());
+    bool mirrored = false;
+    {
+        auto& state = Mirrors();
+        std::lock_guard lock(state.mutex);
+        for (const auto& [base, mirror] : state.entries) {
+            if (mirror->heap && base < address + bytes && address < base + mirror->bytes) { mirrored = true; break; }
+        }
+    }
+    if (!mirrored) return;
+    if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, bytes)) recorder->SyncThrough(address, bytes, true);
+    FlushHeapMirrorWrites(address, bytes, true);
+}
+
 bool mirrorsEnabled() {
     static const bool disabled = std::getenv("APS5_NO_LEASE_MIRROR") != nullptr;
     return !disabled;
@@ -1018,6 +1046,7 @@ void compareBlocks(std::span<const RefreshBlock> blocks) {
     auto& state = Mirrors();
     state.blocksCompared += blocks.size();
     state.blocksCopied += copied;
+    if (ResidentHeapMirrors()) for (const auto& block : blocks) block.mirror->forgetSerial = GuestMemory::ForgetSerial();
 }
 
 // Brings [address, address + bytes) of a writable mirror up to date with guest memory.
@@ -1035,11 +1064,16 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
     Mirrors().heapChecks += mirrors.size();
     for (auto* const pointer : mirrors) {
         auto& mirror = *pointer;
+        auto refreshedGeneration = generation;
         changed.assign(mirror.generations.size(), 0);
         GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+        if (ResidentHeapMirrors() && mirror.forgetSerial != GuestMemory::ForgetSerial()) std::fill(changed.begin(), changed.end(), 1);
         if (ResidentHeapMirrors() && !mirror.pendingWrites.empty() && std::any_of(changed.begin(), changed.end(), [](auto value) { return value != 0; })) {
             FlushHeapMirrorWrites(mirror.base, static_cast<std::size_t>(mirror.bytes), true);
+            refreshedGeneration = GuestMemory::CollectWritesUncached(mirror.base, static_cast<std::size_t>(mirror.bytes));
+            Require(refreshedGeneration != 0, "resident heap refill is no longer write-watched");
             GuestMemory::ChangedBlocks(mirror.base, static_cast<std::size_t>(mirror.bytes), mirror.generations, changed);
+            if (mirror.forgetSerial != GuestMemory::ForgetSerial()) std::fill(changed.begin(), changed.end(), 1);
         }
         const auto aligned = mirror.base / block * block;
         const auto end = mirror.base + mirror.bytes;
@@ -1047,7 +1081,7 @@ void appendChangedBlocks(std::span<ImageMirror* const> mirrors, std::uint64_t ge
         for (std::size_t at = 0; at < changed.size(); ++at) {
             if (changed[at] == 0) continue;
             const auto from = std::max(mirror.base, aligned + at * block);
-            blocks.push_back({&mirror, from, static_cast<std::size_t>(std::min(end, aligned + (at + 1) * block) - from), generation});
+            blocks.push_back({&mirror, from, static_cast<std::size_t>(std::min(end, aligned + (at + 1) * block) - from), refreshedGeneration});
             refilled = true;
         }
         if (refilled) ++Mirrors().heapRefills;
@@ -1071,10 +1105,12 @@ void refreshHeapMirrors(std::vector<ImageMirror*>& mirrors, std::vector<RefreshB
 }
 
 void planSpaceMirrors(GuestBufferMemory::AddressSpace& space) {
+    space.commitment = heapCommitment();
     for (std::size_t index = 0; index < space.base.size(); ++index) {
         const auto& region = space.base[index];
         if (region.mirror == nullptr) continue;
         space.mirrored = true;
+        space.sparseMirrors = space.sparseMirrors || region.mirror->sparse;
         if (!region.mirror->heap) {
             if (region.mirror->writable) space.writableMirrors.push_back(index);
             continue;
@@ -1099,7 +1135,7 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
         const auto generation = GuestMemory::CollectWrites(run.begin, static_cast<std::size_t>(run.bytes));
         Require(generation != 0, "a heap mirror's range is no longer write-watched");
         const auto since = space.verified[index].load(std::memory_order_relaxed);
-        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since)) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
+        if (since == 0 || !GuestMemory::UnchangedSince(run.begin, static_cast<std::size_t>(run.bytes), since) || (ResidentHeapMirrors() && std::any_of(space.heapMirrors.begin() + run.first, space.heapMirrors.begin() + run.last, [](const auto* mirror) { return mirror->forgetSerial != GuestMemory::ForgetSerial(); }))) appendChangedBlocks(std::span<ImageMirror* const>(space.heapMirrors).subspan(run.first, run.last - run.first), generation, blocks);
         checked.emplace_back(index, generation);
     }
     return checked;
@@ -1170,6 +1206,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         else GuestMemory::Read(range->address, mirror->buffer->Bytes());
     }
     if (range->writable && (!heap || ResidentHeapMirrors())) mirror->shadow.assign(mirror->buffer->Bytes().begin(), mirror->buffer->Bytes().end());
+    mirror->forgetSerial = GuestMemory::ForgetSerial();
     std::lock_guard lock(state.mutex);
     ++state.rebuilds;
     mirror->serial = (1ull << 63u) | ++state.serials;
@@ -1221,7 +1258,15 @@ void sweepMirrors() {
 
 void releaseImportedMirrors(const Context& context, const std::vector<std::uint64_t>& imported) {
     if (imported.empty()) return;
-    if (ResidentHeapMirrors()) for (const auto base : imported) FlushHeapMirrorWrites(base, 1, true);
+    if (ResidentHeapMirrors()) {
+        std::vector<std::pair<std::uint64_t, std::size_t>> ranges;
+        {
+            auto& state = Mirrors();
+            std::lock_guard lock(state.mutex);
+            for (const auto base : imported) if (const auto found = state.entries.find(base); found != state.entries.end()) ranges.emplace_back(base, static_cast<std::size_t>(found->second->bytes));
+        }
+        for (const auto& [base, bytes] : ranges) prepareMirrorImport(base, bytes);
+    }
     std::vector<std::shared_ptr<ImageMirror>> released;
     auto& state = Mirrors();
     std::lock_guard lock(state.mutex);
@@ -1462,6 +1507,8 @@ bool ResidentHeapMirrors() {
     return enabled;
 }
 
+bool HeapMirrorExportInProgress() { return exportingHeapMirrors; }
+
 void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force) {
     if (!ResidentHeapMirrors() || exportingHeapMirrors || !pendingHeapMirrors.load(std::memory_order_acquire) || bytes == 0) return;
     if (!force && GuestMemory::CurrentReadSite() == GuestMemory::ReadSite::MirrorRefresh) return;
@@ -1483,8 +1530,15 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
             const auto offset = static_cast<std::size_t>(begin - mirror->base);
             const auto length = static_cast<std::size_t>(end - begin);
             const auto current = mirror->buffer->Bytes().subspan(offset, length);
+            Recorder::NoteWrittenBack(begin, length);
             storeChanged(begin, current, std::span<const std::byte>(mirror->shadow).subspan(offset, length));
             std::memcpy(mirror->shadow.data() + offset, current.data(), length);
+            const auto generation = GuestMemory::TrackerGeneration();
+            for (auto at = begin / 65536; at <= (end - 1) / 65536; ++at) {
+                const auto from = std::max(mirror->base, at * 65536);
+                const auto to = std::min(mirror->base + mirror->bytes, (at + 1) * 65536);
+                if (GuestMemory::EqualsCommittedUnsynced(from, mirror->buffer->Bytes().subspan(static_cast<std::size_t>(from - mirror->base), static_cast<std::size_t>(to - from)))) mirror->generations[static_cast<std::size_t>(at - mirror->base / 65536)] = generation;
+            }
         }
         mirror->pendingWrites.clear();
         mirror->pendingLease.reset();
@@ -1498,6 +1552,7 @@ bool StoreHeapMirrorResults(std::uint64_t address, std::span<const std::byte> cu
     if (!ResidentHeapMirrors() || GuestMemory::CurrentReadSite() != GuestMemory::ReadSite::MirrorRefresh || current.empty()) return false;
     GuestMemory::AssertGpuLockHeld("StoreHeapMirrorResults");
     Require(current.size() == original.size(), "resident heap result sizes differ");
+    if (std::memcmp(current.data(), original.data(), current.size()) == 0) return true;
     std::shared_ptr<ImageMirror> mirror;
     {
         auto& state = Mirrors();
@@ -1792,14 +1847,21 @@ const HostImport* HostImportFor(const Context& context, std::uint64_t address, s
     if (context.hostImportAlignment == 0 || bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return nullptr;
     ensurePinWaiter();
     auto& state = Imports();
-    std::lock_guard lock(state.mutex);
+    std::unique_lock lock(state.mutex);
+    const auto ready = [&](const HostImport* entry) {
+        if (entry == nullptr || !ResidentHeapMirrors()) return entry;
+        lock.unlock();
+        prepareMirrorImport(address, bytes);
+        lock.lock();
+        return findImport(state, address, address + bytes);
+    };
     // A hit is only valid while the registry has not changed since the imports were reconciled.
     if (!importsStale(context, state)) {
-        if (const auto* entry = findImport(state, address, address + bytes)) return entry;
+        if (const auto* entry = findImport(state, address, address + bytes)) return ready(entry);
     }
     const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
     refreshImports(context, state, lease);
-    if (const auto* range = containingRange(lease, address, address + bytes)) return importAllocation(context, state, range->address, range->bytes, lease);
+    if (const auto* range = containingRange(lease, address, address + bytes)) return ready(importAllocation(context, state, range->address, range->bytes, lease));
     return nullptr;
 }
 
@@ -1921,6 +1983,7 @@ void GuestBufferMemory::AcquireRegistered() {
             else if (current->device != context.device) spaces.rebuiltDevice.fetch_add(1, std::memory_order_relaxed);
             else if (current->generation != generation) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else if (current->importsEpoch != state.epoch) spaces.rebuiltEpoch.fetch_add(1, std::memory_order_relaxed);
+            else if (ResidentHeapMirrors() && ((current->sparseMirrors && current->commitment != heapCommitment()) || current->importAlignment != context.hostImportAlignment)) spaces.rebuiltGeneration.fetch_add(1, std::memory_order_relaxed);
             else hit = true;
         }
         if (hit) {
@@ -2039,6 +2102,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 built->generation = generation;
                 built->importsEpoch = importsEpoch;
                 built->device = context.device;
+                built->importAlignment = context.hostImportAlignment;
                 built->serial = spaces.serials.fetch_add(1, std::memory_order_relaxed) + 1;
                 built->lease = std::move(lease);
                 built->ranges = std::move(ranges);

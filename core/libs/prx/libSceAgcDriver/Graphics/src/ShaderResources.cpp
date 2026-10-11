@@ -3548,26 +3548,91 @@ void ShaderResources::WriteBack() {
     }
 }
 
+struct MarkTimes {
+    std::mutex mutex;
+    double readsMs = 0;
+    double copyBacksMs = 0;
+    double writesMs = 0;
+    double directMs = 0;
+    std::uint64_t calls = 0;
+    std::uint64_t readRanges = 0;
+    std::uint64_t readBytes = 0;
+    std::uint64_t writeRanges = 0;
+    std::uint64_t writeBytes = 0;
+    std::chrono::steady_clock::time_point reported = std::chrono::steady_clock::now();
+};
+
+MarkTimes& MarkTiming() {
+    static MarkTimes times;
+    return times;
+}
+
 void ShaderResources::MarkGpuWrites(Recorder& recorder) {
-    // The ranges this use reads in place through their host imports (read-only and written elements
-    // alike, and an address-based build's whole leased heaps), before the writes: a CPU store into
-    // one of them (the copy HLE) must not land before the recorded work read it.
-    recorder.NotePendingReads(guestMemory.InPlaceReads(), guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto elapsed = [&] {
+        if (!timed) return 0.0;
+        const auto now = std::chrono::steady_clock::now();
+        const auto ms = std::chrono::duration<double, std::milli>(now - lap).count();
+        lap = now;
+        return ms;
+    };
+    double readsMs = 0, copyBacksMs = 0, writesMs = 0, directMs = 0;
+    std::uint64_t readRanges = 0, readBytes = 0, writeRanges = 0, writeBytes = 0;
+    const auto report = [&] {
+        if (!timed) return;
+        auto& times = MarkTiming();
+        std::lock_guard lock(times.mutex);
+        times.readsMs += readsMs;
+        times.copyBacksMs += copyBacksMs;
+        times.writesMs += writesMs;
+        times.directMs += directMs;
+        ++times.calls;
+        times.readRanges += readRanges;
+        times.readBytes += readBytes;
+        times.writeRanges += writeRanges;
+        times.writeBytes += writeBytes;
+        const auto now = std::chrono::steady_clock::now();
+        if (now - times.reported < std::chrono::seconds(10)) return;
+        AgcDriver::ProfilePrint_nid_no_patch("[marks] %llu uses (10 s): pending reads %.0f ms (%.1f ranges, %.0f MiB per use), copy-backs %.0f ms, pending writes %.0f ms (%.1f ranges, %.1f MiB per use), direct marks %.0f ms\n", static_cast<unsigned long long>(times.calls), times.readsMs, static_cast<double>(times.readRanges) / static_cast<double>(times.calls), static_cast<double>(times.readBytes) / static_cast<double>(times.calls) / 1048576.0, times.copyBacksMs, times.writesMs, static_cast<double>(times.writeRanges) / static_cast<double>(times.calls), static_cast<double>(times.writeBytes) / static_cast<double>(times.calls) / 1048576.0, times.directMs);
+        times.readsMs = times.copyBacksMs = times.writesMs = times.directMs = 0;
+        times.calls = times.readRanges = times.readBytes = times.writeRanges = times.writeBytes = 0;
+        times.reported = now;
+    };
+    {
+        const auto reads = guestMemory.InPlaceReads();
+        if (timed) {
+            readRanges = reads.size();
+            for (const auto& [begin, end] : reads) readBytes += end - begin;
+        }
+        recorder.NotePendingReads(reads, guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement);
+    }
+    readsMs = elapsed();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index] && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) CopyImageToDepthPlane(context, storageTextures[index]->Descriptor(), storageTextures[index]->Image());
     }
-    if (SkipWriteBack()) return;
+    if (SkipWriteBack()) {
+        report();
+        return;
+    }
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index]) storageTextures[index]->MarkDirty();
     }
-    // Written sub-ranges of buffers the GPU copied out of a host import go back into it by the GPU,
-    // recorded here after the work: those regions then need no CPU write-back (HasCopiedWrites),
-    // and the note and mark below cover them like direct writes.
+    elapsed();
     guestMemory.RecordCopyBacks(recorder);
-    // Only the written elements' ranges (AddWritable): a read-only element is neither noted here
-    // nor marked as a direct write, so CPU reads of its memory never wait for this work.
+    copyBacksMs = elapsed();
+    if (timed) {
+        for (const auto& [begin, end] : guestMemory.Writes()) {
+            ++writeRanges;
+            writeBytes += end - begin;
+        }
+    }
+    elapsed();
     recorder.NotePendingWrites(guestMemory.Writes());
+    writesMs = elapsed();
     guestMemory.MarkDirectWrites();
+    directMs = elapsed();
+    report();
     if (!BuildProfiled()) return;
     auto& counters = BufferWrites();
     // Recorded uses only (dispatches and recorded draws): a synchronous draw writes back in

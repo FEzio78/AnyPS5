@@ -15,6 +15,7 @@
 #endif
 #include "ShaderCacheVersion.hpp"
 #include <algorithm>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -89,6 +90,8 @@ static_assert(sizeof(BindingLayout) == 16, "BindingLayout changed: update BuildK
 #endif
 
 namespace {
+
+static_assert(std::endian::native == std::endian::little);
 
 constexpr std::uint32_t FileMagic = 0x43535041u;
 
@@ -435,32 +438,7 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
     });
 }
 
-void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
-    writer.Value(compiled.stage);
-    writer.Value(compiled.shaderHash);
-    writer.Value(compiled.waveSize);
-    writer.Value(compiled.userDataBase);
-    writer.Value(compiled.userDataCount);
-    writer.Value(compiled.scratchDwords);
-    writer.Value(compiled.paramExportMask);
-    const auto& info = compiled.info;
-    writer.Value(info.scratchDwords);
-    writer.Value(info.sharedMemoryBytes);
-    writer.List(info.buffers, [](Writer& out, const BufferResource& buffer) {
-        out.Value(buffer.source);
-        out.Value(buffer.firstUsePc);
-        out.Value(buffer.maxByteExtent);
-        out.Value(buffer.imageAlias);
-        out.Value(buffer.read);
-        out.Value(buffer.written);
-        out.Value(buffer.atomic);
-        out.Value(buffer.formatted);
-        out.Value(buffer.descriptorFormatted);
-        out.Value(buffer.formattedReadMask);
-        out.Value(buffer.scalar);
-        out.Value(buffer.typedAlignment);
-    });
-    writer.List(info.images, [](Writer& out, const ImageResource& image) {
+void encodeImage(Writer& out, const ImageResource& image) {
         out.Value(image.source);
         out.Value(image.firstUsePc);
         out.Value(image.resourceClass);
@@ -497,8 +475,74 @@ void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
         out.Value(image.indirectMappingOffset);
         out.Value(image.indirectSearchIterations);
         out.Values(std::span<const std::uint32_t>(image.indirectResources));
+    }
+
+void decodeImage(Reader& in, ImageResource& image) {
+        in.Value(image.source);
+        in.Value(image.firstUsePc);
+        in.Value(image.resourceClass);
+        in.Value(image.numericClass);
+        in.Value(image.dimension);
+        in.Value(image.mipMode);
+        in.Value(image.mipCount);
+        in.Value(image.conversionFormat);
+        in.Value(image.shaderSwizzle);
+        in.Value(image.read);
+        in.Value(image.written);
+        in.Value(image.atomic);
+        in.Value(image.atomic64);
+        in.Value(image.depthCompare);
+        in.Value(image.cube);
+        in.Value(image.r128);
+        in.Value(image.srgbDecode);
+        in.Value(image.srgbDecodeCompatible);
+        in.Value(image.srgbDecodeFormats);
+        in.Value(image.depthBits);
+        in.Value(image.depthUnorm16);
+        in.Value(image.packed);
+        in.Value(image.fmaskCompatible);
+        in.Value(image.depthBitsCompatible);
+        in.Value(image.constantSwizzle);
+        in.Value(image.constantSwizzleCompatible);
+        in.Value(image.flatVolumeCompatible);
+        in.Value(image.flatLineCompatible);
+        in.Value(image.byElements);
+        in.Value(image.byComponents);
+        in.Value(image.packedFormat);
+        in.Value(image.emulatedCompare);
+        in.Value(image.indirectRoot);
+        in.Value(image.indirectMappingOffset);
+        in.Value(image.indirectSearchIterations);
+        in.Values(image.indirectResources);
+    }
+
+void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
+    writer.Value(compiled.stage);
+    writer.Value(compiled.shaderHash);
+    writer.Value(compiled.waveSize);
+    writer.Value(compiled.userDataBase);
+    writer.Value(compiled.userDataCount);
+    writer.Value(compiled.scratchDwords);
+    writer.Value(compiled.paramExportMask);
+    const auto& info = compiled.info;
+    writer.Value(info.scratchDwords);
+    writer.Value(info.sharedMemoryBytes);
+    writer.List(info.buffers, [](Writer& out, const BufferResource& buffer) {
+        out.Value(buffer.source);
+        out.Value(buffer.firstUsePc);
+        out.Value(buffer.maxByteExtent);
+        out.Value(buffer.imageAlias);
+        out.Value(buffer.read);
+        out.Value(buffer.written);
+        out.Value(buffer.atomic);
+        out.Value(buffer.formatted);
+        out.Value(buffer.descriptorFormatted);
+        out.Value(buffer.formattedReadMask);
+        out.Value(buffer.scalar);
+        out.Value(buffer.typedAlignment);
     });
-    writer.Value(!info.runtimeImageModes.empty());
+    writer.List(info.images, encodeImage);
+    writer.List(info.runtimeImageModes, [](Writer& out, const auto& modes) { out.List(modes, encodeImage); });
     writer.List(info.samplers, [](Writer& out, const SamplerResource& sampler) {
         out.Value(sampler.source);
         out.Value(sampler.firstUsePc);
@@ -565,47 +609,8 @@ void decodeInfo(Reader& reader, CompiledShaderInfo& compiled) {
         in.Value(buffer.scalar);
         in.Value(buffer.typedAlignment);
     });
-    reader.List(info.images, 74, [](Reader& in, ImageResource& image) {
-        in.Value(image.source);
-        in.Value(image.firstUsePc);
-        in.Value(image.resourceClass);
-        in.Value(image.numericClass);
-        in.Value(image.dimension);
-        in.Value(image.mipMode);
-        in.Value(image.mipCount);
-        in.Value(image.conversionFormat);
-        in.Value(image.shaderSwizzle);
-        in.Value(image.read);
-        in.Value(image.written);
-        in.Value(image.atomic);
-        in.Value(image.atomic64);
-        in.Value(image.depthCompare);
-        in.Value(image.cube);
-        in.Value(image.r128);
-        in.Value(image.srgbDecode);
-        in.Value(image.srgbDecodeCompatible);
-        in.Value(image.srgbDecodeFormats);
-        in.Value(image.depthBits);
-        in.Value(image.depthUnorm16);
-        in.Value(image.packed);
-        in.Value(image.fmaskCompatible);
-        in.Value(image.depthBitsCompatible);
-        in.Value(image.constantSwizzle);
-        in.Value(image.constantSwizzleCompatible);
-        in.Value(image.flatVolumeCompatible);
-        in.Value(image.flatLineCompatible);
-        in.Value(image.byElements);
-        in.Value(image.byComponents);
-        in.Value(image.packedFormat);
-        in.Value(image.emulatedCompare);
-        in.Value(image.indirectRoot);
-        in.Value(image.indirectMappingOffset);
-        in.Value(image.indirectSearchIterations);
-        in.Values(image.indirectResources);
-    });
-    bool preparedImageModes = false;
-    reader.Value(preparedImageModes);
-    if (preparedImageModes) ResourceMaterializer::PrepareImageModes(info);
+    reader.List(info.images, 74, decodeImage);
+    reader.List(info.runtimeImageModes, 8, [](Reader& in, auto& modes) { in.List(modes, 74, decodeImage); });
     reader.List(info.samplers, 15, [](Reader& in, SamplerResource& sampler) {
         in.Value(sampler.source);
         in.Value(sampler.firstUsePc);
@@ -724,16 +729,16 @@ void encodePlan(Writer& writer, const IrResourcePlan& plan) {
         out.Value(source.indirectImage.has_value());
         if (source.indirectImage) {
             const auto& indirect = *source.indirectImage;
-        out.Value(indirect.materialSource);
-        out.Value(indirect.heapSource);
-        out.Value(indirect.selectorStride);
-        out.Value(indirect.selectorOffset);
-        out.Value(indirect.keyArg);
-        out.Value(indirect.entryOffset);
-        out.Value(indirect.countSource);
-        out.Value(indirect.hasMaterial);
-        out.Value(indirect.addressHeap);
-        out.Value(indirect.countSigned);
+            out.Value(indirect.materialSource);
+            out.Value(indirect.heapSource);
+            out.Value(indirect.selectorStride);
+            out.Value(indirect.selectorOffset);
+            out.Value(indirect.keyArg);
+            out.Value(indirect.entryOffset);
+            out.Value(indirect.countSource);
+            out.Value(indirect.hasMaterial);
+            out.Value(indirect.addressHeap);
+            out.Value(indirect.countSigned);
         }
     });
     writer.List(plan.controlFlow, [&](Writer& out, const ResourceBlock& block) {
@@ -778,7 +783,7 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
         std::vector<std::uint32_t> blocks;
     };
     std::vector<ValueRecord> records;
-    reader.List(records, 41, [](Reader& in, ValueRecord& record) {
+    reader.List(records, 45, [](Reader& in, ValueRecord& record) {
         const auto opcode = in.Get<IrOpcode>();
         const auto type = in.Get<IrType>();
         const auto id = in.Get<std::uint32_t>();
@@ -820,7 +825,7 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
             }
         }
     }
-    reader.List(plan.memoryInfo, 1, [](Reader& in, MemoryInfo& memory) {
+    reader.List(plan.memoryInfo, 78, [](Reader& in, MemoryInfo& memory) {
         in.Value(memory.kind);
         in.Value(memory.resource);
         in.Value(memory.sampler);
@@ -858,16 +863,16 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (source.dwordCount > source.dwords.size()) throw std::runtime_error("invalid cached descriptor width");
         if (in.Get<bool>()) {
             auto& indirect = source.indirectImage.emplace();
-        in.Value(indirect.materialSource);
-        in.Value(indirect.heapSource);
-        in.Value(indirect.selectorStride);
-        in.Value(indirect.selectorOffset);
-        in.Value(indirect.keyArg);
-        in.Value(indirect.entryOffset);
-        in.Value(indirect.countSource);
-        in.Value(indirect.hasMaterial);
-        in.Value(indirect.addressHeap);
-        in.Value(indirect.countSigned);
+            in.Value(indirect.materialSource);
+            in.Value(indirect.heapSource);
+            in.Value(indirect.selectorStride);
+            in.Value(indirect.selectorOffset);
+            in.Value(indirect.keyArg);
+            in.Value(indirect.entryOffset);
+            in.Value(indirect.countSource);
+            in.Value(indirect.hasMaterial);
+            in.Value(indirect.addressHeap);
+            in.Value(indirect.countSigned);
         }
     });
     reader.List(plan.controlFlow, 20, [&](Reader& in, ResourceBlock& block) {
@@ -902,6 +907,14 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (index >= plan.descriptorSources.size()) throw std::runtime_error("invalid cached descriptor source");
     };
     for (const auto index : plan.materializationSources) checkSource(index);
+    for (const auto& source : plan.descriptorSources) {
+        if (!source.indirectImage) continue;
+        const auto& indirect = *source.indirectImage;
+        checkSource(indirect.heapSource);
+        if (indirect.hasMaterial) checkSource(indirect.materialSource);
+        if (indirect.addressHeap) checkSource(indirect.countSource);
+    }
+    if (plan.stage == IrShaderStage::Unknown || plan.stage > IrShaderStage::TessellationEvaluation || fill.kind > UniformFillKind::Image) throw std::runtime_error("invalid cached plan stage or fill");
     for (const auto& block : plan.controlFlow) {
         for (const auto index : block.sources) checkSource(index);
         for (const auto index : block.successors) if (index >= plan.controlFlow.size()) throw std::runtime_error("invalid cached control flow");
@@ -1039,14 +1052,16 @@ public:
 
     bool LoadPlan(std::span<const std::byte> key, IrResourcePlan& plan) {
         std::vector<std::byte> file;
+        const auto started = std::chrono::steady_clock::now();
         const auto name = "plan-" + EntryName(key);
-        const bool loaded = ReadWholeFile(directory / name, file) && DecodePlanEntry(file, key, plan) == LoadStatus::Loaded;
+        const bool loaded = ReadWholeFile(directory / name, file, 128u << 20u) && DecodePlanEntry(file, key, plan) == LoadStatus::Loaded;
         (loaded ? planHits : planMisses).fetch_add(1, std::memory_order_relaxed);
         if (!loaded && !file.empty()) {
             const auto failures = loadFailures.fetch_add(1, std::memory_order_relaxed);
             if (failures < 8) std::fprintf(stderr, "[shader-disk-cache] rejected %s; rebuilding resource plan\n", name.c_str());
         }
         if (loaded) bytesRead.fetch_add(file.size(), std::memory_order_relaxed);
+        loadNanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         report(false);
         return loaded;
     }

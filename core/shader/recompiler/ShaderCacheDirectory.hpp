@@ -9,6 +9,7 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <limits>
 #include <span>
 #include <string>
 #include <system_error>
@@ -46,12 +47,12 @@ inline bool WriteFileAtomically(const std::filesystem::path& path, std::span<con
     return true;
 }
 
-inline bool ReadWholeFile(const std::filesystem::path& path, std::vector<std::byte>& bytes) {
+inline bool ReadWholeFile(const std::filesystem::path& path, std::vector<std::byte>& bytes, std::size_t maxBytes = std::numeric_limits<std::size_t>::max()) {
     bytes.clear();
     std::ifstream file(path, std::ios::binary | std::ios::ate);
     if (!file) return false;
     const auto size = static_cast<std::streamoff>(file.tellg());
-    if (size < 0) return false;
+    if (size < 0 || static_cast<std::uint64_t>(size) > maxBytes) return false;
     file.seekg(0, std::ios::beg);
     bytes.resize(static_cast<std::size_t>(size));
     if (!file.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()))) {

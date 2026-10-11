@@ -13,6 +13,7 @@
 #include "SpirvBackend/SpirvOptimizer.hpp"
 #endif
 #include "CacheKey.hpp"
+#include "ShaderDiskCache.hpp"
 #include "BdaAbi.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
@@ -203,6 +204,28 @@ void verifyFrontendProgram(const ShaderRecompiler::IrProgram& reused, const Shad
             require(x != y && x->Flags<std::uint64_t>() == y->Flags<std::uint64_t>(), "frontend pair: mutable IR values were shared or their flags changed");
         }
     }
+}
+
+std::shared_ptr<const ShaderRecompiler::IrResourcePlan> roundTripResourcePlan(const ShaderRecompiler::RecompileRequest& request) {
+    using namespace ShaderRecompiler;
+    const auto original = GetResourcePlan(request);
+    std::vector<std::byte> payload;
+    ShaderDiskCache::EncodePlan(*original, payload);
+    IrResourcePlan decoded;
+    require(ShaderDiskCache::DecodePlan(payload, decoded), "recompiled shader plan failed to decode");
+    require(original->info == decoded.info && original->memoryInfo == decoded.memoryInfo, "recompiled shader plan metadata changed");
+    std::vector<std::byte> restored;
+    ShaderDiskCache::EncodePlan(decoded, restored);
+    require(payload == restored, "recompiled shader plan failed exact round-trip");
+    if (!request.context.memory.empty()) {
+        RequestMemoryView memory(request.context.memory);
+        const auto runtime = memory.MakeRuntime(request.context.userData, request.shader.codeAddress);
+        ResourceSnapshot first, second;
+        ResourceMaterializer{}.Materialize(*original, runtime, first);
+        ResourceMaterializer{}.Materialize(decoded, runtime, second);
+        require(first.buffers == second.buffers && first.images == second.images && first.samplers == second.samplers && first.flattenedSrt == second.flattenedSrt && first.userData == second.userData && first.uniformFill == second.uniformFill && first.srtPoison == second.srtPoison && first.nullRootReads == second.nullRootReads, "recompiled plan changed resource materialization");
+    }
+    return original;
 }
 
 void verifyFrontendPair() {
@@ -622,7 +645,7 @@ void verifyBindlessTable() {
     };
 
     auto request = makeRequest(materialCode);
-    const auto plan = GetResourcePlan(request);
+    const auto plan = roundTripResourcePlan(request);
     std::size_t tables = 0;
     for (const auto& source : plan->descriptorSources) {
         if (!source.indirectImage.has_value()) continue;
@@ -731,7 +754,7 @@ void verifyBindlessTable() {
     materials[2][1] = 3u;
 
     auto whole = makeRequest(wholeCode);
-    const auto wholePlan = GetResourcePlan(whole);
+    const auto wholePlan = roundTripResourcePlan(whole);
     for (const auto& source : wholePlan->descriptorSources) {
         if (source.indirectImage.has_value()) require(!source.indirectImage->hasMaterial, "bindless: a material pattern was recorded without one");
     }
@@ -841,7 +864,7 @@ void verifyDescriptorPhis() {
 
     const auto compile = [&](const std::vector<std::uint32_t>& code, std::size_t images, std::size_t samplers) {
         auto request = makeRequest(code);
-        const auto plan = GetResourcePlan(request);
+        const auto plan = roundTripResourcePlan(request);
         require(plan->info.images.size() == images && plan->info.samplers.size() == samplers && plan->info.sampledPairs.size() == 2u, "descriptor Phi: the edges were not given one resource each");
         AgcDriver::ShaderMemory memory({});
         const auto capture = memory.Capture(request);
@@ -880,7 +903,7 @@ void verifyDescriptorPhis() {
     require(countOps(Recompile(twoLane, *twoLaneCapture)->spirv, OpImageSampleExplicitLod) == 4u, "descriptor Phi: the specialized two-lane SPIR-V does not sample once per edge and half");
 
     auto dynamic = makeRequest(dynamicCode);
-    expectFailure([&] { static_cast<void>(GetResourcePlan(dynamic)); }, "GetSamplerResource dword 0 is not a valid runtime value", "descriptor Phi: an edge without an SRT slot was accepted");
+    expectFailure([&] { static_cast<void>(roundTripResourcePlan(dynamic)); }, "GetSamplerResource dword 0 is not a valid runtime value", "descriptor Phi: an edge without an SRT slot was accepted");
 
     const std::vector<std::uint32_t> loopCode{0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf40c0200u, 0xfa000000u, 0xbe910380u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf068011u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u, 0xbf8cc07fu, 0x80118111u, 0xbf0a8211u, 0xbf85fff0u, 0xbf810000u};
     const auto loopCapture = compile(loopCode, 2u, 1u);
@@ -894,7 +917,7 @@ void verifyDescriptorPhis() {
 
     const std::vector<std::uint32_t> sequentialCode{0xf4000400u, 0xfa000050u, 0xbf8cc07fu, 0xbf068010u, 0xbf850003u, 0xf40c0200u, 0xfa000000u, 0xbf820002u, 0xf40c0200u, 0xfa000060u, 0xbf068010u, 0xbf850003u, 0xf4080500u, 0xfa000020u, 0xbf820002u, 0xf4080500u, 0xfa000030u, 0xf4080600u, 0xfa000040u, 0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
     auto sequential = makeRequest(sequentialCode);
-    const auto sequentialPlan = GetResourcePlan(sequential);
+    const auto sequentialPlan = roundTripResourcePlan(sequential);
     require(sequentialPlan->info.images.size() == 2u && sequentialPlan->info.samplers.size() == 2u, "descriptor Phi: a T# and an S# chosen in separate blocks were not split into their SRT descriptors");
     AgcDriver::ShaderMemory sequentialMemory({});
     const auto sequentialCapture = sequentialMemory.Capture(sequential);
@@ -913,12 +936,12 @@ void verifyDescriptorPhis() {
     }};
     for (const auto& [code, message] : invalidEntries) {
         auto request = makeRequest(code);
-        expectFailure([&] { static_cast<void>(GetResourcePlan(request)); }, "GetImageResource dword 0 is not a valid runtime value", message);
+        expectFailure([&] { static_cast<void>(roundTripResourcePlan(request)); }, "GetImageResource dword 0 is not a valid runtime value", message);
     }
     auto unwritten = loopCode;
     unwritten[4] = 0xf4080200u;
     auto unwrittenRequest = makeRequest(unwritten);
-    require(GetResourcePlan(unwrittenRequest)->info.images.size() == 3u, "descriptor Phi: a T# whose unwritten registers read as 0 was not planned as its own image");
+    require(roundTripResourcePlan(unwrittenRequest)->info.images.size() == 3u, "descriptor Phi: a T# whose unwritten registers read as 0 was not planned as its own image");
 
     const std::array<std::uint32_t, 7> prologue{0xf4080500u, 0xfa000020u, 0xf4080600u, 0xfa000040u, 0xf40c0200u, 0xfa000000u, 0xbf8cc07fu};
     const std::array<std::uint32_t, 7> epilogue{0xbf8cc07fu, 0xf09c0f08u, 0x00a20000u, 0xbf8c3f70u, 0xe0700000u, 0x80060000u, 0xbf810000u};
@@ -927,7 +950,7 @@ void verifyDescriptorPhis() {
         code.insert(code.end(), body.begin(), body.end());
         code.insert(code.end(), epilogue.begin(), epilogue.end());
         auto request = makeRequest(code);
-        return GetResourcePlan(request)->info.images.size();
+        return roundTripResourcePlan(request)->info.images.size();
     };
     const auto distinctLoads = [](std::uint32_t loads) {
         std::vector<std::uint32_t> body;
@@ -2674,8 +2697,8 @@ int main(int argc, char** argv) {
         const auto first = Recompile(request);
         require(!first.spirv.empty(), "empty compiled shader");
         require(!first.cacheHit, "first shader compilation unexpectedly hit the cache");
-        const auto plan = GetResourcePlan(request);
-        require(plan == GetResourcePlan(request), "resource plan was rebuilt");
+        const auto plan = roundTripResourcePlan(request);
+        require(plan == roundTripResourcePlan(request), "resource plan was rebuilt");
         const auto cached = Recompile(request);
         require(cached.cacheHit, "unchanged shader did not hit the cache");
         verifyResult(first, cached);
@@ -2684,15 +2707,15 @@ int main(int argc, char** argv) {
         require(Recompile(relocated).cacheHit, "shader relocation caused recompilation");
         auto changedTarget = request;
         changedTarget.target.subgroupSize = 32;
-        require(GetResourcePlan(changedTarget) != plan, "different target reused the source entry");
+        require(roundTripResourcePlan(changedTarget) != plan, "different target reused the source entry");
         std::vector<std::uint32_t> changedCode(code.begin(), code.end());
         changedCode.insert(changedCode.begin(), 0xbf800000u);
         auto changedSource = request;
         changedSource.shader.code = changedCode;
-        require(GetResourcePlan(changedSource) != plan, "changed code reused the source entry");
+        require(roundTripResourcePlan(changedSource) != plan, "changed code reused the source entry");
         auto uncached = request;
         uncached.useCache = false;
-        require(GetResourcePlan(uncached) != plan, "disabled cache reused the resource plan");
+        require(roundTripResourcePlan(uncached) != plan, "disabled cache reused the resource plan");
         const auto fresh = Recompile(uncached);
         require(!fresh.cacheHit, "disabled cache reused the compiled variant");
         verifyResult(first, fresh);

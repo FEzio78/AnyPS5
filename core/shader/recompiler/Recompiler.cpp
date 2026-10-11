@@ -316,10 +316,20 @@ bool FailureMemo() {
     return memo;
 }
 
+struct SourceCache {
+    std::shared_mutex mutex;
+    std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> entries;
+};
+
+SourceCache& sourceCache() {
+    static SourceCache cache;
+    return cache;
+}
+
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr) {
-    static std::shared_mutex mutex;
-    // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
-    static std::unordered_map<std::vector<std::uint64_t>, std::vector<std::shared_ptr<SourceEntry>>, SourceKeyHash> sources;
+    auto& cache = sourceCache();
+    auto& mutex = cache.mutex;
+    auto& sources = cache.entries;
     struct SourceKeyStorage {};
     auto& key = HostThreadLocal<std::vector<std::uint64_t>, SourceKeyStorage>();
     RecompileCacheKey::Build(request, key);
@@ -1090,6 +1100,12 @@ auto recompileReporting(const RecompileRequest& request, Impl&& impl) -> decltyp
     }
 }
 
+}
+
+void ClearSourceCacheForTesting() {
+    auto& cache = sourceCache();
+    std::unique_lock lock(cache.mutex);
+    cache.entries.clear();
 }
 
 std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request) {

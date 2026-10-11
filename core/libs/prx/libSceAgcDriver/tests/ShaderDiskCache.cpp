@@ -573,9 +573,88 @@ struct ComputeRequest {
     }
 };
 
+void verifyPlanRoundTrip() {
+    ComputeRequest request(false);
+    auto program = PrepareResourceProgram(request.request);
+    const auto original = ResourceMaterializer{}.ExtractPlan(program);
+    std::vector<std::byte> payload;
+    ShaderDiskCache::EncodePlan(original, payload);
+    IrResourcePlan decoded;
+    require(ShaderDiskCache::DecodePlan(payload, decoded), "resource plan did not decode");
+    require(decoded.info == original.info && decoded.memoryInfo == original.memoryInfo, "plan metadata changed");
+    std::vector<std::byte> restored;
+    ShaderDiskCache::EncodePlan(decoded, restored);
+    require(payload == restored, "resource plan did not round-trip exactly");
+    const SrtRuntime runtime{request.userData, request.request.shader.codeAddress};
+    ResourceSnapshot first, second;
+    ResourceMaterializer{}.Materialize(original, runtime, first);
+    ResourceMaterializer{}.Materialize(decoded, runtime, second);
+    require(first.buffers == second.buffers && first.images == second.images && first.samplers == second.samplers && first.flattenedSrt == second.flattenedSrt && first.userData == second.userData && first.uniformFill == second.uniformFill && first.srtPoison == second.srtPoison, "decoded plan changed the resource snapshot");
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildPlanKey(request.request, request.request.target.subgroupSize, key);
+    auto otherLayout = request.request;
+    otherLayout.layout = {3, 4, 16, 64};
+    std::vector<std::byte> pairedKey;
+    ShaderDiskCache::BuildPlanKey(otherLayout, request.request.target.subgroupSize, pairedKey);
+    require(key == pairedKey, "resource plan key depends on binding layout");
+    const auto file = ShaderDiskCache::EncodePlanEntry(key, original);
+    require(ShaderDiskCache::DecodePlanEntry(file, key, decoded) == ShaderDiskCache::LoadStatus::Loaded, "plan entry did not decode");
+    for (std::size_t size = 0; size < file.size(); ++size) {
+        require(ShaderDiskCache::DecodePlanEntry(std::span(file).first(size), key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "truncated plan entry accepted");
+    }
+    for (std::size_t offset = 0; offset < file.size(); ++offset) {
+        auto damaged = file;
+        damaged[offset] ^= std::byte{0x10};
+        require(ShaderDiskCache::DecodePlanEntry(damaged, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "corrupt plan entry accepted");
+    }
+    auto longer = file;
+    longer.push_back(std::byte{0});
+    require(ShaderDiskCache::DecodePlanEntry(longer, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "plan entry trailing bytes accepted");
+    auto otherKey = key;
+    otherKey.back() ^= std::byte{1};
+    require(ShaderDiskCache::DecodePlanEntry(file, otherKey, decoded) == ShaderDiskCache::LoadStatus::KeyMismatch, "plan entry key mismatch accepted");
+    auto previousVersion = file;
+    previousVersion[4] = static_cast<std::byte>(ShaderDiskCache::FormatVersion - 1u);
+    require(ShaderDiskCache::DecodePlanEntry(previousVersion, key, decoded) == ShaderDiskCache::LoadStatus::Rejected, "old plan format accepted");
+    auto incomplete = ResourceMaterializer{}.ExtractPlan(program);
+    incomplete.srtPlanComplete = false;
+    std::vector<std::byte> invalid;
+    ShaderDiskCache::EncodePlan(incomplete, invalid);
+    require(!ShaderDiskCache::DecodePlan(invalid, decoded), "incomplete plan accepted");
+    auto invalidReference = payload;
+    const std::uint32_t missing = UINT32_MAX;
+    std::memcpy(invalidReference.data() + invalidReference.size() - sizeof(missing), &missing, sizeof(missing));
+    require(!ShaderDiskCache::DecodePlan(invalidReference, decoded), "invalid value reference accepted");
+    for (std::size_t size = 0; size < payload.size(); ++size) {
+        require(!ShaderDiskCache::DecodePlan(std::span(payload).first(size), decoded), "truncated plan payload accepted");
+    }
+}
+
+void verifyWarmSourceCache(const RecompileResult& compiled) {
+    ComputeRequest request(true);
+    ClearSourceCacheForTesting();
+    const auto translations = ResourceTranslationCount();
+    ShaderPreparationContext preparation;
+    const auto handle = PrepareShader(request.request, &preparation);
+    const SrtRuntime runtime{request.userData, request.request.shader.codeAddress};
+    const auto capture = CaptureResources(request.request, runtime, *handle);
+    const auto loaded = Recompile(request.request, *capture);
+    requireSameResult(compiled, *loaded, "warm source cache with captured snapshot");
+    requireSameResult(compiled, *MaterializeShader(request.request, *capture, *handle), "warm prepared artifact");
+    require(ResourceTranslationCount() == translations, "warm source cache ran resource translation");
+    require(ShaderDiskCache::Totals().planHits != 0, "warm source cache missed the resource plan");
+
+}
+
 int runLoadingProcess() {
     ComputeRequest cached(true);
-    const auto loaded = Recompile(cached.request);
+    require(ResourceTranslationCount() == 0, "new process has translated before its first request");
+    const auto handle = PrepareShader(cached.request);
+    const auto capture = CaptureResources(cached.request, SrtRuntime{cached.userData, cached.request.shader.codeAddress}, *handle);
+    const auto loaded = *Recompile(cached.request, *capture);
+    require(ResourceTranslationCount() == 0, "second process translated a warm shader");
+    require(ShaderDiskCache::Totals().planHits == 1 && ShaderDiskCache::Totals().planMisses == 0, "second process did not load the resource plan");
+    std::cout << "warm process resource translations: " << ResourceTranslationCount() << '\n';
     const auto totals = ShaderDiskCache::Totals();
     require(totals.hits == 1 && totals.misses == 0 && totals.loadFailures == 0, "the second process did not load the stored variant (hits " + std::to_string(totals.hits) + ", misses " + std::to_string(totals.misses) + ")");
     ComputeRequest fresh(false);
@@ -596,6 +675,52 @@ void verifyAcrossProcesses(const char* self) {
     require(!compiled.spirv.empty(), "the compile produced no SPIR-V");
     const std::string command = "\"" + std::string(self) + "\" --load";
     require(std::system(command.c_str()) == 0, "the loading process failed");
+    verifyWarmSourceCache(compiled);
+}
+
+int runWithoutPlanCache() {
+    ComputeRequest request(true);
+    require(ResourceTranslationCount() == 0, "bypass process has already translated");
+    static_cast<void>(Recompile(request.request));
+    const auto totals = ShaderDiskCache::Totals();
+    require(ResourceTranslationCount() == 1, "plan bypass did not translate exactly once");
+    require(totals.hits == 1 && totals.planHits == 0 && totals.planMisses == 0, "plan bypass disabled compiled variants or loaded a plan");
+    return 0;
+}
+
+void verifyPlanCacheBypass(const char* self) {
+    setEnvironment("APS5_NO_PLAN_DISK_CACHE", "1");
+    const std::string command = "\"" + std::string(self) + "\" --no-plan-cache";
+    require(std::system(command.c_str()) == 0, "process with plan cache disabled failed");
+    setEnvironment("APS5_NO_PLAN_DISK_CACHE", "0");
+}
+
+void verifyPlanRecovery() {
+    ComputeRequest request(true);
+    const auto expected = Recompile(request.request);
+    ShaderDiskCache::Flush();
+    std::vector<std::byte> key;
+    ShaderDiskCache::BuildPlanKey(request.request, request.request.target.subgroupSize, key);
+    const auto planPath = ShaderDiskCache::EntryDirectory() / ("plan-" + ShaderDiskCache::EntryName(key));
+    require(WriteFileAtomically(planPath, std::array{std::byte{0}}), "cannot truncate the test plan entry");
+    ClearSourceCacheForTesting();
+    const auto translations = ResourceTranslationCount();
+    const auto before = ShaderDiskCache::Totals();
+    requireSameResult(expected, Recompile(request.request), "recovered corrupt plan");
+    require(ResourceTranslationCount() == translations + 1, "corrupt plan did not fall back to translation");
+    require(ShaderDiskCache::Totals().hits == before.hits + 1 && ShaderDiskCache::Totals().loadFailures == before.loadFailures + 1, "corrupt plan prevented loading its intact variant");
+    ShaderDiskCache::Flush();
+    IrResourcePlan repaired;
+    require(ShaderDiskCache::LoadPlan(key, repaired), "corrupt plan was not repaired");
+    ShaderDiskCache::BuildKey(request.request, request.request.target.subgroupSize, key);
+    std::error_code error;
+    require(std::filesystem::remove(ShaderDiskCache::EntryDirectory() / ShaderDiskCache::EntryName(key), error) && !error, "cannot remove test variant");
+    ClearSourceCacheForTesting();
+    const auto variantTranslations = ResourceTranslationCount();
+    const auto planHits = ShaderDiskCache::Totals().planHits;
+    requireSameResult(expected, Recompile(request.request), "warm plan with missing variant");
+    require(ResourceTranslationCount() == variantTranslations + 1 && ShaderDiskCache::Totals().planHits == planHits + 1, "missing variant did not lazily translate its warm plan source");
+    ShaderDiskCache::Flush();
 }
 
 struct ClockRequest {
@@ -1058,6 +1183,7 @@ void verifyDefaultDirectory(const char* self) {
 
 int main(int argc, char** argv) {
     try {
+        if (argc == 2 && std::string_view(argv[1]) == "--no-plan-cache") return runWithoutPlanCache();
         if (argc == 2 && std::string_view(argv[1]) == "--load") return runLoadingProcess();
         if (argc == 2 && std::string_view(argv[1]) == "--no-failure-memo") return runWithoutFailureMemo();
         const auto directory = std::filesystem::temp_directory_path() / ("aps5-shader-disk-cache-test-" + std::to_string(std::random_device{}()));
@@ -1072,7 +1198,10 @@ int main(int argc, char** argv) {
         verifyFloatModeSerialization();
         verifyStore();
         verifySpirvEviction();
+        verifyPlanRoundTrip();
         verifyAcrossProcesses(argv[0]);
+        verifyPlanCacheBypass(argv[0]);
+        verifyPlanRecovery();
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();

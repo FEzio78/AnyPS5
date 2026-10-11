@@ -19,6 +19,7 @@ private:
 };
 
 [[nodiscard]] std::uint64_t ResourceTranslationCount();
+void ClearSourceCacheForTesting();
 [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request);
 [[nodiscard]] IrProgram PrepareResourceProgram(const RecompileRequest& request, ShaderPreparationContext* preparation);
 [[nodiscard]] std::shared_ptr<const IrResourcePlan> GetResourcePlan(const RecompileRequest& request);

@@ -3330,7 +3330,9 @@ void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
                     }
                 }
                 AgcDriver::GuestMemory::BumpCollectEpoch();
-                image->Refresh();
+                const auto version = image->Version();
+                const bool unchanged = image->Refresh();
+                if (change == 0) Require(unchanged && image->Version() == version, "a neighbor-only CPU write replaced the pending GPU image");
                 recorder.Sync();
                 auto plane = resource;
                 plane.dimension = TextureDimension::k2D;

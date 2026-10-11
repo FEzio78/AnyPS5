@@ -1498,12 +1498,15 @@ bool StorageTexture::Refresh() {
             stampedBlocks.assign(generations.size(), 0);
             cpuBlocks.assign(generations.size(), 0);
             tracked = GuestMemory::ChangedBlocks(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generations, stampedBlocks, cpuBlocks);
-            for (std::uint32_t unit = 0; tracked && blockUnits && unit < trackedLayers; ++unit) {
-                if (stampedBlocks[unit] != GuestMemory::BlockMaybeWritten) continue;
+            const auto firstBlock = descriptor.baseAddress & ~std::uint64_t{65535};
+            for (std::size_t index = 0; tracked && index < stampedBlocks.size(); ++index) {
+                if (stampedBlocks[index] == GuestMemory::BlockUnchanged) continue;
+                const auto begin = std::max(descriptor.baseAddress, firstBlock + index * 65536);
+                const auto end = std::min(descriptor.baseAddress + guestBytes, firstBlock + (index + 1) * 65536);
                 std::array<std::uint8_t, 1> block{};
-                if (!compareUntracked(layerBegin(unit), static_cast<std::size_t>(layerBytes(unit)), block) || block[0] != GuestMemory::BlockUnchanged) continue;
-                stampedBlocks[unit] = GuestMemory::BlockUnchanged;
-                cpuBlocks[unit] = 0;
+                if (!compareUntracked(begin, static_cast<std::size_t>(end - begin), block) || block[0] != GuestMemory::BlockUnchanged) continue;
+                stampedBlocks[index] = GuestMemory::BlockUnchanged;
+                cpuBlocks[index] = 0;
             }
             compared = !tracked && compareUntracked(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), stampedBlocks, true);
             if (compared) cpuBlocks = stampedBlocks;
@@ -1542,7 +1545,7 @@ bool StorageTexture::Refresh() {
         }
         // "cpu" names a CPU store in both models; a block without a generation (untracked) says
         // nothing about who wrote it.
-        if (compared && !keysChanged) {
+        if ((compared || (tracked && !stampedBlocks.empty())) && !keysChanged) {
             for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
                 const auto first = layerBegin(layer) / 65536 - descriptor.baseAddress / 65536;
                 const auto last = (layerBegin(layer) + layerBytes(layer) - 1) / 65536 - descriptor.baseAddress / 65536;

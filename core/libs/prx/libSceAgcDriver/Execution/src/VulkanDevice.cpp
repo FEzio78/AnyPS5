@@ -29,6 +29,7 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libc/include/General.hpp"
 #ifdef _WIN32
+#include <unordered_set>
 #include <windows.h>
 #endif
 #include <atomic>
@@ -3456,6 +3457,22 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         phase(PreparedDispatch::PrepareFind);
     }
     if (cached == nullptr) {
+        if (profile && !prepared->key.empty()) {
+            static std::mutex movableMutex;
+            static std::unordered_set<std::uint64_t> movableSeen;
+            static std::uint64_t misses = 0, wouldHit = 0;
+            static auto reported = std::chrono::steady_clock::now();
+            std::uint64_t hash = 14695981039346656037ull;
+            for (const auto word : Graphics::ShaderResources::ContentKey(compute, false, true)) hash = (hash ^ word) * 1099511628211ull;
+            std::lock_guard movableLock(movableMutex);
+            ++misses;
+            if (!movableSeen.insert(hash).second) ++wouldHit;
+            if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(10)) {
+                AgcDriver::ProfilePrint_nid_no_patch("[rescache-dispatch] %llu misses (10 s), %llu would hit with read-only buffer addresses out of the key; %zu distinct such keys\n", static_cast<unsigned long long>(misses), static_cast<unsigned long long>(wouldHit), movableSeen.size());
+                misses = wouldHit = 0;
+                reported = std::chrono::steady_clock::now();
+            }
+        }
         prepared->resources = std::make_shared<Graphics::ShaderResources>(context, compute, snapshots, true, dispatchThreads);
         phase(PreparedDispatch::PrepareStageA);
     }

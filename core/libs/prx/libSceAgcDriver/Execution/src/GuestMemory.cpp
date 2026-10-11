@@ -1123,7 +1123,7 @@ bool walkWrites(WriteTracker& tracker, std::uint64_t first, std::uint64_t stop, 
     ++tracker.generation;
 #ifdef _WIN32
     static_cast<void>(armedOnly);
-    static const bool residentSparse = std::getenv("APS5_RESIDENT_HEAP_MIRRORS") != nullptr;
+    static const bool residentSparse = std::getenv("APS5_NO_RESIDENT_HEAP_MIRRORS") == nullptr;
     if (residentSparse && sparseRunCacheEnabled()) {
         const auto generation = GuestArena::GuestArenaCommitGeneration_nid_postfix();
         for (const auto& entry : sparseRunCache.entries) {

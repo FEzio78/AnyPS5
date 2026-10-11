@@ -1538,7 +1538,7 @@ bool SyncLeaseWork() {
 }
 
 bool ResidentHeapMirrors() {
-    static const bool enabled = std::getenv("APS5_RESIDENT_HEAP_MIRRORS") != nullptr;
+    static const bool enabled = std::getenv("APS5_NO_RESIDENT_HEAP_MIRRORS") == nullptr;
     return enabled;
 }
 

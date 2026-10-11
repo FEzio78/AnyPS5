@@ -556,11 +556,24 @@ const HostImport* importAllocation(const Context& context, HostImports& state, s
     if (alignment == 0 || base % alignment != 0 || bytes % alignment != 0) return refuse("alignment");
     if (state.failed.contains(base)) return nullptr;
     // Pinned imports count against the driver's system memory budget; past it ordinary host
-    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB (default 6 GiB, which covers the
-    // registered memory of address-based shaders; past it they copy gigabytes per dispatch).
+    // allocations fail, so imports stop at APS5_HOST_IMPORT_MIB. The default is a quarter of the
+    // physical memory, at least 6 GiB and at most 24 GiB: a title whose registered memory outgrows
+    // the budget copies gigabytes per dispatch and samples its surfaces as CPU snapshots.
     static const std::uint64_t budget = [] {
-        const char* value = std::getenv("APS5_HOST_IMPORT_MIB");
-        return (value ? std::strtoull(value, nullptr, 10) : 6144ull) << 20u;
+        if (const char* value = std::getenv("APS5_HOST_IMPORT_MIB")) return std::strtoull(value, nullptr, 10) << 20u;
+        constexpr std::uint64_t floor = 6144ull << 20u;
+        constexpr std::uint64_t ceiling = 24576ull << 20u;
+        std::uint64_t physical = 0;
+#ifdef _WIN32
+        MEMORYSTATUSEX status{};
+        status.dwLength = sizeof(status);
+        if (GlobalMemoryStatusEx(&status)) physical = status.ullTotalPhys;
+#else
+        const auto pages = sysconf(_SC_PHYS_PAGES);
+        const auto pageBytes = sysconf(_SC_PAGESIZE);
+        if (pages > 0 && pageBytes > 0) physical = static_cast<std::uint64_t>(pages) * static_cast<std::uint64_t>(pageBytes);
+#endif
+        return std::clamp(physical / 4u, floor, ceiling);
     }();
     const auto live = state.liveBytes;
     if (live + bytes > budget) {

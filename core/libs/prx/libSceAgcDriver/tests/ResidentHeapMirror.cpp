@@ -157,8 +157,8 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         return output;
     };
     dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
-    Require(std::memcmp(raw, values.data(), sizeof(values)) == 0, "explicit heap write-back did not publish the GPU stores");
-    Require(static_cast<std::uint8_t*>(raw)[8] == 0x55, "explicit heap write-back rolled back a CPU store after the GPU baseline");
+    const bool synchronousPublished = std::memcmp(raw, values.data(), sizeof(values)) == 0;
+    const bool synchronousCpuPreserved = static_cast<std::uint8_t*>(raw)[8] == 0x55;
     auto synchronousRead = dispatch(false);
     recorder.Sync();
     Require(std::memcmp(synchronousRead->Bytes().data(), values.data(), sizeof(values)) == 0 && static_cast<std::uint8_t*>(raw)[8] == 0x55, "heap reuse after explicit write-back lost the merged stores");
@@ -246,6 +246,8 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     ClearHostImports(context.device);
     GuestArena::GuestArenaReset_nid_postfix(raw, 2 * block);
     GuestArena::GuestArenaRelease_nid_postfix(raw, 2 * block);
+    Require(synchronousPublished, "explicit heap write-back did not publish the GPU stores");
+    Require(synchronousCpuPreserved, "explicit heap write-back rolled back a CPU store after the GPU baseline");
     std::cout << "Partially committed resident heap recorder tests passed\n";
 #endif
 }

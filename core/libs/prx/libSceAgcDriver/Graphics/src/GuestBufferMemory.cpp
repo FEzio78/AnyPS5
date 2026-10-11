@@ -822,6 +822,21 @@ thread_local bool exportingHeapMirrors = false;
 
 void storeChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original);
 
+void storeMirrorWrite(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
+    const auto offset = static_cast<std::size_t>(begin - mirror.base);
+    const auto length = static_cast<std::size_t>(end - begin);
+    const auto current = mirror.buffer->Bytes().subspan(offset, length);
+    Recorder::NoteWrittenBack(begin, length);
+    storeChanged(begin, current, std::span<const std::byte>(mirror.shadow).subspan(offset, length));
+    std::memcpy(mirror.shadow.data() + offset, current.data(), length);
+    const auto generation = GuestMemory::TrackerGeneration();
+    for (auto at = begin / 65536; at <= (end - 1) / 65536; ++at) {
+        const auto from = std::max(mirror.base, at * 65536);
+        const auto to = std::min(mirror.base + mirror.bytes, (at + 1) * 65536);
+        if (GuestMemory::EqualsCommittedUnsynced(from, mirror.buffer->Bytes().subspan(static_cast<std::size_t>(from - mirror.base), static_cast<std::size_t>(to - from)))) mirror.generations[static_cast<std::size_t>(at - mirror.base / 65536)] = generation;
+    }
+}
+
 void deferMirrorWrite(ImageMirror& mirror, std::uint64_t begin, std::uint64_t end) {
     Require(mirror.shadow.size() == mirror.bytes, "resident heap mirror has no baseline");
     mirror.pendingLease = mirror.range.lock();
@@ -1548,20 +1563,7 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
     for (auto& mirror : mirrors) {
         static const bool trace = std::getenv("APS5_TRACE_FLUSH") != nullptr;
         if (trace) std::fprintf(stderr, "[resident-heap] export 0x%llx+0x%llx for %s 0x%llx+0x%zx force=%u spans=%zu\n", static_cast<unsigned long long>(mirror->base), static_cast<unsigned long long>(mirror->bytes), GuestMemory::ReadSiteName(GuestMemory::CurrentReadSite()), static_cast<unsigned long long>(address), bytes, static_cast<unsigned>(force), mirror->pendingWrites.size());
-        for (const auto& [begin, end] : mirror->pendingWrites) {
-            const auto offset = static_cast<std::size_t>(begin - mirror->base);
-            const auto length = static_cast<std::size_t>(end - begin);
-            const auto current = mirror->buffer->Bytes().subspan(offset, length);
-            Recorder::NoteWrittenBack(begin, length);
-            storeChanged(begin, current, std::span<const std::byte>(mirror->shadow).subspan(offset, length));
-            std::memcpy(mirror->shadow.data() + offset, current.data(), length);
-            const auto generation = GuestMemory::TrackerGeneration();
-            for (auto at = begin / 65536; at <= (end - 1) / 65536; ++at) {
-                const auto from = std::max(mirror->base, at * 65536);
-                const auto to = std::min(mirror->base + mirror->bytes, (at + 1) * 65536);
-                if (GuestMemory::EqualsCommittedUnsynced(from, mirror->buffer->Bytes().subspan(static_cast<std::size_t>(from - mirror->base), static_cast<std::size_t>(to - from)))) mirror->generations[static_cast<std::size_t>(at - mirror->base / 65536)] = generation;
-            }
-        }
+        for (const auto& [begin, end] : mirror->pendingWrites) storeMirrorWrite(*mirror, begin, end);
         mirror->pendingWrites.clear();
         mirror->pendingLease.reset();
     }
@@ -3311,7 +3313,11 @@ void GuestBufferMemory::WriteBack() {
             const auto current = mirror.buffer->Bytes().subspan(offset, length);
             if (mirror.heap) {
                 if (ResidentHeapMirrors()) {
-                    deferMirrorWrite(mirror, begin, end);
+                    if (Recorder::InCompletion()) deferMirrorWrite(mirror, begin, end);
+                    else {
+                        FlushHeapMirrorWrites(begin, length, true);
+                        storeMirrorWrite(mirror, begin, end);
+                    }
                     continue;
                 }
                 const auto reference = std::find_if(heapReferences.begin(), heapReferences.end(), [&](const auto& entry) { return entry.first == begin; });

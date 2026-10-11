@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/ChangedBytes.hpp"
 #include "prx/libc/include/GuestArena.hpp"
 #include "prx/libc/include/GuestWriteWatch.hpp"
 #ifdef _WIN32
@@ -342,8 +343,35 @@ void CheckWriteJournal() {
     Require(JournalTouchedSince(own, base, 0x10, &image), "owner exclusion hid a journal overflow");
 }
 
+void CheckChangedWrites() {
+    std::array<std::byte, 16> original{};
+    std::array<std::byte, 16> current{};
+    for (std::uint32_t mask = 0; mask < 65536; ++mask) {
+        for (std::size_t bit = 0; bit < 16; ++bit) current[bit] = (mask & (1u << bit)) != 0 ? std::byte{0xff} : std::byte{0};
+        Require(ChangedByteMask(current.data(), original.data(), 16) == mask, "changed byte mask differs from byte comparisons");
+    }
+    std::uint32_t random = 0x91735721u;
+    for (const auto size : {0u, 1u, 15u, 16u, 17u, 63u, 64u, 65u, 255u, 256u, 257u, 513u, 65539u}) {
+        for (unsigned pattern = 0; pattern < 7; ++pattern) {
+            std::vector<std::byte> before(size + 32, std::byte{0x11});
+            auto result = before;
+            std::vector<std::byte> guest(size + 32, std::byte{0xa3});
+            auto expected = guest;
+            for (std::size_t at = 0; at < size; ++at) {
+                random = random * 1664525u + 1013904223u;
+                const bool changed = pattern == 0 ? false : pattern == 1 ? true : pattern == 2 ? at % 2 == 0 : pattern == 3 ? at >= 15 && at < 300 : pattern == 4 ? at % 64 == 63 : pattern == 5 ? at % 256 == 0 : (random & 7u) != 0;
+                if (changed) result[at + 7] = std::byte{0xff};
+                if (changed) expected[at + 7] = result[at + 7];
+            }
+            WriteChanged(reinterpret_cast<std::uint64_t>(guest.data() + 7), std::span<const std::byte>(result).subspan(7, size), std::span<const std::byte>(before).subspan(7, size));
+            Require(guest == expected, "changed write overwrote an unchanged CPU byte, missed a changed byte, or crossed its bounds");
+        }
+    }
+}
+
 int main() {
     try {
+        CheckChangedWrites();
         CheckWriteJournal();
         if (!WriteWatched()) {
             std::cout << "no write watching: skipped\n";

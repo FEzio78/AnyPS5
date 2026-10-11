@@ -4,6 +4,7 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ParallelCompare.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/MeshArguments_spv.h"
@@ -1029,6 +1030,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             recorder->SyncThrough(address, bytes, true);
         }
     }
+    FlushHeapMirrorWrites(address, bytes);
     // A reader takes every shadowed unit of the range; a store only the units it covers partly
     // (its own stamp makes the others stale). Inside a completion action a store has no publish
     // recorded: the batch is not waited for, and the copy would land over the store later.
@@ -1068,6 +1070,7 @@ void FlushForAccess(std::uint64_t address, std::size_t bytes) {
             else recorder->SyncThrough(address, bytes, true);
         }
     }
+    FlushHeapMirrorWrites(address, bytes);
 }
 
 }

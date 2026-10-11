@@ -1319,6 +1319,7 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
     } finished{address, bytes};
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        GpuMutexProfile::Scope timing(GpuMutexProfile::StoreStamp, stored.first, stored.second - stored.first);
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) return 0;
         for (auto block = tracker.blockOf(stored.first); block <= tracker.blockOf(stored.second - 1); ++block) {
@@ -1337,9 +1338,17 @@ std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::func
 #ifdef _WIN32
     if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(first, static_cast<std::size_t>(stop - first))) return stampStored(tracker, store());
 #endif
-    if (!walkWrites(tracker, first, stop, StampKind::Cpu)) return stampStored(tracker, store());
+    bool walked = false;
+    {
+        GpuMutexProfile::Scope timing(GpuMutexProfile::StoreWalk, first, stop - first);
+        walked = walkWrites(tracker, first, stop, StampKind::Cpu);
+    }
+    if (!walked) return stampStored(tracker, store());
     const auto stored = store();
-    walkWrites(tracker, first, stop, StampKind::Driver);
+    {
+        GpuMutexProfile::Scope timing(GpuMutexProfile::StoreWalk, first, stop - first);
+        walkWrites(tracker, first, stop, StampKind::Driver);
+    }
     return stampStored(tracker, stored);
 }
 
@@ -1943,6 +1952,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
     const auto size = current.size();
     // Stamped like a GPU write: a collect memoized for this packet would not see the page fault.
     storeOwn(address, size, [&] {
+        GpuMutexProfile::Scope timing(GpuMutexProfile::StoreMask, address, size);
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         ForEachChangedRun(current, original, [&](std::size_t first, std::size_t bytes) {

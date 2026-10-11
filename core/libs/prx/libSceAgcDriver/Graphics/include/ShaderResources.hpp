@@ -116,7 +116,6 @@ public:
     ShaderResources(const ShaderResources&) = delete;
     ShaderResources& operator=(const ShaderResources&) = delete;
     VkDescriptorSetLayout Layout() const;
-    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const;
     struct DrawBindings {
         DrawBindings() = default;
         DrawBindings(const DrawBindings&) = delete;
@@ -136,13 +135,20 @@ public:
         std::size_t size;
         std::vector<std::uint32_t> words;
     };
+    struct DispatchBindings : DrawBindings {
+        explicit DispatchBindings(const Context& context) : memory(context) {}
+        GuestBufferMemory memory;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> reads;
+    };
+    void Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings* overrides = nullptr) const;
     std::shared_ptr<DrawBindings> PrepareDrawBindings(Recorder& recorder, std::span<const MovedBuffer> moved = {}) const;
+    std::optional<std::shared_ptr<DispatchBindings>> PrepareDispatchBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const;
     std::optional<std::vector<MovedBuffer>> MovedReadOnlyBuffers(std::span<const CompiledShader> shaders, Recorder& recorder) const;
     void WriteBack();
     // Deferred completion: MarkGpuWrites registers the results the recorded work leaves on the GPU
     // (storage images stay there; buffer ranges are noted so CPU reads wait); WriteBackBuffers runs
     // once the work completed.
-    void MarkGpuWrites(Recorder& recorder);
+    void MarkGpuWrites(Recorder& recorder, const DispatchBindings* overrides = nullptr);
     void WriteBackBuffers();
     // Whether WriteBackBuffers has anything the CPU must see (copied written buffers, BDA faults).
     bool NeedsCompletion() const { return bda != nullptr || guestMemory.HasCopiedWrites(); }
@@ -156,7 +162,7 @@ public:
     // The recorder's hazard tracker inputs (Recorder::NoteAccess): the written elements' guest
     // ranges, the regions read in place, and the storage images with whether each is written.
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& GpuWrites() const { return guestMemory.Writes(); }
-    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads() const { return guestMemory.InPlaceReads(); }
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> InPlaceReads(const DispatchBindings* overrides = nullptr) const { return overrides != nullptr ? overrides->reads : guestMemory.InPlaceReads(); }
     std::vector<std::pair<VkImage, bool>> StorageImages() const;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> DeviceReads() const { return guestMemory.DeviceReads(); }
     bool ReadsImage(const StorageTexture* image) const;
@@ -244,6 +250,7 @@ public:
 private:
     friend class AgcDriver::VulkanDevice;
     bool refreshData(VkCommandBuffer commands, const CompiledShader& shader, Recorder* recorder);
+    void copyBindings(DrawBindings& result, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> overrides) const;
     struct DescribedRange {
         const char* kind;
         std::uint64_t address;

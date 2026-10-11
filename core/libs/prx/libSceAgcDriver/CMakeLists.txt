@@ -1043,6 +1043,21 @@ foreach(agcExecutionTestSource IN LISTS agcExecutionTestSources)
     list(APPEND agcExecutionTests ${agcExecutionTest})
 endforeach()
 
+set(agcMovedDispatchSource ${CMAKE_CURRENT_SOURCE_DIR}/tests/shaders/MovedDispatch.comp)
+set(agcMovedDispatchSpv ${agcTestShaderGeneratedRoot}/MovedDispatch.spv)
+set(agcMovedDispatchHeader ${agcTestShaderGeneratedRoot}/MovedDispatch_spv.h)
+add_custom_command(
+    OUTPUT "${agcMovedDispatchHeader}"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${agcTestShaderGeneratedRoot}"
+    COMMAND "$<TARGET_FILE:glslang-standalone>" -V --target-env vulkan1.1 -o "${agcMovedDispatchSpv}" "${agcMovedDispatchSource}"
+    COMMAND ${CMAKE_COMMAND} -DINPUT=${agcMovedDispatchSpv} -DOUTPUT=${agcMovedDispatchHeader}
+    -DSYMBOL=MOVED_DISPATCH_SPV -P "${CMAKE_CURRENT_SOURCE_DIR}/embed_spirv.cmake"
+    DEPENDS "${agcMovedDispatchSource}" glslang-standalone
+    VERBATIM
+)
+target_sources(agc_driver_movable_dispatch_tests PRIVATE ${agcMovedDispatchHeader})
+target_include_directories(agc_driver_movable_dispatch_tests PRIVATE ${agcTestShaderGeneratedRoot})
+
 target_include_directories(agc_driver_dual_source_blend_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
 
 target_include_directories(agc_driver_packed_unorm_color_target_tests PRIVATE $<TARGET_PROPERTY:shader_recompiler_agc_driver,INTERFACE_INCLUDE_DIRECTORIES>)
@@ -1169,6 +1184,20 @@ if(BUILD_TESTING)
     endif()
     add_test(NAME agc_driver_draw_cache_reuse_off COMMAND agc_driver_draw_cache_reuse_tests)
     set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1;APS5_NO_GPL=1" SKIP_RETURN_CODE 77)
+
+    foreach(movedDispatchMode IN ITEMS off word_keyed verify)
+        add_test(NAME agc_driver_movable_dispatch_${movedDispatchMode} COMMAND agc_driver_movable_dispatch_tests)
+        set_tests_properties(agc_driver_movable_dispatch_${movedDispatchMode} PROPERTIES
+            ENVIRONMENT "ANYPS5_NO_SHADER_CACHE=1" SKIP_RETURN_CODE 77 TIMEOUT 30 WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
+        if(WIN32)
+            set_tests_properties(agc_driver_movable_dispatch_${movedDispatchMode} PROPERTIES ENVIRONMENT_MODIFICATION
+                "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
+        endif()
+    endforeach()
+    set_tests_properties(agc_driver_movable_dispatch PROPERTIES TIMEOUT 30)
+    set_property(TEST agc_driver_movable_dispatch_off APPEND PROPERTY ENVIRONMENT "APS5_NO_MOVED_DISPATCH_BUFFERS=1")
+    set_property(TEST agc_driver_movable_dispatch_word_keyed APPEND PROPERTY ENVIRONMENT "APS5_NO_TEMPLATE_DATA_REFRESH=1")
+    set_property(TEST agc_driver_movable_dispatch_verify APPEND PROPERTY ENVIRONMENT "APS5_VERIFY_RECIPE=1;APS5_VERIFY_PROOFS=1;APS5_BARRIER_VALIDATE=1")
     if(WIN32)
         set_tests_properties(agc_driver_draw_cache_reuse_off PROPERTIES ENVIRONMENT_MODIFICATION
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")

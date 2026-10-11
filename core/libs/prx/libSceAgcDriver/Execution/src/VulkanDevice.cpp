@@ -2940,11 +2940,16 @@ bool TemplateDataRefresh() {
     return enabled;
 }
 
+bool MovableDispatchBuffers() {
+    static const bool enabled = std::getenv("APS5_NO_MOVED_DISPATCH_BUFFERS") == nullptr;
+    return enabled;
+}
+
 // The content key of a compute stage, naming the device: the cache is process-wide and the driver
 // replaces the headless device with the windowed one while workers may still use the old one, so
 // the key names the device that built the entry (its descriptor set and pooled buffers belong to it).
 ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, VkDevice device) {
-    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh());
+    auto key = Graphics::ShaderResources::ContentKey(shader, !TemplateDataRefresh(), MovableDispatchBuffers());
     const auto deviceHandle = reinterpret_cast<std::uint64_t>(device);
     key.push_back(static_cast<std::uint32_t>(deviceHandle));
     key.push_back(static_cast<std::uint32_t>(deviceHandle >> 32u));
@@ -2953,8 +2958,8 @@ ResourceCache::Key DispatchContentKey(const Graphics::CompiledShader& shader, Vk
 
 // The phases of VulkanDevice::dispatch (APS5_PROFILE_DRAW), followed by one row per image lookup
 // outcome (Graphics::LookupOutcomes) on the [indirect] line.
-enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
-constexpr std::array<const char*, DispatchPhaseCount> DispatchPhaseNames{"reap", "resources", "resources: cache insert", "resources: complete (wall)", "resources: B images", "resources: B upload", "resources: B descriptors", "resources: B bda+other", "resources: A locked (bda)", "resources: address bindings (bda)", "resources A (unlocked)", "resources: revalidate", "resources: full build (locked)", "resources: hook waits", "proof", "pipeline", "decide", "argument read", "record: commands", "record: keeps", "record: data refresh", "record: bind+dispatch", "record: marks", "record: completion", "record", "sync"};
+enum DispatchPhase : std::size_t { PhaseReap, PhaseResources, PhaseResourcesInsert, PhaseResourcesComplete, PhaseResourcesImages, PhaseResourcesUpload, PhaseResourcesDescriptors, PhaseResourcesOther, PhaseResourcesALocked, PhaseResourcesAddress, PhaseResourcesAUnlocked, PhaseResourcesRevalidate, PhaseResourcesRebind, PhaseResourcesFullBuild, PhaseResourcesHookWaits, PhaseProof, PhasePipeline, PhaseDecide, PhaseArgumentRead, PhaseRecordCommands, PhaseRecordKeeps, PhaseRecordDataRefresh, PhaseRecordBind, PhaseRecordMarks, PhaseRecordCompletion, PhaseRecord, PhaseSync, DispatchPhaseCount };
+constexpr std::array<const char*, DispatchPhaseCount> DispatchPhaseNames{"reap", "resources", "resources: cache insert", "resources: complete (wall)", "resources: B images", "resources: B upload", "resources: B descriptors", "resources: B bda+other", "resources: A locked (bda)", "resources: address bindings (bda)", "resources A (unlocked)", "resources: revalidate", "resources: moved buffer rebind", "resources: full build (locked)", "resources: hook waits", "proof", "pipeline", "decide", "argument read", "record: commands", "record: keeps", "record: data refresh", "record: bind+dispatch", "record: marks", "record: completion", "record", "sync"};
 constexpr std::size_t DispatchRows = static_cast<std::size_t>(DispatchPhaseCount) + static_cast<std::size_t>(Graphics::LookupOutcomes::Count);
 
 const char* DispatchRowName(std::size_t row) {
@@ -3130,6 +3135,8 @@ struct DispatchCounters {
     IndirectHold indirectHold;
     std::uint64_t cacheHits = 0, cacheMisses = 0, cacheInvalidated = 0, templateRefreshed = 0, templateSameWords = 0;
     double templateRevalidateMs = 0;
+    std::uint64_t movedHits = 0, reportedMovedHits = 0, reportedHits = 0, reportedMisses = 0;
+    double rebindMs = 0, reportedRebindMs = 0;
     std::uint64_t procLookups = 0, preBarriersRecorded = 0, preBarriersSkipped = 0;
     std::chrono::steady_clock::time_point cacheReport = std::chrono::steady_clock::now();
 };
@@ -3260,6 +3267,18 @@ struct DispatchTimer {
         if (!profile) return;
         auto& d = Dispatches();
         d.procLookups += Graphics::DeviceProcLookups() - lookupsBefore;
+        if (std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
+            d.cacheReport = std::chrono::steady_clock::now();
+            AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; moved-buffer hits %llu (rebind %.1f us/hit); Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), Graphics::SharedResourceCache().Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(d.movedHits), d.movedHits != 0 ? d.rebindMs * 1000 / static_cast<double>(d.movedHits) : 0.0, static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
+            AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
+            const auto moved = d.movedHits - d.reportedMovedHits;
+            AgcDriver::ProfilePrint_nid_no_patch("[rescache-dispatch] %llu hits, %llu misses (10 s); moved-buffer template hits %llu, rebind %.1f ms (%.1f us/hit)\n", static_cast<unsigned long long>(d.cacheHits - d.reportedHits), static_cast<unsigned long long>(d.cacheMisses - d.reportedMisses), static_cast<unsigned long long>(moved), d.rebindMs - d.reportedRebindMs, moved != 0 ? (d.rebindMs - d.reportedRebindMs) * 1000 / static_cast<double>(moved) : 0.0);
+            d.reportedHits = d.cacheHits;
+            d.reportedMisses = d.cacheMisses;
+            d.reportedMovedHits = d.movedHits;
+            d.reportedRebindMs = d.rebindMs;
+            reportRecipes();
+        }
         const auto now = std::chrono::steady_clock::now();
         const auto totalMs = std::chrono::duration<double, std::milli>(now - start).count();
         if (totalMs > 100) AgcDriver::ProfilePrint_nid_no_patch("[dispatch] %s %zu words:%s\n", groupsText, spirvWords, formatCall().c_str());
@@ -3320,6 +3339,7 @@ struct RecordedDispatch {
     // Whether the data refresh recorded anything.
     bool refreshed = false;
     bool resourceKeyMatched = false;
+    std::shared_ptr<Graphics::ShaderResources::DispatchBindings> bindings;
 };
 
 VkDevice VulkanDevice::Device() const {
@@ -3457,22 +3477,6 @@ std::shared_ptr<PreparedDispatch> VulkanDevice::PrepareDispatch(const ShaderReco
         phase(PreparedDispatch::PrepareFind);
     }
     if (cached == nullptr) {
-        if (profile && !prepared->key.empty()) {
-            static std::mutex movableMutex;
-            static std::unordered_set<std::uint64_t> movableSeen;
-            static std::uint64_t misses = 0, wouldHit = 0;
-            static auto reported = std::chrono::steady_clock::now();
-            std::uint64_t hash = 14695981039346656037ull;
-            for (const auto word : Graphics::ShaderResources::ContentKey(compute, false, true)) hash = (hash ^ word) * 1099511628211ull;
-            std::lock_guard movableLock(movableMutex);
-            ++misses;
-            if (!movableSeen.insert(hash).second) ++wouldHit;
-            if (std::chrono::steady_clock::now() - reported > std::chrono::seconds(10)) {
-                AgcDriver::ProfilePrint_nid_no_patch("[rescache-dispatch] %llu misses (10 s), %llu would hit with read-only buffer addresses out of the key; %zu distinct such keys\n", static_cast<unsigned long long>(misses), static_cast<unsigned long long>(wouldHit), movableSeen.size());
-                misses = wouldHit = 0;
-                reported = std::chrono::steady_clock::now();
-            }
-        }
         prepared->resources = std::make_shared<Graphics::ShaderResources>(context, compute, snapshots, true, dispatchThreads);
         phase(PreparedDispatch::PrepareStageA);
     }
@@ -3652,7 +3656,8 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     // the label).
     const auto touches = [&](std::uint64_t begin, std::uint64_t end) {
         const auto bytes = static_cast<std::size_t>(end - begin);
-        return resources.WritesOverlap(begin, bytes) || resources.ReadsOverlap(begin, bytes) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
+        const auto reads = resources.InPlaceReads(record.bindings.get());
+        return resources.WritesOverlap(begin, bytes) || std::any_of(reads.begin(), reads.end(), [&](const auto& range) { return begin < range.second && range.first < end; }) || (argumentImport != nullptr && begin < arguments + 12 && arguments < end);
     };
     if (recorder.HasQueuedKeyStores() && (resources.HoldsLease() || recorder.AnyQueuedKeyStore(touches))) recorder.FlushKeyStores();
     if (recorder.HasQueuedStores() && (resources.HoldsLease() || recorder.AnyQueuedStore(touches))) recorder.FlushStores();
@@ -3685,7 +3690,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
             const std::pair<std::uint64_t, std::uint64_t> argumentRange{arguments, arguments + 12};
             recorder.NoteAccess(CommandClass::IndirectArguments, Graphics::Recorder::Access{std::span(&argumentRange, 1), {}, {}, VK_PIPELINE_STAGE_DRAW_INDIRECT_BIT});
         }
-        const auto reads = resources.InPlaceReads();
+        const auto reads = resources.InPlaceReads(record.bindings.get());
         const auto images = resources.StorageImages();
         recorder.NoteAccess(CommandClass::DispatchLeading, Graphics::Recorder::Access{reads, resources.GpuWrites(), images, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, resources.HoldsLease()});
     }
@@ -3721,7 +3726,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     const auto packet = GuestMemory::CurrentPacket();
     const Graphics::DebugLabel label(context, commands, "dispatch cs 0x%llx %ux%ux%u%s (pm4 0x%x queue %u)", static_cast<unsigned long long>(record.programAddress), record.x, record.y, record.z, record.arguments != 0 ? " indirect" : "", packet.opcode, packet.queue);
     context.Resolved(&Graphics::DeviceFunctions::cmdBindPipeline, "vkCmdBindPipeline")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->pipeline);
-    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout);
+    resources.Bind(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, record.bindings.get());
     if (const auto dwords = record.shader->program->workgroupMemoryDwords; dwords != 0) {
         auto memory = state->WorkgroupMemoryFor(context, record.x, record.y, record.z, dwords);
         context.Resolved(&Graphics::DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, VK_PIPELINE_BIND_POINT_COMPUTE, record.objects->layout, ShaderRecompiler::WorkgroupMemoryDescriptorSet, 1, &memory->set, 0, nullptr);
@@ -3741,7 +3746,7 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
     recorder.EndGpuTiming(trailingTiming);
     recorder.MarkCovered(dispatchedAccess);
     recordStep(PhaseRecordBind);
-    resources.MarkGpuWrites(recorder);
+    resources.MarkGpuWrites(recorder, record.bindings.get());
     recordStep(PhaseRecordMarks);
     // Only copied written buffers (and BDA fault checks) need work once the GPU is done; without them
     // the batch can signal its labels from the GPU.
@@ -3801,6 +3806,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     const auto lookupsBefore = Graphics::DeviceProcLookups();
     std::shared_ptr<Graphics::ShaderResources> resources;
     ResourceCache::Key contentKey;
+    std::shared_ptr<Graphics::ShaderResources::DispatchBindings> dispatchBindings;
     const bool cacheable = ResourceCacheEnabled() && shader.PipelineVariantId() != 0;
     // The object came from the resource cache: a compute template whose data buffers take this
     // dispatch's words at the record (ShaderResources::RefreshData).
@@ -3885,7 +3891,17 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
         contentKey = prepared != nullptr && !prepared->key.empty() ? std::move(prepared->key) : DispatchContentKey(shaders[0], context.device);
         auto cached = preparedFind && prepared != nullptr && prepared->cached != nullptr ? std::move(prepared->cached) : state->resourceCache.Find(contentKey);
         if (cached != nullptr) {
-            if (cached->Revalidate(shaders[0])) {
+            const auto rebindStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            const auto moved = cached->MovedReadOnlyBuffers(shaders, *state->recorder);
+            const auto rebound = moved.has_value() ? cached->PrepareDispatchBindings(*state->recorder, *moved) : std::nullopt;
+            const auto rebindMs = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - rebindStart).count() : 0.0;
+            timer.add(PhaseResourcesRebind, rebindMs);
+            if (rebound.has_value() && cached->Revalidate(shaders[0])) {
+                dispatchBindings = *rebound;
+                if (dispatchBindings != nullptr) {
+                    ++d.movedHits;
+                    d.rebindMs += rebindMs;
+                }
                 resources = std::move(cached);
                 fromCache = true;
                 ++d.cacheHits;
@@ -3923,12 +3939,6 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
             d.indirectHold.phaseMs[row] += outcomes.ms[kind];
             d.indirectHold.phaseCounts[row] += outcomes.counts[kind];
         }
-    }
-    if (profile && std::chrono::steady_clock::now() - d.cacheReport > std::chrono::seconds(10)) {
-        d.cacheReport = std::chrono::steady_clock::now();
-        AgcDriver::ProfilePrint_nid_no_patch("[rescache] %llu hits, %llu misses, %llu invalidated, %zu entries (dispatch + draw); template hits: %llu refreshed the data buffers (revalidate %.1f ms), %llu had the same words; Find calls %llu, Touch calls %llu\n", static_cast<unsigned long long>(d.cacheHits), static_cast<unsigned long long>(d.cacheMisses), static_cast<unsigned long long>(d.cacheInvalidated), state->resourceCache.Size(), static_cast<unsigned long long>(d.templateRefreshed), d.templateRevalidateMs, static_cast<unsigned long long>(d.templateSameWords), static_cast<unsigned long long>(ResourceCache::Finds()), static_cast<unsigned long long>(ResourceCache::Touches()));
-        AgcDriver::ProfilePrint_nid_no_patch("[vk] deviceProc lookups inside the device call: %llu (%.2f per dispatch); pre-dispatch barriers recorded %llu, skipped %llu\n", static_cast<unsigned long long>(d.procLookups), d.profiledDispatches != 0 ? static_cast<double>(d.procLookups) / static_cast<double>(d.profiledDispatches) : 0.0, static_cast<unsigned long long>(d.preBarriersRecorded), static_cast<unsigned long long>(d.preBarriersSkipped));
-        reportRecipes();
     }
     timing.Mark("shader_resources");
     timer.phase(PhaseResources);
@@ -3984,6 +3994,7 @@ VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::Rec
     IndirectOutcome outcome{0, 0};
     RecordedDispatch record{&context, &shaders[0], resources, objects, pushStages, &pushBytes, x, y, z, arguments, nullptr, programAddress, fromCache && TemplateDataRefresh() ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::None, 0, revalidateMs, &timer};
     record.resourceKeyMatched = fromCache;
+    record.bindings = std::move(dispatchBindings);
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     // The indirect hold total below still covers the whole call of a CPU-resolved one.
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
@@ -4080,6 +4091,7 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     // Without the refresh the template holds the words it was keyed with: a data-only hit takes
     // the ordinary path, whose word-keyed lookup serves or builds the object for the live words.
     if (refreshByWords && !TemplateDataRefresh()) return RecipeOutcome::Rebuild;
+    if (DispatchContentKey(shaders[0], context.device) != recipe.key) return RecipeOutcome::Rebuild;
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     DispatchTimer timer(profile, arguments != 0, shader.spirv.size(), programAddress);
     DispatchTimer::countDispatch(profile);
@@ -4133,7 +4145,11 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const auto waitedBefore = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
     const auto proofStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     Graphics::ShaderResources::ProofReport report;
-    const bool proved = hit->resources->ProveCurrent(shaders[0], &report);
+    const auto moved = hit->resources->MovedReadOnlyBuffers(shaders, *state->recorder);
+    const auto rebound = moved.has_value() ? hit->resources->PrepareDispatchBindings(*state->recorder, *moved) : std::nullopt;
+    const auto rebindMs = profile ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - proofStart).count() : 0.0;
+    timer.add(PhaseResourcesRebind, rebindMs);
+    const bool proved = rebound.has_value() && hit->resources->ProveCurrent(shaders[0], &report);
     if (profile) {
         counters.proofNs.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - proofStart).count()), std::memory_order_relaxed);
         timer.add(PhaseResourcesHookWaits, Graphics::Recorder::ThreadWaitedMs() - waitedBefore);
@@ -4156,7 +4172,12 @@ RecipeOutcome VulkanDevice::DispatchRecipe(const ShaderRecompiler::RecompileResu
     const auto dataRefresh = !TemplateDataRefresh() ? RecordedDispatch::DataRefresh::None : refreshByWords ? RecordedDispatch::DataRefresh::Words : RecordedDispatch::DataRefresh::Hash;
     if (dataRefresh == RecordedDispatch::DataRefresh::Words) counters.refreshByWords.fetch_add(1, std::memory_order_relaxed);
     RecordedDispatch record{&context, &shaders[0], hit->resources, hit->objects, recipe.pushes ? VkShaderStageFlags{VK_SHADER_STAGE_COMPUTE_BIT} : VkShaderStageFlags{0}, &recipe.pushBytes, x, y, z, arguments, nullptr, programAddress, dataRefresh, recipe.dataWordsHash, 0, &timer};
-    record.resourceKeyMatched = verify != nullptr;
+    record.resourceKeyMatched = true;
+    record.bindings = *rebound;
+    if (record.bindings != nullptr) {
+        ++d.movedHits;
+        d.rebindMs += rebindMs;
+    }
     if (arguments != 0) decideIndirect(record, outcome, groupsText);
     const bool indirect = record.arguments != 0 || outcome.cpuReason != 0;
     const auto recordStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

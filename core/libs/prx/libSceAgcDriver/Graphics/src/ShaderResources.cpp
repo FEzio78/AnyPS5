@@ -1737,7 +1737,7 @@ void VisitContentKey(const CompiledShader& shader, bool dataWords, bool movableB
                 if (written || empty) { for (std::uint32_t index = 0; index < 4u; ++index) visit(words[index]); }
                 else { for (const auto word : {0u, words[1] & 0xffff0000u, 0u, words[3]}) visit(word); }
             }
-        } else if ((dataWords && !movableBuffers) || !DataRole(binding.role)) {
+        } else if ((dataWords && (!movableBuffers || shader.stage == ShaderRecompiler::ShaderStage::Compute)) || !DataRole(binding.role)) {
             for (const auto word : binding.guestDescriptor) visit(word);
         }
         packBits(binding.imageWritten);
@@ -2771,6 +2771,22 @@ DescriptorCache::Stats DescriptorCache::Counters() const {
     return stats;
 }
 
+std::size_t GuestBufferBytes(const ShaderRecompiler::ShaderBufferResource& descriptor) {
+    const auto byteSize = descriptor.GetSize();
+    const auto address = descriptor.Base48();
+    auto size = static_cast<std::size_t>(byteSize);
+    if (const std::uint64_t stride = descriptor.Stride(); stride != 0) {
+        constexpr std::uint64_t GuestPageBytes = 0x4000;
+        const auto end = address + size;
+        const auto overhang = end % GuestPageBytes;
+        if (overhang != 0 && overhang < stride) {
+            const auto allocationEnd = RegisteredReadableEnd(address);
+            if (allocationEnd > address && allocationEnd < end && end - allocationEnd < stride) size = static_cast<std::size_t>(allocationEnd - address);
+        }
+    }
+    return size;
+}
+
 std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words, const ColorTarget* target, std::uint64_t indexAddress, std::size_t indexBytes, bool written, bool atomic, bool read) {
     Require(words.size() == 4, "buffer descriptor must contain four DWORDs");
     Require((words[1] & 0x40000000u) == 0, "buffer descriptor has reserved bits set");
@@ -2784,16 +2800,7 @@ std::size_t ShaderResources::addGuestBuffer(std::span<const std::uint32_t> words
     }
     Require(byteSize <= context.limits.maxStorageBufferRange, "shader buffer exceeds descriptor range limit");
     Require(byteSize <= std::numeric_limits<std::size_t>::max(), "shader buffer size exceeds host address space");
-    auto size = static_cast<std::size_t>(byteSize);
-    if (const std::uint64_t stride = descriptor.Stride(); stride != 0) {
-        constexpr std::uint64_t GuestPageBytes = 0x4000;
-        const auto end = address + size;
-        const auto overhang = end % GuestPageBytes;
-        if (overhang != 0 && overhang < stride) {
-            const auto allocationEnd = RegisteredReadableEnd(address);
-            if (allocationEnd > address && allocationEnd < end && end - allocationEnd < stride) size = static_cast<std::size_t>(allocationEnd - address);
-        }
-    }
+    const auto size = GuestBufferBytes(descriptor);
     Require(target == nullptr || !overlap(address, size, target->address, target->bytes), "shader buffer aliases the render target");
     // APS5_ALL_BUFFERS_WRITTEN=1: every element is noted as written, as before bufferWritten existed.
     static const bool allWritten = std::getenv("APS5_ALL_BUFFERS_WRITTEN") != nullptr;
@@ -3413,6 +3420,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
         if (shader.program == nullptr) return std::nullopt;
         for (const auto& binding : shader.program->bindings) {
             if (DataRole(binding.role)) {
+                if (!drawBuild) continue;
                 const auto kept = std::find_if(bindings.begin(), bindings.end(), [&](const Binding& item) { return item.layout.binding == binding.binding; });
                 if (kept == bindings.end() || kept->allocations.size() != 1) return std::nullopt;
                 const auto index = kept->allocations.front();
@@ -3432,7 +3440,7 @@ std::optional<std::vector<ShaderResources::MovedBuffer>> ShaderResources::MovedR
                 const auto* words = binding.guestDescriptor.data() + static_cast<std::size_t>(element) * 4u;
                 const ShaderRecompiler::ShaderBufferResource descriptor{{words[0], words[1], words[2], words[3]}};
                 const auto address = descriptor.Base48();
-                const auto size = descriptor.GetSize();
+                const auto size = GuestBufferBytes(descriptor);
                 const auto index = kept->allocations[element];
                 const auto& item = allocations[index];
                 const bool empty = size == 0 || address == 0;
@@ -3497,63 +3505,106 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
         CaptureTrace::Log("draw-snapshot batch=%llu address=%llx bytes=%zu", static_cast<unsigned long long>(recorder.Submissions() + 1), static_cast<unsigned long long>(begin), bytes);
     }
     if (selected.empty()) return {};
-    Require(context.descriptorCache != nullptr, "draw snapshots require a descriptor cache");
+    std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> overrides;
+    for (std::size_t index = 0; index < selected.size(); ++index) {
+        const auto& snapshot = result->snapshots[index];
+        overrides.push_back({selected[index], {snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()}});
+    }
+    copyBindings(*result, overrides);
+    recorder.Keep(result);
+    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    return result;
+}
+
+void ShaderResources::copyBindings(DrawBindings& result, std::span<const std::pair<std::size_t, VkDescriptorBufferInfo>> overrides) const {
+    Require(context.descriptorCache != nullptr, "buffer rebindings require a descriptor cache");
     std::map<VkDescriptorType, std::uint32_t> counts;
     for (const auto& binding : bindings) counts[binding.layout.descriptorType] += binding.layout.descriptorCount;
     std::vector<VkDescriptorPoolSize> sizes;
     for (const auto& [type, count] : counts) sizes.push_back({type, count});
-    result->cache = context.descriptorCache;
-    result->allocation = result->cache->Allocate(_layout, sizes);
-    Require(result->allocation.set != VK_NULL_HANDLE, "draw snapshot descriptor allocation failed");
+    result.cache = context.descriptorCache;
+    result.allocation = result.cache->Allocate(_layout, sizes, updateAfterBind);
+    Require(result.allocation.set != VK_NULL_HANDLE, "buffer rebinding descriptor allocation failed");
     std::vector<VkCopyDescriptorSet> copies;
     for (const auto& binding : bindings) {
         VkCopyDescriptorSet copy{VK_STRUCTURE_TYPE_COPY_DESCRIPTOR_SET};
         copy.srcSet = _set;
         copy.srcBinding = binding.layout.binding;
-        copy.dstSet = result->allocation.set;
+        copy.dstSet = result.allocation.set;
         copy.dstBinding = binding.layout.binding;
         copy.descriptorCount = binding.layout.descriptorCount;
         copies.push_back(copy);
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
     update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
-    std::vector<std::size_t> snapshotIndices(allocations.size(), selected.size());
-    for (std::size_t index = 0; index < selected.size(); ++index) snapshotIndices[selected[index]] = index;
     std::size_t infoCount = 0;
     for (const auto& binding : bindings) infoCount += binding.allocations.size();
     std::vector<VkDescriptorBufferInfo> infos;
     infos.reserve(infoCount);
     std::vector<VkWriteDescriptorSet> writes;
     for (const auto& binding : bindings) {
-        if (std::none_of(binding.allocations.begin(), binding.allocations.end(),
-                [&](std::size_t index) { return snapshotIndices[index] != selected.size(); })) continue;
+        const auto find = [&](std::size_t index) {
+            return std::find_if(overrides.begin(), overrides.end(), [&](const auto& entry) { return entry.first == index; });
+        };
+        if (std::none_of(binding.allocations.begin(), binding.allocations.end(), [&](std::size_t index) { return find(index) != overrides.end(); })) continue;
         const auto first = infos.size();
         for (const auto index : binding.allocations) {
-            const auto snapshotIndex = snapshotIndices[index];
-            if (snapshotIndex == selected.size()) infos.push_back(allocationDescriptors[index]);
-            else {
-                const auto& snapshot = result->snapshots[snapshotIndex];
-                infos.push_back({snapshot.buffer->Handle(), 0, snapshot.buffer->Bytes().size()});
-            }
+            const auto override = find(index);
+            infos.push_back(override == overrides.end() ? allocationDescriptors[index] : override->second);
         }
         VkWriteDescriptorSet write{VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET};
-        write.dstSet = result->allocation.set;
+        write.dstSet = result.allocation.set;
         write.dstBinding = binding.layout.binding;
-        write.dstArrayElement = 0;
         write.descriptorCount = static_cast<std::uint32_t>(binding.allocations.size());
         write.descriptorType = binding.layout.descriptorType;
         write.pBufferInfo = infos.data() + first;
         writes.push_back(write);
     }
     update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+}
+
+std::optional<std::shared_ptr<ShaderResources::DispatchBindings>> ShaderResources::PrepareDispatchBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {
+    if (moved.empty()) return std::shared_ptr<DispatchBindings>{};
+    Require(!drawBuild && !usesBda, "dispatch buffer rebindings require descriptor-based compute resources");
+    auto result = std::make_shared<DispatchBindings>(context);
+    result->memory.AllowDeviceStaging();
+    for (const auto& entry : moved) {
+        Require(entry.allocation < allocations.size() && entry.words.empty(), "invalid moved dispatch buffer");
+        const auto& item = allocations[entry.allocation];
+        Require(item.guest && !item.written, "cannot move a written dispatch buffer");
+        result->memory.AddReadable(entry.address, entry.size);
+    }
+    result->memory.Upload(false);
+    std::vector<std::pair<std::size_t, VkDescriptorBufferInfo>> overrides;
+    for (const auto& entry : moved) {
+        std::uint32_t adjustment = 0;
+        const auto descriptor = result->memory.Descriptor(entry.address, entry.size, adjustment);
+        if (adjustment != allocations[entry.allocation].adjustment) return std::nullopt;
+        overrides.push_back({entry.allocation, descriptor});
+    }
+    result->reads = result->memory.InPlaceReads();
+    const auto original = guestMemory.InPlaceReads();
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& item = allocations[index];
+        if (!item.guest || std::any_of(moved.begin(), moved.end(), [&](const auto& entry) { return entry.allocation == index; })) continue;
+        const auto begin = item.address - item.adjustment;
+        const auto end = begin + GuestBufferMemory::ViewBytes(item.size, item.adjustment);
+        for (const auto& range : original) {
+            const auto from = std::max(begin, range.first);
+            const auto to = std::min(end, range.second);
+            if (from < to) result->reads.emplace_back(from, to);
+        }
+    }
+    copyBindings(*result, overrides);
     recorder.Keep(result);
-    for (const auto& snapshot : result->snapshots) recorder.KeepBytes(snapshot.buffer.get(), snapshot.buffer->Bytes().size());
+    recorder.KeepBytes(result.get(), result->memory.CopiedBytes());
     return result;
 }
 
-void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout) const {
-    if (_set == VK_NULL_HANDLE) return;
-    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &_set, 0, nullptr);
+void ShaderResources::Bind(VkCommandBuffer commands, VkPipelineBindPoint bindPoint, VkPipelineLayout layout, const DrawBindings* overrides) const {
+    const auto set = overrides != nullptr ? overrides->allocation.set : _set;
+    if (set == VK_NULL_HANDLE) return;
+    context.Resolved(&DeviceFunctions::cmdBindDescriptorSets, "vkCmdBindDescriptorSets")(commands, bindPoint, layout, 0, 1, &set, 0, nullptr);
 }
 
 namespace {
@@ -3595,7 +3646,7 @@ MarkTimes& MarkTiming() {
     return times;
 }
 
-void ShaderResources::MarkGpuWrites(Recorder& recorder) {
+void ShaderResources::MarkGpuWrites(Recorder& recorder, const DispatchBindings* overrides) {
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elapsed = [&] {
@@ -3632,7 +3683,7 @@ void ShaderResources::MarkGpuWrites(Recorder& recorder) {
         const auto kind = guestMemory.HoldsLease() ? Recorder::ReadKind::AddressBased : Recorder::ReadKind::DispatchElement;
         static const bool everySpaceUse = std::getenv("APS5_NO_SPACE_READ_DEDUPE") != nullptr;
         const auto owner = everySpaceUse ? nullptr : guestMemory.SpaceOwner();
-        const auto reads = guestMemory.InPlaceReads(owner == nullptr);
+        const auto reads = overrides != nullptr ? overrides->reads : guestMemory.InPlaceReads(owner == nullptr);
         if (timed) {
             readRanges = reads.size();
             for (const auto& [begin, end] : reads) readBytes += end - begin;

@@ -2061,6 +2061,82 @@ void descriptorSnapshotTests() {
     }
 }
 
+void dispatchMovedBufferTests() {
+    using namespace AgcDriver::Graphics;
+    alignas(256) const std::array<std::uint32_t, 8> first{11, 12, 13, 14, 15, 16, 17, 18};
+    alignas(256) const std::array<std::uint32_t, 8> second{21, 22, 23, 24, 25, 26, 27, 28};
+    for (const unsigned selected : {1u, 2u, 3u}) {
+        mock = MockVulkan{};
+        mock.allowCopies = true;
+        auto context = mockContext();
+        {
+            DescriptorCache cache(context);
+            context.descriptorCache = &cache;
+            std::lock_guard lock(AgcDriver::GuestMemory::GpuMutex());
+            Recorder recorder(context);
+            ShaderRecompiler::RecompileResult program;
+            auto binding = makeBinding(Role::GuestBuffers, 0, 2, join(vsharp(guestFirst.data(), 16), vsharp(guestSecond.data(), 32)));
+            binding.bufferWritten = {false, false};
+            program.bindings.push_back(binding);
+            program.bindings.push_back(makeBinding(Role::GuestBuffers, 4, 1, vsharp(guestThird.data(), 8)));
+            program.bindings.push_back(makeBinding(Role::FlattenedSrt, 5, 1, {1, 2, 3, 4}));
+            const CompiledShader shader{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+            ShaderResources resources(context, shader);
+            const auto original = findWrite(0).buffers;
+            auto live = program;
+            if (selected & 1u) {
+                const auto words = vsharp(first.data(), 24);
+                std::copy(words.begin(), words.end(), live.bindings[0].guestDescriptor.begin());
+            }
+            if (selected & 2u) {
+                const auto words = vsharp(second.data(), 12);
+                std::copy(words.begin(), words.end(), live.bindings[0].guestDescriptor.begin() + 4);
+            }
+            const CompiledShader current{ShaderRecompiler::ShaderStage::Compute, &live, 0};
+            Require(ShaderResources::ContentKey(shader, false, true) == ShaderResources::ContentKey(current, false, true), "moved dispatch addresses changed the template key");
+            Require(ShaderResources::ContentKey(shader, false, false) != ShaderResources::ContentKey(current, false, false), "address-keyed dispatches shared a moved template");
+            auto changed = live;
+            changed.bindings[1].guestDescriptor = vsharp(first.data(), 8);
+            Require(ShaderResources::ContentKey(shader, false, true) != ShaderResources::ContentKey({ShaderRecompiler::ShaderStage::Compute, &changed, 0}, false, true), "written dispatch addresses left the key");
+            changed = live;
+            changed.bindings[0].guestDescriptor[2] = 0;
+            Require(ShaderResources::ContentKey(current, false, true) != ShaderResources::ContentKey({ShaderRecompiler::ShaderStage::Compute, &changed, 0}, false, true), "empty dispatch buffers left the key");
+            changed = live;
+            changed.bindings[0].guestDescriptor[0] = 0;
+            changed.bindings[0].guestDescriptor[1] &= 0xffff0000u;
+            Require(ShaderResources::ContentKey(current, false, true) != ShaderResources::ContentKey({ShaderRecompiler::ShaderStage::Compute, &changed, 0}, false, true), "null dispatch buffers left the key");
+            changed = live;
+            changed.bindings[2].guestDescriptor[0] = 99;
+            Require(ShaderResources::ContentKey(current, true, true) != ShaderResources::ContentKey({ShaderRecompiler::ShaderStage::Compute, &changed, 0}, true, true), "word-keyed compute data was omitted by movable buffers");
+            const auto moved = resources.MovedReadOnlyBuffers(std::span(&current, 1), recorder);
+            Require(moved.has_value() && moved->size() == (selected == 3 ? 2 : 1), "dispatch moves were not resolved");
+            mock.writes.clear();
+            const auto rebound = resources.PrepareDispatchBindings(recorder, *moved);
+            Require(rebound.has_value() && *rebound != nullptr, "dispatch moves were not rebound");
+            const auto bindings = *rebound;
+            Require(mock.copies.size() == 3 && mock.copies[0].descriptorCount == 2, "dispatch rebinding did not copy every binding");
+            Require(mock.writes.size() == 1 && mock.writes[0].count == 2 && mock.writes[0].arrayElement == 0, "dispatch rebinding did not rewrite the complete affected array");
+            const auto descriptors = findWrite(0).buffers;
+            Require(bindings->memory.CopiedBytes() != 0 && bindings->memory.InPlaceReads().empty(), "a moved range outside imports did not get a fresh copy");
+            for (std::size_t index = 0; index < 2; ++index) {
+                if (selected & (1u << index)) continue;
+                Require(descriptors[index].buffer == original[index].buffer && descriptors[index].offset == original[index].offset && descriptors[index].range == original[index].range, "dispatch rebinding changed an untouched descriptor");
+            }
+            mock.writes.clear();
+            ShaderResources fresh(context, current);
+            const auto expected = findWrite(0).buffers;
+            for (std::size_t index = 0; index < 2; ++index) {
+                Require(descriptors[index].offset == expected[index].offset && descriptors[index].range == expected[index].range, "moved and fresh dispatch descriptor views differ");
+                Require(sameBytes(bufferBytes(descriptors[index].buffer).subspan(descriptors[index].offset), bufferBytes(expected[index].buffer).data() + expected[index].offset, expected[index].range), "moved and fresh dispatch data differ");
+            }
+            resources.Bind(recorder.Commands(), VK_PIPELINE_BIND_POINT_COMPUTE, VK_NULL_HANDLE, bindings.get());
+            Require(mock.boundPoint == VK_PIPELINE_BIND_POINT_COMPUTE && mock.boundSets == 1, "moved dispatch bound the wrong set");
+            recorder.Sync();
+        }
+        Require(mock.live == 0, "moved dispatch bindings leaked Vulkan objects");
+    }
+}
+
 void resourceTests() {
     mock = MockVulkan{};
     const auto context = mockContext();
@@ -4074,6 +4150,7 @@ int main() {
         pushConstantTests();
         resourceTests();
         descriptorSnapshotTests();
+        dispatchMovedBufferTests();
         descriptorCacheTests();
         misalignedShaderDataTests();
         debugBranchTests();

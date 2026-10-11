@@ -3226,13 +3226,22 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
 
 std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSurfaces() const {
     std::vector<std::pair<std::uint64_t, std::uint64_t>> surfaces;
+    static const bool resourceReads = std::getenv("APS5_PRESYNC_RESOURCE_READS") != nullptr;
+    if (resourceReads && (usesBda || lockedBuild)) {
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& range : lease) {
+            if (!range->gpu || !range->readable || (!range->writable && !range->releasable)) continue;
+            if (!HostImportCovers(context, range->address, range->bytes)) surfaces.emplace_back(range->address, range->bytes);
+        }
+    }
     // A surface's lookup reads guest memory on the CPU unless it is served GPU-direct from a host
     // import: a storage image of imported memory uploads and refreshes from the import, and a
     // sampled texture of one views that image (SampledFromStorageEligible), so neither waits for
     // the producer.
-    const auto consider = [&](std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes, bool sampled) {
+    const auto consider = [&](std::uint32_t format, std::uint64_t address, std::uint64_t guestBytes, bool sampled, std::uint64_t keys) {
         const bool gpuDirect = sampled ? SampledFromStorageEligible(context, format, address, guestBytes) : HostImportCovers(context, address, static_cast<std::size_t>(guestBytes));
         if (!gpuDirect) surfaces.emplace_back(address, guestBytes);
+        if (resourceReads && keys != 0) surfaces.emplace_back(keys, DccKeyBytes(guestBytes));
     };
     if (completed) {
         // A cached object (the resource cache): Revalidate repeats the lookups of the objects the
@@ -3246,20 +3255,20 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
         for (const auto& range : describedRanges) {
             if (std::strcmp(range.kind, "texture") == 0 && textureIndex < textures.size()) {
                 const auto& texture = textures[textureIndex++];
-                if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false);
-                else consider(range.format, range.address, range.bytes, true);
+                if (texture->ViewsStorageImage()) consider(range.format, range.address, range.bytes, false, range.dccAddress);
+                else consider(range.format, range.address, range.bytes, true, range.dccAddress);
             }
         }
         for (std::size_t index = 0; index < storageTextures.size(); ++index) {
             if (index != 0 && storageTextures[index] == storageTextures[index - 1]) continue;
             const auto& image = *storageTextures[index];
-            consider(image.Descriptor().format, image.Descriptor().baseAddress, image.GuestBytes(), false);
+            consider(image.Descriptor().format, image.Descriptor().baseAddress, image.GuestBytes(), false, image.Descriptor().dccAddress);
         }
         return surfaces;
     }
     if (!imageRecords.empty()) {
         for (const auto& record : imageRecords) {
-            if (record.decoded) consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled);
+            if (record.decoded) consider(record.resource.format, record.resource.baseAddress, record.guestBytes, record.sampled, record.resource.dccAddress);
         }
         return surfaces;
     }
@@ -3268,7 +3277,7 @@ std::vector<std::pair<std::uint64_t, std::uint64_t>> ShaderResources::PresyncSur
     forEachImageElement(*deferredCompute.program, [&](const ShaderRecompiler::DescriptorBinding& binding, std::uint32_t, std::span<const std::uint32_t> words) {
         if (words[0] == 0u && (words[1] & 0xffu) == 0u) return;
         const auto resource = DecodeTextureResource(words);
-        consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage);
+        consider(resource.format, resource.baseAddress, DescribeSurface(resource).guestBytes, binding.kind == ShaderRecompiler::DescriptorKind::SampledImage, resource.dccAddress);
     });
     return surfaces;
 }

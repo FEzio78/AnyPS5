@@ -3323,6 +3323,11 @@ RecipeOutcome VulkanDevice::DrawFromRecipe(const Graphics::State& graphics, cons
 
 std::uint64_t VulkanDevice::presync(std::span<const std::pair<std::uint64_t, std::uint64_t>> surfaces) {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    static const bool resourceReads = std::getenv("APS5_PRESYNC_RESOURCE_READS") != nullptr;
+    if (resourceReads && !GuestMemory::GpuMutex().HeldByThisThread()) {
+        const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::BufferUpload);
+        for (const auto& [address, bytes] : surfaces) GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
+    }
     auto& counters = Presyncs();
     bool overlaps = false;
     for (const auto& [address, bytes] : surfaces) overlaps = overlaps || Graphics::Recorder::SnapshotWriteOverlaps(address, static_cast<std::size_t>(bytes));

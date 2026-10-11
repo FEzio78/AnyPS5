@@ -3946,6 +3946,57 @@ std::array<std::uint32_t, 8> linearTextureWords(std::uint64_t address, std::uint
     return words;
 }
 
+void resourcePresyncTests(const Device& device) {
+    auto context = device.GetContext();
+    context.hostImportAlignment = 0;
+    context.nullDescriptors = true;
+    alignas(4096) static std::array<std::byte, 65536> mirror{};
+    const auto address = reinterpret_cast<std::uint64_t>(mirror.data());
+    {
+        GuestAllocations::Mutation mutation;
+        mutation.Add(mirror.data(), mirror.size(), true, true, true);
+    }
+    struct Unregister {
+        ~Unregister() {
+            GuestAllocations::Mutation mutation;
+            mutation.Remove(mirror.data());
+        }
+    } unregister;
+    ShaderRecompiler::RecompileResult program;
+    program.bdaAbiVersion = ShaderRecompiler::BdaAbi::Version;
+    for (const auto role : {ShaderRecompiler::DescriptorRole::BdaPagetable, ShaderRecompiler::DescriptorRole::FaultBuffer}) {
+        ShaderRecompiler::DescriptorBinding binding;
+        binding.kind = ShaderRecompiler::DescriptorKind::StorageBuffer;
+        binding.role = role;
+        binding.count = 1;
+        binding.binding = static_cast<std::uint32_t>(program.bindings.size());
+        program.bindings.push_back(binding);
+    }
+    constexpr std::uint64_t surface = 0x200000000ull, keys = 0x210000000ull;
+    auto words = linearTextureWords(surface, 64, 4, 56);
+    words[6] = (1u << 21u) | (static_cast<std::uint32_t>((keys >> 8u) & 0xffu) << 24u);
+    words[7] = static_cast<std::uint32_t>(keys >> 16u);
+    ShaderRecompiler::DescriptorBinding image;
+    image.kind = ShaderRecompiler::DescriptorKind::StorageImage;
+    image.role = ShaderRecompiler::DescriptorRole::GuestImages;
+    image.count = 1;
+    image.guestDescriptor.assign(words.begin(), words.end());
+    program.bindings.push_back(image);
+    const CompiledShader compute{ShaderRecompiler::ShaderStage::Compute, &program, 0};
+    ShaderResources resources(context, compute, {}, true);
+    const auto ranges = resources.PresyncSurfaces();
+    const auto contains = [&](std::uint64_t begin, std::uint64_t bytes) {
+        return std::find(ranges.begin(), ranges.end(), std::pair{begin, bytes}) != ranges.end();
+    };
+    const auto enabled = std::getenv("APS5_PRESYNC_RESOURCE_READS") != nullptr;
+    const auto bytes = DescribeSurface(DecodeTextureResource(words)).guestBytes;
+    Require(contains(surface, bytes), "resource presync lost a CPU-read image surface");
+    Require(contains(keys, DccKeyBytes(bytes)) == enabled, "resource presync did not select the DCC metadata range according to the switch");
+    Require(contains(address, mirror.size()) == enabled, "resource presync did not select the BDA mirror range according to the switch");
+    Require(!contains(keys, bytes), "resource presync used surface bytes for metadata");
+    std::cout << "resource presync range tests passed\n";
+}
+
 void imageMemoTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
     TextureDetiler detiler(base);
@@ -4858,6 +4909,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-presync-only") {
+            resourcePresyncTests(device);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--cpu-storage-upload-only") {
             recordedCpuStorageUploadTests(device, recorder);
             return 0;

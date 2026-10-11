@@ -40,6 +40,7 @@ private:
     PadOutputState outputState{};
     bool outputPending = false;
     std::chrono::steady_clock::time_point nextRumbleRefresh{};
+    std::uint32_t scriptedButtons = 0;
 };
 
 #endif

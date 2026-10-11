@@ -1,4 +1,7 @@
 #include <algorithm>
+#include <chrono>
+#include <utility>
+#include <vector>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -13,8 +16,60 @@
 #include "prx/libScePad/include/PadInputTypes.hpp"
 #include "prx/libc/include/General.hpp"
 
+namespace {
+
+// APS5_PAD_SCRIPT="cross@30+6,down@300+0.2": pad buttons held from a time after start (seconds) for a
+// duration, ORed into the published state, so an unattended run can press buttons whatever the
+// window focus.
+struct ScriptedPress {
+    std::uint32_t button = 0;
+    double from = 0;
+    double until = 0;
+};
+
+const std::vector<ScriptedPress>& ScriptedPresses() {
+    static const std::vector<ScriptedPress> presses = [] {
+        std::vector<ScriptedPress> parsed;
+        const char* text = std::getenv("APS5_PAD_SCRIPT");
+        if (text == nullptr) return parsed;
+        const std::pair<const char*, Pad::PadButton> names[] = {{"cross", Pad::PadButton::Cross}, {"circle", Pad::PadButton::Circle}, {"square", Pad::PadButton::Square}, {"triangle", Pad::PadButton::Triangle}, {"options", Pad::PadButton::Options}, {"up", Pad::PadButton::Up}, {"down", Pad::PadButton::Down}, {"left", Pad::PadButton::Left}, {"right", Pad::PadButton::Right}, {"l1", Pad::PadButton::L1}, {"r1", Pad::PadButton::R1}};
+        std::string script = text;
+        std::size_t cursor = 0;
+        while (cursor < script.size()) {
+            const auto comma = script.find(',', cursor);
+            const auto entry = script.substr(cursor, comma == std::string::npos ? std::string::npos : comma - cursor);
+            cursor = comma == std::string::npos ? script.size() : comma + 1;
+            const auto at = entry.find('@');
+            const auto plus = entry.find('+', at == std::string::npos ? 0 : at);
+            if (at == std::string::npos || plus == std::string::npos) throw std::runtime_error("APS5_PAD_SCRIPT entry '" + entry + "' is not button@seconds+seconds");
+            const auto name = entry.substr(0, at);
+            const auto found = std::find_if(std::begin(names), std::end(names), [&](const auto& candidate) { return name == candidate.first; });
+            if (found == std::end(names)) throw std::runtime_error("APS5_PAD_SCRIPT names an unknown button '" + name + "'");
+            const auto from = std::strtod(entry.c_str() + at + 1, nullptr);
+            parsed.push_back({static_cast<std::uint32_t>(found->second), from, from + std::strtod(entry.c_str() + plus + 1, nullptr)});
+        }
+        return parsed;
+    }();
+    return presses;
+}
+
+std::uint32_t ScriptedButtons() {
+    static const auto started = std::chrono::steady_clock::now();
+    const auto& presses = ScriptedPresses();
+    if (presses.empty()) return 0;
+    const auto seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+    std::uint32_t buttons = 0;
+    for (const auto& press : presses) {
+        if (press.from <= seconds && seconds < press.until) buttons |= press.button;
+    }
+    return buttons;
+}
+
+}
+
 PadInput::PadInput()
     : bindings(Pad::LoadInputMapping()), pressed(bindings.size()), wheelReleaseTimes(bindings.size()) {
+    static_cast<void>(ScriptedButtons());
     openFirstAvailableController();
 }
 
@@ -275,6 +330,10 @@ void PadInput::Update() {
         wheelReleaseTimes[index] = {};
         released = true;
     }
+    if (const auto scripted = ScriptedButtons(); scripted != scriptedButtons) {
+        scriptedButtons = scripted;
+        released = true;
+    }
     if (released) publish();
     if (!mouseEnabled) return;
     if (SDL_GetKeyboardFocus() == nullptr) {
@@ -301,7 +360,7 @@ void PadInput::Update() {
 
 void PadInput::publish() {
     PadInputState state;
-    state.buttons = controllerState.buttons;
+    state.buttons = controllerState.buttons | scriptedButtons;
     state.sticks = controllerState.sticks;
     state.analogButtonsL2 = controllerState.analogButtonsL2;
     state.analogButtonsR2 = controllerState.analogButtonsR2;

@@ -1347,8 +1347,10 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window) : state(std::make_u
     VkPhysicalDeviceFeatures2 queried{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &robustness2};
     state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &queried);
     Graphics::Require(robustness2.nullDescriptor == VK_TRUE, "shader runtime requires nullDescriptor");
+    Graphics::Require(robustness2.robustImageAccess2 == VK_TRUE, "shader runtime requires robustImageAccess2");
     robustness2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ROBUSTNESS_2_FEATURES_EXT};
     robustness2.nullDescriptor = VK_TRUE;
+    robustness2.robustImageAccess2 = VK_TRUE;
     robustness2.pNext = bdaFeatures.pNext;
     bdaFeatures.pNext = &robustness2;
     deviceExtensions.push_back(VK_EXT_ROBUSTNESS_2_EXTENSION_NAME);

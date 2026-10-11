@@ -504,16 +504,24 @@ struct SpecializedModule {
 };
 
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-std::vector<std::uint32_t> OptimizeCached(std::vector<std::uint32_t> words, const SpirvTarget& target, bool specialize) {
+// The specialized module of a substituted prepared module: specialization passes and the optimizer,
+// cached on disk by their whole input (APS5_NO_SPECIALIZED_DISK_CACHE=1 runs them every time).
+std::vector<std::uint32_t> SpecializeCached(const std::vector<std::uint32_t>& words, std::span<const PipelineSpecializationConstant> constants, const std::set<std::uint32_t>& specializedIds, const SpirvTarget& target) {
+    const auto produce = [&] { return ValidateAndOptimizeSpirv(SpecializeFragmentOutputs(SpecializeSpirv(words), constants, specializedIds), target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true); };
     static const bool cached = std::getenv("APS5_NO_SPECIALIZED_DISK_CACHE") == nullptr;
-    if (!cached || !ShaderDiskCache::Enabled()) return ValidateAndOptimizeSpirv(words, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, specialize);
+    if (!cached || !ShaderDiskCache::Enabled()) return produce();
     std::vector<std::byte> key;
     const auto append = [&](const void* data, std::size_t bytes) {
         const auto* first = static_cast<const std::byte*>(data);
         key.insert(key.end(), first, first + bytes);
     };
-    const std::array<std::uint32_t, 5> header{0x53504f31u, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets ? 1u : 0u, specialize ? 1u : 0u};
+    const std::array<std::uint32_t, 6> header{0x53504f32u, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets ? 1u : 0u, static_cast<std::uint32_t>(constants.size()), static_cast<std::uint32_t>(specializedIds.size())};
     append(header.data(), sizeof(header));
+    for (const auto& constant : constants) {
+        const std::array<std::uint32_t, 2> pair{constant.id, constant.value};
+        append(pair.data(), sizeof(pair));
+    }
+    for (const auto id : specializedIds) append(&id, sizeof(id));
     append(words.data(), words.size() * sizeof(std::uint32_t));
     const auto directory = ShaderDiskCache::EntryDirectory() / "specialized";
     const auto path = directory / ShaderDiskCache::EntryName(key);
@@ -528,7 +536,7 @@ std::vector<std::uint32_t> OptimizeCached(std::vector<std::uint32_t> words, cons
             }
         }
     }
-    auto optimized = ValidateAndOptimizeSpirv(words, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, specialize);
+    auto optimized = produce();
     std::error_code error;
     std::filesystem::create_directories(directory, error);
     const auto temporary = path.string() + ".tmp" + std::to_string(nextVariantId());
@@ -580,9 +588,10 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
-    materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = OptimizeCached(std::move(materialized), target, true);
+    materialized = SpecializeCached(materialized, constants, specializedIds, target);
+#else
+    materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
 #endif
     std::map<std::uint32_t, std::uint32_t> descriptorVariables;
     std::set<std::uint32_t> usedDescriptors;

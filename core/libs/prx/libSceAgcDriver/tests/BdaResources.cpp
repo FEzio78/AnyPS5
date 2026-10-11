@@ -346,7 +346,7 @@ void heapMirrorTests(const Context& context, const BdaTestAccess& access) {
         access.bytes(view.buffer)[view.offset + adjustment] = std::byte{0x77};
         guest[16 + 8] = 0x55;
     });
-    Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a writable heap mirror's write-back lost the GPU's store or rolled back the CPU's");
+    Require(guest[16] == 0x77 && guest[16 + 8] == 0x55, "a writable heap mirror's write-back lost the GPU's store or rolled back the CPU's (GPU byte=" + std::to_string(guest[16]) + ", CPU byte=" + std::to_string(guest[16 + 8]) + ")");
     Require(build(0, {}) == device && access.addressBytes(device)[16] == std::byte{0x77} && access.addressBytes(device)[16 + 8] == std::byte{0x55}, "the writable heap mirror missed the stores");
     Require(build(address + 40, [&](GuestBufferMemory& leased) {
         std::uint32_t adjustment = 0;

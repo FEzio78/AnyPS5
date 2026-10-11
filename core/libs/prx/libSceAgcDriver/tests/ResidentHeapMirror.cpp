@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include <iostream>
 #include <memory>
 #ifdef _WIN32
@@ -120,11 +121,11 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
     }
     const std::array<std::uint32_t, 2> values{0x12345678u, 0xabcdef09u};
     VkDeviceAddress serving = 0;
-    const auto dispatch = [&](bool written) {
+    const auto dispatch = [&](bool written, const std::function<void()>& beforeWriteBack = {}) {
         Memory::BumpCollectEpoch();
         auto memory = std::make_shared<GuestBufferMemory>(context);
         memory->AcquireRegistered();
-        if (written) memory->AddWritable(address, sizeof(values));
+        if (written) memory->AddWritable(address, 16);
         memory->Upload(true);
         const auto ranges = memory->AddressRanges();
         const auto found = std::find_if(ranges.begin(), ranges.end(), [&](const auto& range) { return range.begin == address; });
@@ -147,10 +148,22 @@ void RunResidentHeapMirrorTests(const AgcDriver::Graphics::Context& device, AgcD
         recorder.Keep(pipeline);
         recorder.Keep(memory);
         recorder.NotePendingWrites(memory->Writes());
-        recorder.OnComplete([memory] { memory->WriteBack(); });
         CountLeaseOutcome(false, recorder.Submissions() + 1);
+        if (beforeWriteBack) {
+            recorder.Sync();
+            beforeWriteBack();
+            memory->WriteBack();
+        } else recorder.OnComplete([memory] { memory->WriteBack(); });
         return output;
     };
+    dispatch(true, [&] { static_cast<volatile std::uint8_t*>(raw)[8] = 0x55; });
+    Require(std::memcmp(raw, values.data(), sizeof(values)) == 0, "explicit heap write-back did not publish the GPU stores");
+    Require(static_cast<std::uint8_t*>(raw)[8] == 0x55, "explicit heap write-back rolled back a CPU store after the GPU baseline");
+    auto synchronousRead = dispatch(false);
+    recorder.Sync();
+    Require(std::memcmp(synchronousRead->Bytes().data(), values.data(), sizeof(values)) == 0 && static_cast<std::uint8_t*>(raw)[8] == 0x55, "heap reuse after explicit write-back lost the merged stores");
+    const std::array<std::uint32_t, 2> initial{0x11111111u, 0x11111111u};
+    Memory::Write(address, std::as_bytes(std::span(initial)));
     dispatch(true);
     const auto beforeConsumer = MirrorCounters();
     auto read = dispatch(false);

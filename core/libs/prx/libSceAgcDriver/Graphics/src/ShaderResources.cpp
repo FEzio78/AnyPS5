@@ -145,6 +145,17 @@ struct TextureCache {
     std::uint64_t reportedBudget = 0;
     std::chrono::steady_clock::time_point reportedAt{};
     std::uint64_t erasures = 0;
+    // Textures of fast-cleared surfaces read through their DCC keys while a storage image holds
+    // pending results: their texels follow from the descriptor and the keys alone, so they are kept
+    // apart from the surface's view, which shares their key and would otherwise replace them.
+    struct Clear {
+        TextureKey key;
+        DccKeys keys;
+        std::size_t bytes;
+        std::shared_ptr<Texture> texture;
+        std::uint64_t accounted;
+    };
+    std::list<Clear> clears;
 };
 
 TextureCache& Textures() {
@@ -626,6 +637,33 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     std::unique_lock lock(cache.mutex, std::defer_lock);
     ImageProfile::Measure(ImageProfile::CacheLock, "sampled cache", [&] { lock.lock(); });
     dropUncachedViews(cache);
+    static const bool clearCacheDisabled = std::getenv("APS5_NO_CLEAR_TEXTURE_CACHE") != nullptr;
+    if (clearThroughKeys && !clearCacheDisabled) {
+        const auto found = std::find_if(cache.clears.begin(), cache.clears.end(), [&](const TextureCache::Clear& clear) { return clear.key == key && clear.keys == *keys && clear.bytes == bytes; });
+        if (found != cache.clears.end()) {
+            cache.clears.splice(cache.clears.begin(), cache.clears, found);
+            logLookup({found->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+            imageTiming.Reason("cached clear");
+            if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
+            return found->texture;
+        }
+        std::vector<std::byte> texels(bytes);
+        ReadTextureSurface(resource, *keys, texels);
+        auto texture = ImageProfile::Measure(ImageProfile::TextureCreate, "clear upload", [&] { return std::make_shared<Texture>(context, *context.detiler, resource, components, texels, depthCompare); });
+        constexpr std::size_t clearsKept = 16;
+        const auto accounted = texture->AllocationBytes();
+        cache.bytes += accounted;
+        cache.clears.push_front({key, *keys, bytes, texture, accounted});
+        while (cache.clears.size() > clearsKept) {
+            cache.bytes -= cache.clears.back().accounted;
+            cache.clears.pop_back();
+        }
+        counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+        logLookup({texture.get(), resource, guestBytes, *keys, generation, nullptr});
+        imageTiming.Reason("new clear");
+        if (profile) LookupOutcomes::Add(LookupOutcomes::SampledMadeSnapshot, start);
+        return texture;
+    }
     if (auto it = findTexture(cache, key); it != cache.entries.end()) {
         if (it->source != nullptr) {
             // The view follows the storage image, whatever the GPU wrote to it since; guest memory
@@ -972,6 +1010,14 @@ void ClearCachedTextures(VkDevice device) {
         for (auto it = sampled.entries.begin(); it != sampled.entries.end();) {
             if (it->key.device == device) eraseTexture(sampled, it++);
             else ++it;
+        }
+        for (auto it = sampled.clears.begin(); it != sampled.clears.end();) {
+            if (it->key.device != device) {
+                ++it;
+                continue;
+            }
+            sampled.bytes -= it->accounted;
+            it = sampled.clears.erase(it);
         }
     }
     auto& storage = StorageTextures();

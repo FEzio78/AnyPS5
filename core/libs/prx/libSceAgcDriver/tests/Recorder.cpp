@@ -3188,6 +3188,152 @@ void sharedPlaneEdgeTests(const Device& device, Recorder& recorder) {
     std::cout << "shared plane edge write-back and detile: ok\n";
 }
 
+void sharedUnitMergeTests(const Device& device, Recorder& recorder) {
+    const auto& base = device.GetContext();
+    struct Case {
+        std::uint32_t format, width, height;
+        std::uint64_t offset;
+    };
+    constexpr Case cases[]{{18, 1920, 1080, 0x2000}, {5, 3840, 2160, 0xa000}, {18, 1920, 1080, 0}, {56, 256, 128, 0}};
+    const auto decided = PrepareImportWatch(base);
+    struct Restore {
+        const Context& context;
+        ImportWatch decided;
+        ~Restore() { SetImportWatch(context, decided); }
+    } restore{base, decided};
+    for (const auto& test : cases) {
+        for (const int mode : {1, 2, 0}) {
+            SetImportWatch(base, mode == 1 ? ImportWatch::Unwatch : ImportWatch::Watch);
+            const bool imported = mode != 0;
+            if (imported && base.hostImportAlignment == 0) continue;
+            
+            auto context = base;
+            if (!imported) context.hostImportAlignment = 0;
+            context.singlePassStorage = mode == 1 && base.singlePassStorage;
+            TextureDetiler detiler(context);
+            context.detiler = &detiler;
+            GuestTextureResource resource{};
+            resource.width = test.width;
+            resource.height = test.height;
+            resource.mipCount = 1;
+            resource.tileMode = TextureTileMode::kStandard4KB;
+            resource.dimension = TextureDimension::k2D;
+            resource.format = test.format;
+            if (test.format == 56) { resource.dimension = TextureDimension::k2DArray; resource.depthOrLastArray = 1; }
+            resource.dstSelX = 4;
+            resource.dstSelY = 5;
+            resource.dstSelZ = 6;
+            resource.dstSelW = 7;
+            const auto geometry = DescribeSurface(resource);
+            const auto bytes = static_cast<std::size_t>((test.offset + geometry.guestBytes + 65536 + 65535) / 65536 * 65536);
+            std::byte* memory = nullptr;
+#ifdef _WIN32
+            if (mode == 2) {
+                memory = static_cast<std::byte*>(GuestArena::GuestArenaAllocate_nid_postfix(bytes, 65536));
+                Require(memory != nullptr, "shared plane edge test cannot reserve memory");
+                const auto section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_EXECUTE_READWRITE, 0, static_cast<DWORD>(bytes), nullptr);
+                Require(section != nullptr, "shared plane edge test cannot create a mapping");
+                GuestArena::GuestArenaMap_nid_postfix(memory, bytes, section, 0, PAGE_READWRITE);
+                CloseHandle(section);
+            } else
+#endif
+            {
+                memory = static_cast<std::byte*>(AllocateWatched(bytes, 65536));
+            }
+            Require(memory != nullptr, "shared plane edge test requires watched memory");
+            const auto address = reinterpret_cast<std::uint64_t>(memory);
+            std::memset(memory, 0, bytes);
+            GuestAllocations::Mutation().Add(memory, bytes, true, true, true);
+            struct Unregister {
+                const Context& context;
+                void* memory;
+                std::uint64_t address;
+                std::size_t bytes;
+                ~Unregister() {
+                    GuestAllocations::Mutation().Remove(memory);
+                    HostImportFor(context, address, bytes);
+                    ReleaseWatched(memory, bytes);
+                }
+            } unregister{base, memory, address, bytes};
+            resource.baseAddress = address + test.offset;
+            AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+            auto image = std::make_shared<StorageTexture>(context, detiler, resource, 0);
+            recorder.Keep(image);
+            Require(AgcDriver::GuestMemory::Watched(resource.baseAddress, geometry.guestBytes) == (mode != 1), "shared unit merge test uses the wrong tracking path");
+            Require((HostImportFor(context, resource.baseAddress, geometry.guestBytes) != nullptr) == imported, "shared plane edge test uses the wrong upload path");
+            const auto elementBytes = BytesPerElement(test.format);
+            std::vector<std::byte> expected(static_cast<std::size_t>(test.width) * test.height * elementBytes);
+            for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<std::byte>(i * 131u % 251u + 1u);
+            auto staging = std::make_shared<Buffer>(context, expected.size(), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
+            std::memcpy(staging->Bytes().data(), expected.data(), expected.size());
+            recorder.Keep(staging);
+            const auto commands = recorder.Commands();
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+            VkBufferImageCopy copy{};
+            copy.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+            copy.imageExtent = {test.width, test.height, 1};
+            context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(commands, staging->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+            RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+            image->MarkDirty();
+            image->WriteBack();
+            recorder.Sync();
+            std::vector<std::byte> gpuBytes(static_cast<std::size_t>(geometry.guestBytes));
+            AgcDriver::GuestMemory::Read(resource.baseAddress, gpuBytes);
+            for (const int change : {0, 1, 2, 3}) {
+                recorder.Sync();
+                std::memset(memory, 0, bytes);
+                AgcDriver::GuestMemory::CollectWritesUncached(address, bytes);
+                image->Refresh();
+                recorder.Sync();
+                auto wanted = gpuBytes;
+                if (change == 2) std::fill_n(expected.begin(), elementBytes, std::byte{0});
+                std::memcpy(staging->Bytes().data(), expected.data(), expected.size());
+                const auto work = recorder.Commands();
+                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+                context.Function<PFN_vkCmdCopyBufferToImage>("vkCmdCopyBufferToImage")(work, staging->Handle(), image->Image(), VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+                RecordMemoryBarrier(context, work, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT);
+                image->MarkDirty();
+                recorder.Sync();
+                const auto neighbor = test.offset != 0 && test.format == 5 ? test.offset - 0x300 - 64 : test.offset + geometry.guestBytes;
+                Require(neighbor + 64 <= bytes, "shared unit merge neighbor exceeds allocation");
+                std::memset(memory + neighbor, 0x7b, 64);
+                if (change != 0) {
+                    const auto at = change == 2 ? 1u : static_cast<std::size_t>(geometry.guestBytes - 4093);
+                    if (change == 3) {
+                        std::memset(memory + test.offset, 0x37, static_cast<std::size_t>(geometry.guestBytes));
+                        std::fill(wanted.begin(), wanted.end(), std::byte{0x37});
+                    } else {
+                        memory[test.offset + at] = std::byte{0x37};
+                        wanted[at] = std::byte{0x37};
+                        if (change == 2) std::fill_n(wanted.begin(), elementBytes, std::byte{0});
+                        wanted[at] = std::byte{0x37};
+                    }
+                }
+                AgcDriver::GuestMemory::BumpCollectEpoch();
+                image->Refresh();
+                recorder.Sync();
+                const auto actual = ReadColorPlane(context, image->Image(), VK_IMAGE_LAYOUT_GENERAL, resource, 0);
+                const VkComponentMapping identity{VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY, VK_COMPONENT_SWIZZLE_IDENTITY};
+                Texture reference(context, detiler, resource, identity, wanted);
+                const auto referenceBytes = reference.ReadColorPlane(resource);
+                const auto mismatch = std::mismatch(referenceBytes.begin(), referenceBytes.end(), actual.begin(), actual.end());
+                if (mismatch.first != referenceBytes.end()) {
+                    const auto pixel = static_cast<std::size_t>(mismatch.first - referenceBytes.begin()) / elementBytes;
+                    throw std::runtime_error("shared unit merge " + std::to_string(test.width) + "x" + std::to_string(test.height) + " mode=" + std::to_string(mode) + " change=" + std::to_string(change) + " offset=" + std::to_string(test.offset) + " lost texel at " + std::to_string(pixel % test.width) + "," + std::to_string(pixel / test.width));
+                }
+                image->WriteBack();
+                recorder.Sync();
+                std::vector<std::byte> stored(wanted.size());
+                AgcDriver::GuestMemory::Read(resource.baseAddress, stored);
+                Require(stored == wanted, "shared unit merge stored bytes differ from the three-way result");
+                for (std::size_t i = 0; i < 64; ++i) Require(memory[neighbor + i] == std::byte{0x7b}, "shared unit merge overwrote the neighbor");
+                std::cout << "shared unit merge mode=" << mode << " change=" << change << " offset=" << test.offset << ": ok\n";
+            }
+        }
+    }
+    std::cout << "shared unit byte merge and refresh: ok\n";
+}
+
 void settledBaselineTests(const Device& device, Recorder& recorder) {
     const auto& base = device.GetContext();
 #ifdef _WIN32
@@ -5016,6 +5162,10 @@ int main(int argc, char** argv) {
         std::cout << "host imports " << (PrepareImportWatch(device.GetContext()) == ImportWatch::Unwatch ? "are compared" : "stay watched") << '\n';
         Recorder recorder(device.GetContext());
         recorder.Activate();
+        if (argc == 2 && std::string_view(argv[1]) == "--shared-unit-merge-only") {
+            sharedUnitMergeTests(device, recorder);
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--shared-plane-edges-only") {
             sharedPlaneEdgeTests(device, recorder);
             return 0;

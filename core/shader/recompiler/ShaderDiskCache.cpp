@@ -439,81 +439,81 @@ void decodeLayout(Reader& reader, IrBindingLayout& layout) {
 }
 
 void encodeImage(Writer& out, const ImageResource& image) {
-        out.Value(image.source);
-        out.Value(image.firstUsePc);
-        out.Value(image.resourceClass);
-        out.Value(image.numericClass);
-        out.Value(image.dimension);
-        out.Value(image.mipMode);
-        out.Value(image.mipCount);
-        out.Value(image.conversionFormat);
-        out.Value(image.shaderSwizzle);
-        out.Value(image.read);
-        out.Value(image.written);
-        out.Value(image.atomic);
-        out.Value(image.atomic64);
-        out.Value(image.depthCompare);
-        out.Value(image.cube);
-        out.Value(image.r128);
-        out.Value(image.srgbDecode);
-        out.Value(image.srgbDecodeCompatible);
-        out.Value(image.srgbDecodeFormats);
-        out.Value(image.depthBits);
-        out.Value(image.depthUnorm16);
-        out.Value(image.packed);
-        out.Value(image.fmaskCompatible);
-        out.Value(image.depthBitsCompatible);
-        out.Value(image.constantSwizzle);
-        out.Value(image.constantSwizzleCompatible);
-        out.Value(image.flatVolumeCompatible);
-        out.Value(image.flatLineCompatible);
-        out.Value(image.byElements);
-        out.Value(image.byComponents);
-        out.Value(image.packedFormat);
-        out.Value(image.emulatedCompare);
-        out.Value(image.indirectRoot);
-        out.Value(image.indirectMappingOffset);
-        out.Value(image.indirectSearchIterations);
-        out.Values(std::span<const std::uint32_t>(image.indirectResources));
+    out.Value(image.source);
+    out.Value(image.firstUsePc);
+    out.Value(image.resourceClass);
+    out.Value(image.numericClass);
+    out.Value(image.dimension);
+    out.Value(image.mipMode);
+    out.Value(image.mipCount);
+    out.Value(image.conversionFormat);
+    out.Value(image.shaderSwizzle);
+    out.Value(image.read);
+    out.Value(image.written);
+    out.Value(image.atomic);
+    out.Value(image.atomic64);
+    out.Value(image.depthCompare);
+    out.Value(image.cube);
+    out.Value(image.r128);
+    out.Value(image.srgbDecode);
+    out.Value(image.srgbDecodeCompatible);
+    out.Value(image.srgbDecodeFormats);
+    out.Value(image.depthBits);
+    out.Value(image.depthUnorm16);
+    out.Value(image.packed);
+    out.Value(image.fmaskCompatible);
+    out.Value(image.depthBitsCompatible);
+    out.Value(image.constantSwizzle);
+    out.Value(image.constantSwizzleCompatible);
+    out.Value(image.flatVolumeCompatible);
+    out.Value(image.flatLineCompatible);
+    out.Value(image.byElements);
+    out.Value(image.byComponents);
+    out.Value(image.packedFormat);
+    out.Value(image.emulatedCompare);
+    out.Value(image.indirectRoot);
+    out.Value(image.indirectMappingOffset);
+    out.Value(image.indirectSearchIterations);
+    out.Values(std::span<const std::uint32_t>(image.indirectResources));
     }
 
 void decodeImage(Reader& in, ImageResource& image) {
-        in.Value(image.source);
-        in.Value(image.firstUsePc);
-        in.Value(image.resourceClass);
-        in.Value(image.numericClass);
-        in.Value(image.dimension);
-        in.Value(image.mipMode);
-        in.Value(image.mipCount);
-        in.Value(image.conversionFormat);
-        in.Value(image.shaderSwizzle);
-        in.Value(image.read);
-        in.Value(image.written);
-        in.Value(image.atomic);
-        in.Value(image.atomic64);
-        in.Value(image.depthCompare);
-        in.Value(image.cube);
-        in.Value(image.r128);
-        in.Value(image.srgbDecode);
-        in.Value(image.srgbDecodeCompatible);
-        in.Value(image.srgbDecodeFormats);
-        in.Value(image.depthBits);
-        in.Value(image.depthUnorm16);
-        in.Value(image.packed);
-        in.Value(image.fmaskCompatible);
-        in.Value(image.depthBitsCompatible);
-        in.Value(image.constantSwizzle);
-        in.Value(image.constantSwizzleCompatible);
-        in.Value(image.flatVolumeCompatible);
-        in.Value(image.flatLineCompatible);
-        in.Value(image.byElements);
-        in.Value(image.byComponents);
-        in.Value(image.packedFormat);
-        in.Value(image.emulatedCompare);
-        in.Value(image.indirectRoot);
-        in.Value(image.indirectMappingOffset);
-        in.Value(image.indirectSearchIterations);
-        in.Values(image.indirectResources);
+    in.Value(image.source);
+    in.Value(image.firstUsePc);
+    in.Value(image.resourceClass);
+    in.Value(image.numericClass);
+    in.Value(image.dimension);
+    in.Value(image.mipMode);
+    in.Value(image.mipCount);
+    in.Value(image.conversionFormat);
+    in.Value(image.shaderSwizzle);
+    in.Value(image.read);
+    in.Value(image.written);
+    in.Value(image.atomic);
+    in.Value(image.atomic64);
+    in.Value(image.depthCompare);
+    in.Value(image.cube);
+    in.Value(image.r128);
+    in.Value(image.srgbDecode);
+    in.Value(image.srgbDecodeCompatible);
+    in.Value(image.srgbDecodeFormats);
+    in.Value(image.depthBits);
+    in.Value(image.depthUnorm16);
+    in.Value(image.packed);
+    in.Value(image.fmaskCompatible);
+    in.Value(image.depthBitsCompatible);
+    in.Value(image.constantSwizzle);
+    in.Value(image.constantSwizzleCompatible);
+    in.Value(image.flatVolumeCompatible);
+    in.Value(image.flatLineCompatible);
+    in.Value(image.byElements);
+    in.Value(image.byComponents);
+    in.Value(image.packedFormat);
+    in.Value(image.emulatedCompare);
+    in.Value(image.indirectRoot);
+    in.Value(image.indirectMappingOffset);
+    in.Value(image.indirectSearchIterations);
+    in.Values(image.indirectResources);
     }
 
 void encodeInfo(Writer& writer, const CompiledShaderInfo& compiled) {
@@ -795,7 +795,7 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (immediate) record.value->SetImmediateU64(bits);
         const auto bank = in.Get<RegisterBank>();
         const auto index = in.Get<std::uint32_t>();
-        if (bank > RegisterBank::UserData) throw std::runtime_error("invalid cached plan register");
+        if (static_cast<std::uint32_t>(bank) > static_cast<std::uint32_t>(RegisterBank::UserData)) throw std::runtime_error("invalid cached plan register");
         record.value->SetRegister({bank, index});
         if (opcode == IrOpcode::Phi) {
             struct Operand { std::uint32_t value = 0, block = 0; };
@@ -914,10 +914,27 @@ void decodePlan(Reader& reader, IrResourcePlan& plan) {
         if (indirect.hasMaterial) checkSource(indirect.materialSource);
         if (indirect.addressHeap) checkSource(indirect.countSource);
     }
-    if (plan.stage == IrShaderStage::Unknown || plan.stage > IrShaderStage::TessellationEvaluation || fill.kind > UniformFillKind::Image) throw std::runtime_error("invalid cached plan stage or fill");
+    if (plan.stage == IrShaderStage::Unknown || static_cast<std::uint32_t>(plan.stage) > static_cast<std::uint32_t>(IrShaderStage::TessellationEvaluation) || static_cast<std::uint32_t>(fill.kind) > static_cast<std::uint32_t>(UniformFillKind::Image)) throw std::runtime_error("invalid cached plan stage or fill");
     for (const auto& block : plan.controlFlow) {
         for (const auto index : block.sources) checkSource(index);
         for (const auto index : block.successors) if (index >= plan.controlFlow.size()) throw std::runtime_error("invalid cached control flow");
+    }
+    for (const auto& memory : plan.memoryInfo) {
+        if (static_cast<std::uint32_t>(memory.kind) > static_cast<std::uint32_t>(ResourceKind::Sampler)) throw std::runtime_error("invalid cached memory kind");
+    }
+    std::unordered_map<const IrValue*, std::uint8_t> identityStates;
+    for (const auto& value : plan.valueStorage) {
+        auto* current = value.get();
+        std::vector<const IrValue*> chain;
+        while (current != nullptr && current->IsIdentity()) {
+            auto& state = identityStates[current];
+            if (state == 2) break;
+            if (state == 1 || current->ArgumentCount() != 1 || current->Argument(0) == nullptr) throw std::runtime_error("invalid cached identity chain");
+            state = 1;
+            chain.push_back(current);
+            current = current->Argument(0);
+        }
+        for (const auto* identity : chain) identityStates[identity] = 2;
     }
     for (const auto& buffer : plan.info.buffers) checkSource(buffer.source);
     for (const auto& image : plan.info.images) checkSource(image.source);

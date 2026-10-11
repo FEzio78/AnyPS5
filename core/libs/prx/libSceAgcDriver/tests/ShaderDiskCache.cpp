@@ -621,6 +621,19 @@ void verifyPlanRoundTrip() {
     std::vector<std::byte> invalid;
     ShaderDiskCache::EncodePlan(incomplete, invalid);
     require(!ShaderDiskCache::DecodePlan(invalid, decoded), "incomplete plan accepted");
+    auto invalidStage = ResourceMaterializer{}.ExtractPlan(program);
+    invalidStage.stage = static_cast<IrShaderStage>(UINT32_MAX);
+    invalid.clear();
+    ShaderDiskCache::EncodePlan(invalidStage, invalid);
+    require(!ShaderDiskCache::DecodePlan(invalid, decoded), "invalid plan stage accepted");
+    IrResourcePlan cyclic;
+    cyclic.stage = IrShaderStage::Compute;
+    cyclic.srtPlanComplete = cyclic.resourceTrackingComplete = true;
+    cyclic.valueStorage.push_back(std::make_unique<IrValue>(IrOpcode::Identity, IrType::U32, 1));
+    cyclic.valueStorage.front()->AddArgument(cyclic.valueStorage.front().get());
+    invalid.clear();
+    ShaderDiskCache::EncodePlan(cyclic, invalid);
+    require(!ShaderDiskCache::DecodePlan(invalid, decoded), "cyclic identity chain accepted");
     auto invalidReference = payload;
     const std::uint32_t missing = UINT32_MAX;
     std::memcpy(invalidReference.data() + invalidReference.size() - sizeof(missing), &missing, sizeof(missing));
@@ -676,6 +689,35 @@ void verifyAcrossProcesses(const char* self) {
     const std::string command = "\"" + std::string(self) + "\" --load";
     require(std::system(command.c_str()) == 0, "the loading process failed");
     verifyWarmSourceCache(compiled);
+}
+
+void verifyPairedWarmPlans() {
+    ComputeRequest first(true);
+    auto second = first.request;
+    second.layout.pushConstantSizeBytes = 0;
+    ShaderPreparationContext cold;
+    const auto firstHandle = PrepareShader(first.request, &cold);
+    const auto secondHandle = PrepareShader(second, &cold);
+    const SrtRuntime runtime{first.userData, first.request.shader.codeAddress};
+    const auto capture = CaptureResources(first.request, runtime, *firstHandle);
+    const auto expectedFirst = MaterializeShader(first.request, *capture, *firstHandle);
+    const auto expectedSecond = MaterializeShader(second, *capture, *secondHandle);
+    ShaderDiskCache::Flush();
+    ClearSourceCacheForTesting();
+    first.request.shader.codeAddress += 0x10000u;
+    second.shader.codeAddress = first.request.shader.codeAddress;
+    const auto translations = ResourceTranslationCount();
+    const auto before = ShaderDiskCache::Totals();
+    ShaderPreparationContext warm;
+    const auto warmFirst = PrepareShader(first.request, &warm);
+    const auto warmSecond = PrepareShader(second, &warm);
+    const auto warmCapture = CaptureResources(first.request, SrtRuntime{first.userData, first.request.shader.codeAddress}, *warmFirst);
+    require(warmCapture->plan->shaderHash == first.request.shader.codeAddress, "loaded plan kept a previous process diagnostic address");
+    requireSameResult(*expectedFirst, *MaterializeShader(first.request, *warmCapture, *warmFirst), "paired warm push layout");
+    requireSameResult(*expectedSecond, *MaterializeShader(second, *warmCapture, *warmSecond), "paired warm buffer layout");
+    require(ResourceTranslationCount() == translations, "paired warm preparation ran translation");
+    const auto after = ShaderDiskCache::Totals();
+    require(after.planHits == before.planHits + 1 && after.hits == before.hits + 2, "paired layouts did not share one disk resource plan");
 }
 
 int runWithoutPlanCache() {
@@ -1202,6 +1244,7 @@ int main(int argc, char** argv) {
         verifyAcrossProcesses(argv[0]);
         verifyPlanCacheBypass(argv[0]);
         verifyPlanRecovery();
+        verifyPairedWarmPlans();
         verifyEmissionFailureMemo();
         verifyFailureMemoSwitch(argv[0]);
         verifyInvocationIsolation();

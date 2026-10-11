@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include <chrono>
 #include <cstdlib>
 
@@ -27,7 +28,10 @@ void ShaderResources::prepareAddressBindings(std::span<const CompiledShader> sha
         static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
         guestMemory.AcquireRegistered();
         const auto snapshotsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        for (const auto& snapshot : snapshots) guestMemory.AddSnapshot(snapshot);
+        for (const auto& snapshot : snapshots) {
+            GpuMutexProfile::Scope timing(GpuMutexProfile::Snapshots, snapshot.address, snapshot.bytes.size());
+            guestMemory.AddSnapshot(snapshot);
+        }
         if (profile) GuestBufferMemory::CountAddressBuild(std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - snapshotsStart).count());
     }
 }

@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BdaResources.hpp"
@@ -942,11 +943,15 @@ private:
 void prepareRange(std::uint64_t address, std::uint64_t bytes) {
     // The compare reads the pages directly; a mirror is only reused while its Range exists, but a
     // lease of a build in flight can keep a replaced Range alive past a protection change.
-    Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    {
+        GpuMutexProfile::Scope timing(GpuMutexProfile::Verify, address, bytes);
+        Require(GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes)), "image mirror range became inaccessible");
+    }
     // Named for the [hooksync] attribution: the flush goes through the hook, which waits when
     // recorded work notes a write inside the range (a descriptor written inside a writable exe
     // range; the lease itself maps the range read-only). The access is the whole range.
     const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::MirrorRefresh);
+    GpuMutexProfile::Scope timing(GpuMutexProfile::Flush, address, bytes);
     GuestMemory::FlushGpuWrites(address, static_cast<std::size_t>(bytes));
     auto& state = Mirrors();
     if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->PendingWriteOverlaps(address, static_cast<std::size_t>(bytes))) {
@@ -976,6 +981,9 @@ void appendBlocks(std::vector<RefreshBlock>& blocks, ImageMirror& mirror, std::u
 // Compares the gathered blocks (of one or many mirrors) and counts them.
 void compareBlocks(std::span<const RefreshBlock> blocks) {
     if (blocks.empty()) return;
+    std::uint64_t bytes = 0;
+    if (GpuMutexProfile::active != nullptr) for (const auto& block : blocks) bytes += block.length;
+    GpuMutexProfile::Scope timing(GpuMutexProfile::Compare, blocks.front().address, bytes);
     const auto copied = RefreshPool::Get().Run(blocks);
     auto& state = Mirrors();
     state.blocksCompared += blocks.size();
@@ -1776,6 +1784,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
 }
 
 void GuestBufferMemory::AcquireRegistered() {
+    GpuMutexProfile::Scope mutexTiming(GpuMutexProfile::Acquire);
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;

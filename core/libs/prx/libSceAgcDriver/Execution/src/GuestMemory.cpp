@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
@@ -1161,6 +1162,7 @@ std::uint64_t collectWrites(std::uint64_t address, std::size_t bytes, bool memoi
 }
 
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes) {
+    GpuMutexProfile::Scope timing(GpuMutexProfile::Collect, address, bytes);
     return collectWrites(address, bytes, true);
 }
 
@@ -1464,6 +1466,7 @@ bool WrittenSince(std::uint64_t address, std::size_t bytes, std::uint64_t genera
 }
 
 bool ChangedBlocks(std::uint64_t address, std::size_t bytes, std::span<const std::uint64_t> generations, std::span<std::uint8_t> changed, std::span<std::uint8_t> cpu) {
+    GpuMutexProfile::Scope timing(GpuMutexProfile::Changed, address, bytes);
     std::fill(changed.begin(), changed.end(), BlockWritten);
     std::fill(cpu.begin(), cpu.end(), std::uint8_t{1});
     auto& tracker = Tracker();
@@ -1925,6 +1928,7 @@ void WriteChangedCommitted(std::uint64_t address, std::span<const std::byte> cur
 }
 
 void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
+    GpuMutexProfile::Scope timing(GpuMutexProfile::Writeback, address, current.size());
     JournalWrite(address, current.size());
     require(current.size() == original.size(), "write-back snapshot sizes differ");
     if (current.empty()) return;

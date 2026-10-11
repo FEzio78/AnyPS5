@@ -1680,6 +1680,8 @@ bool StorageTexture::refreshProved() {
     if (refreshProof.generation == 0) return false;
     if (generation != refreshProof.generation || uploadedKeys != refreshProof.keys || !GuestMemory::GpuMutex().HeldByThisThread()) return false;
     const auto bytes = static_cast<std::size_t>(guestBytes);
+    if (Recorder::SnapshotWriteOverlaps(descriptor.baseAddress, bytes) ||
+        (descriptor.dccAddress != 0 && Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, DccKeyCount(descriptor, guestBytes)))) return false;
     std::array<GuestMemory::UnchangedQuery, 2> queries{};
     std::size_t used = 0;
     if (GuestMemory::CollectWrites(descriptor.baseAddress, bytes) == 0) return false;

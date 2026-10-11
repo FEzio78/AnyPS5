@@ -157,7 +157,7 @@ std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t by
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
-void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool wait = true) {
+ShaderRecompiler::RecompileResult Compile(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData) {
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
     const ShaderRecompiler::ShaderComputeStageInfo compute{{Threads, 1, 1}, 0u, {false, false, false}, false, 1};
     ShaderRecompiler::RecompileRequest request{
@@ -167,9 +167,41 @@ void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> co
         {0, 0, 0, 128}
     };
     request.useCache = false;
-    const auto result = ShaderRecompiler::Recompile(request);
+    return ShaderRecompiler::Recompile(request);
+}
+
+void Dispatch(AgcDriver::VulkanDevice& device, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, bool wait = true) {
+    const auto result = Compile(device, code, userData);
     device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     if (wait) device.WaitIdle();
+}
+
+void RunResourcePresync(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
+    using namespace AgcDriver::GuestMemory;
+    using namespace AgcDriver::Graphics;
+    if (!device.CanWaitUnlocked()) throw std::runtime_error("resource presync test requires timeline semaphores");
+    const auto texture = TextureDescriptor(block, block + KeysOffset);
+    std::vector<std::uint32_t> data(16, 0u);
+    std::copy(texture.begin(), texture.end(), data.begin() + 4);
+    const auto result = Compile(device, WriteCode, data);
+    const auto keys = AddressOf(block + KeysOffset);
+    const std::array<std::uint32_t, 4> pattern{0xffffffffu, 0xffffffffu, 0xffffffffu, 0xffffffffu};
+    {
+        std::lock_guard gpu(GpuMutex());
+        Require(device.FillBuffer(keys, KeyBytes, pattern), "presync test could not record a metadata store");
+        Require(Recorder::Active()->PendingWriteOverlaps(keys, KeyBytes), "presync test metadata store was not pending");
+    }
+    Require(!GpuMutex().HeldByThisThread(), "resource presync test held the GPU mutex during preparation");
+    auto prepared = device.PrepareDispatch(result, {});
+    {
+        std::lock_guard gpu(GpuMutex());
+        const bool enabled = std::getenv("APS5_PRESYNC_RESOURCE_READS") != nullptr;
+        Require(Recorder::Active()->PendingWriteOverlaps(keys, KeyBytes) != enabled, "metadata preflight did not drain the recorded store according to the switch");
+        device.Dispatch(result, 1, 1, 1, {}, reinterpret_cast<std::uintptr_t>(WriteCode.data()), std::move(prepared));
+        device.WaitIdle();
+        Require(std::all_of(block + KeysOffset, block + KeysOffset + KeyBytes, [](auto value) { return value == 0xff; }), "prepared dispatch lost metadata results");
+    }
+    std::puts("resource metadata preflight integration: ok");
 }
 
 void RunRefreshMemo(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
@@ -196,8 +228,12 @@ void RunRefreshMemo(AgcDriver::VulkanDevice& device, std::uint8_t* block) {
     const bool enabled = std::getenv("APS5_NO_STORAGE_REFRESH_MEMO") == nullptr;
     const auto checkRefresh = [&](bool reused, const char* what) {
         const auto before = proofCalls();
+        const auto provedBefore = StorageTexture::RefreshesProved();
+        const bool pendingStore = Recorder::SnapshotWriteOverlaps(address, SurfaceBytes) || Recorder::SnapshotWriteOverlaps(address + KeysOffset, KeyBytes);
         image->Refresh();
-        Require((proofCalls() == before) == (reused && enabled), what);
+        const bool independentlyProved = StorageTexture::RefreshesProved() != provedBefore;
+        Require(!pendingStore || !independentlyProved, "a storage refresh proof ignored a recorded store");
+        Require((proofCalls() == before) == ((reused && enabled) || independentlyProved), what);
     };
     const auto journal = WriteJournalSerial();
     Dispatch(device, WriteRowCode, data, false);
@@ -521,6 +557,10 @@ int main(int argc, char** argv) {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
         block.emplace(false);
+        if (argc == 2 && std::string_view(argv[1]) == "--resource-presync-only") {
+            RunResourcePresync(*device, block->Data());
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--refresh-memo-only") {
             RunRefreshMemo(*device, block->Data());
 #ifdef _WIN32

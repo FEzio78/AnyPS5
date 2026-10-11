@@ -11,6 +11,16 @@
 
 namespace AgcDriver::GuestMemory {
 
+inline void CopyChangedRun(std::byte* destination, const std::byte* source, std::size_t bytes) {
+    switch (bytes) {
+        case 1: *destination = *source; break;
+        case 2: std::memcpy(destination, source, 2); break;
+        case 3: std::memcpy(destination, source, 2); destination[2] = source[2]; break;
+        case 4: std::memcpy(destination, source, 4); break;
+        default: std::memcpy(destination, source, bytes); break;
+    }
+}
+
 inline std::uint64_t ChangedByteMask(const std::byte* current, const std::byte* original, std::size_t bytes) {
     std::uint64_t mask = 0;
     std::size_t at = 0;

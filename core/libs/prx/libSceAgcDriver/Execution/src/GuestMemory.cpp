@@ -1946,7 +1946,7 @@ void WriteChanged(std::uint64_t address, std::span<const std::byte> current, std
         std::size_t firstChanged = size;
         std::size_t lastChanged = 0;
         ForEachChangedRun(current, original, [&](std::size_t first, std::size_t bytes) {
-            std::memcpy(destination + first, current.data() + first, bytes);
+            CopyChangedRun(destination + first, current.data() + first, bytes);
             firstChanged = std::min(firstChanged, first);
             lastChanged = std::max(lastChanged, first + bytes);
         });

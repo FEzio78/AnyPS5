@@ -2,7 +2,11 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <array>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <system_error>
 #include <cstdio>
 #include "CacheKey.hpp"
 #include "CompiledVariant.hpp"
@@ -468,6 +472,50 @@ struct SpecializedModule {
     bool pushData = false;
 };
 
+#if ANYPS5_ENABLE_SPIRV_TOOLS
+std::vector<std::uint32_t> OptimizeCached(std::vector<std::uint32_t> words, const SpirvTarget& target, bool specialize) {
+    static const bool cached = std::getenv("APS5_NO_SPECIALIZED_DISK_CACHE") == nullptr;
+    if (!cached || !ShaderDiskCache::Enabled()) return ValidateAndOptimizeSpirv(words, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, specialize);
+    std::vector<std::byte> key;
+    const auto append = [&](const void* data, std::size_t bytes) {
+        const auto* first = static_cast<const std::byte*>(data);
+        key.insert(key.end(), first, first + bytes);
+    };
+    const std::array<std::uint32_t, 5> header{0x53504f31u, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets ? 1u : 0u, specialize ? 1u : 0u};
+    append(header.data(), sizeof(header));
+    append(words.data(), words.size() * sizeof(std::uint32_t));
+    const auto directory = ShaderDiskCache::EntryDirectory() / "specialized";
+    const auto path = directory / ShaderDiskCache::EntryName(key);
+    {
+        std::ifstream file(path, std::ios::binary | std::ios::ate);
+        if (file) {
+            const auto bytes = static_cast<std::size_t>(file.tellg());
+            if (bytes >= 5u * sizeof(std::uint32_t) && bytes % sizeof(std::uint32_t) == 0) {
+                std::vector<std::uint32_t> loaded(bytes / sizeof(std::uint32_t));
+                file.seekg(0);
+                if (file.read(reinterpret_cast<char*>(loaded.data()), static_cast<std::streamsize>(bytes)) && loaded[0] == spv::MagicNumber) return loaded;
+            }
+        }
+    }
+    auto optimized = ValidateAndOptimizeSpirv(words, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, specialize);
+    std::error_code error;
+    std::filesystem::create_directories(directory, error);
+    const auto temporary = path.string() + ".tmp" + std::to_string(nextVariantId());
+    {
+        std::ofstream file(temporary, std::ios::binary | std::ios::trunc);
+        file.write(reinterpret_cast<const char*>(optimized.data()), static_cast<std::streamsize>(optimized.size() * sizeof(std::uint32_t)));
+        if (!file) {
+            file.close();
+            std::filesystem::remove(temporary, error);
+            return optimized;
+        }
+    }
+    std::filesystem::rename(temporary, path, error);
+    if (error) std::filesystem::remove(temporary, error);
+    return optimized;
+}
+#endif
+
 std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledShaderArtifact& artifact, std::span<const std::uint32_t> classes, std::span<const PipelineSpecializationConstant> constants, const SpirvTarget& target) {
     auto source = SpecializeVertexInputTypes(artifact, classes);
     std::map<std::uint32_t, std::uint32_t> supplied;
@@ -503,7 +551,7 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
     }
     materialized = SpecializeFragmentOutputs(SpecializeSpirv(materialized), constants, specializedIds);
 #if ANYPS5_ENABLE_SPIRV_TOOLS
-    materialized = ValidateAndOptimizeSpirv(materialized, target.vulkanVersion, target.spirvVersion, target.nonConstantImageOffsets, true, true);
+    materialized = OptimizeCached(std::move(materialized), target, true);
 #endif
     std::map<std::uint32_t, std::uint32_t> descriptorVariables;
     std::set<std::uint32_t> usedDescriptors;

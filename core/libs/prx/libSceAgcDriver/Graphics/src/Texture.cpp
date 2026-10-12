@@ -52,7 +52,41 @@ void CountAlias(StorageTexture::AliasKind kind, bool gpu) {
     }
 }
 
-// APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
+void TraceAliasPair(const GuestTextureResource& from, std::uint64_t sourceBytes, std::uint64_t producer, std::uint64_t sourceVersion, const GuestTextureResource& descriptor, std::uint64_t bytes, const char* reason) {
+    static const bool enabled = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
+    if (!enabled) return;
+    const auto signature = [](const GuestTextureResource& d) {
+        return std::array<std::uint64_t, 18>{d.baseAddress, d.format, d.width, d.height, d.depthOrLastArray, d.baseArray, d.mipCount, d.baseLevel, d.lastLevel, static_cast<std::uint64_t>(d.tileMode), static_cast<std::uint64_t>(d.dimension), d.pipeBankXor, d.dccAddress, d.allocatedMipCount, d.bcSwizzle, d.minLod, static_cast<std::uint64_t>(d.dstSelX | (d.dstSelY << 8) | (d.dstSelZ << 16) | (d.dstSelW << 24)), static_cast<std::uint64_t>(d.dccAlphaOnMsb | (d.dccPipeAligned << 1))};
+    };
+    const auto describe = [](const char* role, const GuestTextureResource& d, std::uint64_t size) {
+        std::fprintf(stderr, "[image-alias] %s address=0x%llx bytes=%llu format=%u extent=%ux%ux%u layers=%u..%u mips=%u..%u/%u allocated=%u tile=%u xor=%u dimension=%u dcc=0x%llx alpha=%u pipe=%u swizzle=%u,%u,%u,%u bc=%u minLod=%u\n", role, static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(size), d.format, d.width, d.height, d.dimension == TextureDimension::k3D ? d.depthOrLastArray + 1 : 1, d.baseArray, d.depthOrLastArray, d.baseLevel, d.lastLevel, d.mipCount, d.allocatedMipCount, static_cast<unsigned>(d.tileMode), d.pipeBankXor, static_cast<unsigned>(d.dimension), static_cast<unsigned long long>(d.dccAddress), d.dccAlphaOnMsb, d.dccPipeAligned, d.dstSelX, d.dstSelY, d.dstSelZ, d.dstSelW, d.bcSwizzle, d.minLod);
+    };
+    using Pair = std::tuple<std::array<std::uint64_t, 18>, std::array<std::uint64_t, 18>, std::uint64_t, std::uint64_t>;
+    struct Counts {
+        std::uint64_t attempts = 0, gpu = 0, guest = 0;
+        std::chrono::steady_clock::time_point first = std::chrono::steady_clock::now();
+    };
+    static std::mutex mutex;
+    std::lock_guard lock(mutex);
+    static std::map<Pair, Counts> pairs;
+    static std::uint64_t overflow = 0;
+    const Pair key{signature(from), signature(descriptor), producer, aliasProgram};
+    auto it = pairs.find(key);
+    if (it == pairs.end()) {
+        if (pairs.size() == 4096) { ++overflow; return; }
+        it = pairs.emplace(key, Counts{}).first;
+    }
+    auto& totals = it->second;
+    const auto count = std::strcmp(reason, "gpu") == 0 ? ++totals.gpu : std::strcmp(reason, "guest") == 0 ? ++totals.guest : ++totals.attempts;
+    if (!std::has_single_bit(count)) return;
+    const auto plan = StorageTexture::PlanAlias(from, descriptor);
+    const char* kind = plan.kind == StorageTexture::AliasKind::Layout ? "byte-layout" : plan.kind == StorageTexture::AliasKind::Subset ? "subset" : plan.kind == StorageTexture::AliasKind::Format ? "format" : "descriptor-key";
+    const auto elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - totals.first).count();
+    std::fprintf(stderr, "[image-alias] pair elapsed=%.3fs count=%llu attempts=%llu gpu=%llu guest=%llu kind=%s event=%s producer=0x%llx consumer=0x%llx sourceVersion=%llu pairs=%zu overflow=%llu\n", elapsed, static_cast<unsigned long long>(count), static_cast<unsigned long long>(totals.attempts), static_cast<unsigned long long>(totals.gpu), static_cast<unsigned long long>(totals.guest), kind, reason, static_cast<unsigned long long>(producer), static_cast<unsigned long long>(aliasProgram), static_cast<unsigned long long>(sourceVersion), pairs.size(), static_cast<unsigned long long>(overflow));
+    describe("source", from, sourceBytes);
+    describe("destination", descriptor, bytes);
+}
+
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
     std::uint64_t count = 0;
@@ -145,6 +179,8 @@ void reportStorageTraffic(StorageTraffic& traffic) {
     const auto partialUploadCount = take(partialUploads), partialWriteBackCount = take(partialWriteBacks);
     const auto uploadMiB = take(partialUploadBytes) / 1048576.0, writeBackMiB = take(partialWriteBackBytes) / 1048576.0;
     AgcDriver::ProfilePrint_nid_no_patch( "[storage] uploads by path (count/MiB, 10 s):%s; %llu write-backs GPU-direct, %llu stored nothing; block units: partial uploads %llu/%.1f, partial write-backs %llu/%.1f, %llu widened to every pending unit, units dropped %llu, superseded %llu, dropped unregistered %llu, kept over a key flip %llu%s, pretest skipped %llu, evicted stale %llu\n", line.c_str(), static_cast<unsigned long long>(traffic.directWriteBacks), take(emptyWriteBacks), partialUploadCount, uploadMiB, partialWriteBackCount, writeBackMiB, take(coalescedWriteBacks), take(unitsDropped), take(unitsSuperseded), take(unregisteredDropped), take(keyFlipKept), ShadowReport().c_str(), take(pretestSkipped), take(staleEvicted));
+    const auto aliases = StorageTexture::AliasCounters();
+    AgcDriver::ProfilePrint_nid_no_patch("[image-alias] cumulative gpu identical=%llu format=%llu subset=%llu guest identical=%llu format=%llu subset=%llu layout=%llu reused=%llu subsetWrites=%llu\n", static_cast<unsigned long long>(aliases.gpu[0]), static_cast<unsigned long long>(aliases.gpu[1]), static_cast<unsigned long long>(aliases.gpu[2]), static_cast<unsigned long long>(aliases.guest[0]), static_cast<unsigned long long>(aliases.guest[1]), static_cast<unsigned long long>(aliases.guest[2]), static_cast<unsigned long long>(aliases.guest[3]), static_cast<unsigned long long>(aliases.reused), static_cast<unsigned long long>(aliases.subsetWrites));
     traffic.writeBacks.clear();
     traffic.uploadReasons.clear();
     traffic.directWriteBacks = 0;
@@ -2034,6 +2070,7 @@ bool StorageTexture::compareUntracked(std::uint64_t address, std::size_t bytes, 
 }
 
 void StorageTexture::upload(const std::vector<bool>* layers) {
+    gpuAliasSource.reset();
     ImageProfile::Scope imageTiming(ImageProfile::StorageUpload, uploadReason);
     imageTiming.Describe({descriptor.baseAddress, guestBytes, descriptor.format, descriptor.width, descriptor.height});
     CaptureTrace::Log("upload image=%llx bytes=%llu generation=%llu reason=%s partial=%d", static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(guestBytes), static_cast<unsigned long long>(generation), uploadReason, layers != nullptr);
@@ -2911,8 +2948,6 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
-    lastWriterProgram = aliasProgram;
-    if (writeAlias()) return;
     if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -2930,6 +2965,8 @@ void StorageTexture::refreshGeneration() {
 }
 
 void StorageTexture::markLayersPending(std::uint32_t first, std::uint32_t count) {
+    lastWriterProgram = aliasProgram;
+    if (count != 0 && writeAlias()) return;
     if (importRefresh) {
         importRefresh = false;
         if (!originalValid && !GuestMemory::Watched(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) captureGuestBytes(nullptr);
@@ -3048,7 +3085,10 @@ bool StorageTexture::FlushPending(std::uint64_t address, std::size_t bytes, cons
                     ++it;
                     continue;
                 }
-                if (aliasConsumer != nullptr) CountAlias(PlanAlias(texture->descriptor, aliasConsumer->descriptor).kind, false);
+                if (aliasConsumer != nullptr) {
+                    CountAlias(PlanAlias(texture->descriptor, aliasConsumer->descriptor).kind, false);
+                    TraceAliasPair(texture->descriptor, texture->guestBytes, texture->lastWriterProgram, texture->version, aliasConsumer->descriptor, aliasConsumer->guestBytes, "guest");
+                }
                 texture->dirty = false;
                 if (const auto skips = texture->hookSkips.exchange(0, std::memory_order_relaxed); skips != 0 && texture->skippedResultsInside(address, bytes)) {
                     flushedAfterSkip.fetch_add(1, std::memory_order_relaxed);
@@ -3697,6 +3737,7 @@ bool StorageTexture::FillClear(std::span<const std::uint32_t, 4> pattern, std::u
     // A neighbour's results shadowed in the range's edge units reach the import before the stamp
     // below makes those units stale (nothing for a 64 KiB-multiple surface).
     PublishShadow(begin, bytes, PublishScope::PartialUnits, PublishReason::FillClear);
+    gpuAliasSource.reset();
     GuestMemory::MarkWritten(begin, bytes);
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::FillClear);
@@ -3814,6 +3855,7 @@ bool StorageTexture::CopyFrom(StorageTexture& source, const char*& refusal) {
             if (texture != this && !texture->released && texture->overlaps(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) texture->originalValid = false;
         }
     }
+    gpuAliasSource.reset();
     GuestMemory::MarkWritten(descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     const auto commands = recorder->Commands();
     const auto timing = recorder->BeginGpuTiming(Recorder::CommandClass::Copy);
@@ -4009,6 +4051,10 @@ bool StorageTexture::handoffAlias(bool discard) {
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
+        if (!pending.textures.MayOverlap(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
+            gpuAliasSource.reset();
+            return false;
+        }
         for (auto* candidate : pending.textures) {
             if (candidate == this || !candidate->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) continue;
             if (source != nullptr) { gpuAliasSource.reset(); return false; }
@@ -4022,19 +4068,33 @@ bool StorageTexture::handoffAlias(bool discard) {
     auto plan = PlanAlias(source->descriptor, descriptor);
     const auto refuse = [&](const char* reason) {
         static const bool trace = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
-        if (trace) std::fprintf(stderr, "[image-alias] refused reason=%s source=0x%llx destination=0x%llx sourceGeneration=%llu watched=%d\n", reason, static_cast<unsigned long long>(source->descriptor.baseAddress), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(source->generation), GuestMemory::Watched(source->descriptor.baseAddress, static_cast<std::size_t>(source->guestBytes)));
+        static std::map<std::string, std::uint64_t> reasons;
+        const auto count = trace ? ++reasons[reason] : 0;
+        if (trace && std::has_single_bit(count)) std::fprintf(stderr, "[image-alias] refused count=%llu reason=%s source=0x%llx destination=0x%llx sourceGeneration=%llu watched=%d\n", static_cast<unsigned long long>(count), reason, static_cast<unsigned long long>(source->descriptor.baseAddress), static_cast<unsigned long long>(descriptor.baseAddress), static_cast<unsigned long long>(source->generation), GuestMemory::Watched(source->descriptor.baseAddress, static_cast<std::size_t>(source->guestBytes)));
         gpuAliasSource.reset();
         return false;
     };
-    if (plan.regions.empty() || !source->Cached() || source->released || source->context.device != context.device || source->generation == 0) return refuse("layout or owner");
+    if (plan.regions.empty() || source->descriptor.dccAddress != descriptor.dccAddress || !source->Cached() || source->released || source->context.device != context.device || source->generation == 0) return refuse("layout or owner");
     const auto from = source->descriptor.baseAddress;
     const auto bytes = static_cast<std::size_t>(source->guestBytes);
-    if (Recorder::SnapshotWriteOverlaps(from, bytes) ||
-        (source->descriptor.dccAddress != 0 && Recorder::SnapshotWriteOverlaps(source->descriptor.dccAddress, DccKeyCount(source->descriptor, source->guestBytes))) ||
-        (descriptor.dccAddress != 0 && Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, DccKeyCount(descriptor, guestBytes)))) return refuse("snapshot writer");
+    if (Recorder::SnapshotWriteOverlaps(from, bytes)) return refuse("snapshot writer");
     const auto current = GuestMemory::CollectWrites(from, bytes);
+    const auto sourceKeys = source->ProvedKeys();
+    const auto destinationKeys = ProvedKeys();
+    if (gpuAliasSource.lock() == source && descriptor.dccAddress != 0 && (sourceKeys != DccKeys::Uncompressed || destinationKeys != DccKeys::Uncompressed)) {
+        const auto keyBytes = DccKeyCount(source->descriptor, source->guestBytes);
+        std::vector<std::byte> saved(keyBytes);
+        GuestMemory::ReadCommitted(descriptor.dccAddress, saved);
+        FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), this, "alias metadata changed", PublishScope::None, nullptr, this);
+        GuestMemory::Write(descriptor.dccAddress, saved);
+        source->keyProof = {};
+        keyProof = {};
+        return refuse("metadata changed after copy");
+    }
+    if ((source->descriptor.dccAddress != 0 && Recorder::SnapshotWriteOverlaps(source->descriptor.dccAddress, DccKeyCount(source->descriptor, source->guestBytes))) ||
+        (descriptor.dccAddress != 0 && Recorder::SnapshotWriteOverlaps(descriptor.dccAddress, DccKeyCount(descriptor, guestBytes)))) return refuse("snapshot writer");
     if (current == 0 || !GuestMemory::UnchangedSince(from, bytes, source->generation) ||
-        source->ProvedKeys() != DccKeys::Uncompressed || ProvedKeys() != DccKeys::Uncompressed || source->uploadedKeys != DccKeys::Uncompressed) return refuse("generation or metadata");
+        sourceKeys != DccKeys::Uncompressed || destinationKeys != DccKeys::Uncompressed || source->uploadedKeys != DccKeys::Uncompressed) return refuse("generation or metadata");
     {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
@@ -4046,6 +4106,7 @@ bool StorageTexture::handoffAlias(bool discard) {
         NoteProved();
         return true;
     }
+    TraceAliasPair(source->descriptor, source->guestBytes, source->lastWriterProgram, source->version, descriptor, guestBytes, "gpu");
     copyAlias(*source, plan.regions, discard);
     originalValid = false;
     original.clear();
@@ -4131,7 +4192,15 @@ bool StorageTexture::writeAlias() {
         gpuAliasSource.reset();
         return false;
     }
+    if (source->ProvedKeys() != DccKeys::Uncompressed) {
+        FlushPending(source->descriptor.baseAddress, static_cast<std::size_t>(source->guestBytes), this, "alias metadata changed", PublishScope::None);
+        gpuAliasSource.reset();
+        return false;
+    }
     if (gpuAliasPlan.kind != AliasKind::Subset) {
+        Require(trackedLayers == source->trackedLayers, "identical alias has different ownership units");
+        layerPending = source->layerPending;
+        reconcilePending();
         for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) source->layerPending[unit] = false;
         source->originalValid = false;
         source->reconcilePending();
@@ -4159,34 +4228,11 @@ ImageAliasScope::~ImageAliasScope() {
 void StorageTexture::TraceAliases(const GuestTextureResource& descriptor, std::uint64_t bytes, const char* reason) {
     static const bool enabled = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
     if (!enabled) return;
-    const auto signature = [](const GuestTextureResource& d) {
-        return std::array<std::uint64_t, 18>{d.baseAddress, d.format, d.width, d.height, d.depthOrLastArray, d.baseArray, d.mipCount, d.baseLevel, d.lastLevel, static_cast<std::uint64_t>(d.tileMode), static_cast<std::uint64_t>(d.dimension), d.pipeBankXor, d.dccAddress, d.allocatedMipCount, d.bcSwizzle, d.minLod, static_cast<std::uint64_t>(d.dstSelX | (d.dstSelY << 8) | (d.dstSelZ << 16) | (d.dstSelW << 24)), static_cast<std::uint64_t>(d.dccAlphaOnMsb | (d.dccPipeAligned << 1))};
-    };
-    const auto describe = [](const char* role, const GuestTextureResource& d, std::uint64_t size) {
-        std::fprintf(stderr, "[image-alias] %s address=0x%llx bytes=%llu format=%u extent=%ux%ux%u layers=%u..%u mips=%u..%u/%u allocated=%u tile=%u xor=%u dimension=%u dcc=0x%llx alpha=%u pipe=%u swizzle=%u,%u,%u,%u bc=%u minLod=%u\n", role, static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(size), d.format, d.width, d.height, d.dimension == TextureDimension::k3D ? d.depthOrLastArray + 1 : 1, d.baseArray, d.depthOrLastArray, d.baseLevel, d.lastLevel, d.mipCount, d.allocatedMipCount, static_cast<unsigned>(d.tileMode), d.pipeBankXor, static_cast<unsigned>(d.dimension), static_cast<unsigned long long>(d.dccAddress), d.dccAlphaOnMsb, d.dccPipeAligned, d.dstSelX, d.dstSelY, d.dstSelZ, d.dstSelW, d.bcSwizzle, d.minLod);
-    };
-    using Pair = std::tuple<std::array<std::uint64_t, 18>, std::array<std::uint64_t, 18>, std::uint64_t, std::uint64_t>;
-    static std::map<Pair, std::uint64_t> pairs;
-    static std::uint64_t overflow = 0;
     auto& pending = Pending();
     std::lock_guard lock(pending.mutex);
     for (const auto* source : pending.textures) {
-        if (&source->descriptor == &descriptor || !source->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(bytes))) continue;
-        const Pair key{signature(source->descriptor), signature(descriptor), source->lastWriterProgram, aliasProgram};
-        auto it = pairs.find(key);
-        if (it == pairs.end()) {
-            if (pairs.size() == 4096) { ++overflow; continue; }
-            it = pairs.emplace(key, 0).first;
-        }
-        const auto count = ++it->second;
-        if (!std::has_single_bit(count)) continue;
-        const auto& from = source->descriptor;
-        const bool layout = from.tileMode == descriptor.tileMode && from.pipeBankXor == descriptor.pipeBankXor && BytesPerElement(from.format) == BytesPerElement(descriptor.format);
-        const bool shape = from.baseAddress == descriptor.baseAddress && source->guestBytes == bytes && from.width == descriptor.width && from.height == descriptor.height && from.mipCount == descriptor.mipCount && from.depthOrLastArray == descriptor.depthOrLastArray && from.dimension == descriptor.dimension;
-        const char* kind = !layout ? "byte-layout" : !shape ? "subset-or-overlap" : from.format != descriptor.format ? "format" : "descriptor-key";
-        std::fprintf(stderr, "[image-alias] pair count=%llu kind=%s reason=%s producer=0x%llx consumer=0x%llx sourceVersion=%llu pairs=%zu overflow=%llu\n", static_cast<unsigned long long>(count), kind, reason, static_cast<unsigned long long>(source->lastWriterProgram), static_cast<unsigned long long>(aliasProgram), static_cast<unsigned long long>(source->version), pairs.size(), static_cast<unsigned long long>(overflow));
-        describe("source", from, source->guestBytes);
-        describe("destination", descriptor, bytes);
+        if (&source->descriptor == &descriptor || !source->overlaps(descriptor.baseAddress, static_cast<std::size_t>(bytes)) || !source->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(bytes))) continue;
+        TraceAliasPair(source->descriptor, source->guestBytes, source->lastWriterProgram, source->version, descriptor, bytes, reason);
     }
 }
 
@@ -4198,7 +4244,7 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         auto& pending = Pending();
         std::lock_guard lock(pending.mutex);
         for (auto* texture : pending.textures) {
-            if (texture == this || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
+            if (texture == this || texture->context.device != context.device || texture->descriptor.baseAddress != descriptor.baseAddress || texture->guestBytes != guestBytes || !texture->blockUnits) continue;
             if (auto alive = texture->weak_from_this().lock()) candidates.push_back(std::move(alive));
         }
     }
@@ -4208,7 +4254,7 @@ std::shared_ptr<StorageTexture> StorageTexture::pendingAlias() const {
         // The same texels under another format of the same size: the device copy moves them bit
         // for bit, as the guest bytes would.
         const bool sameShape = mine.width == theirs.width && mine.height == theirs.height && mine.depthOrLastArray == theirs.depthOrLastArray && mine.baseArray == theirs.baseArray && mine.mipCount == theirs.mipCount && mine.tileMode == theirs.tileMode && mine.dimension == theirs.dimension && BytesPerElement(mine.format) == BytesPerElement(theirs.format) && geometry.imageLayers == candidate->geometry.imageLayers && geometry.imageDepth == candidate->geometry.imageDepth && trackedLayers == candidate->trackedLayers;
-        if (sameShape && candidate->Cached() && candidate->uploadedKeys == DccKeys::Uncompressed) return candidate;
+        if (sameShape && candidate->Cached() && candidate->descriptor.dccAddress == descriptor.dccAddress && candidate->uploadedKeys == DccKeys::Uncompressed && candidate->ProvedKeys() == DccKeys::Uncompressed) return candidate;
     }
     return nullptr;
 }
@@ -4223,6 +4269,8 @@ void StorageTexture::forgetBorrowed(std::uint32_t first, std::uint32_t count) {
 }
 
 std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vector<bool>& units) {
+    TraceAliasPair(source.descriptor, source.guestBytes, source.lastWriterProgram, source.version, descriptor, guestBytes, "gpu");
+    CountAlias(PlanAlias(source.descriptor, descriptor).kind, true);
     const auto runs = unitRuns(units);
     const auto windows = sliceWindows(runs);
     Require(!windows.empty(), "storage image borrows no unit");

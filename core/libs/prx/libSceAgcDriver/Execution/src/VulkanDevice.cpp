@@ -42,6 +42,7 @@
 #include <cctype>
 #include <cstdlib>
 #include <mutex>
+#include <map>
 #include <SDL_loadso.h>
 #include <SDL_error.h>
 #include <spirv/unified1/spirv.hpp>
@@ -3933,6 +3934,14 @@ void VulkanDevice::recordDispatch(RecordedDispatch& record) {
 }
 
 VulkanDevice::IndirectOutcome VulkanDevice::dispatch(const ShaderRecompiler::RecompileResult& shader, std::uint32_t x, std::uint32_t y, std::uint32_t z, std::uint64_t arguments, std::span<const Graphics::GuestMemorySnapshot> snapshots, std::uint64_t programAddress, std::shared_ptr<PreparedDispatch> prepared, std::shared_ptr<const Recipe>* recipeOut) {
+    static const bool traceAliases = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
+    if (traceAliases) {
+        static std::mutex mutex;
+        static std::map<std::pair<std::uint64_t, std::uint64_t>, bool> reported;
+        std::lock_guard lock(mutex);
+        if (reported.size() < 4096 && reported.emplace(std::pair{shader.PipelineVariantId(), programAddress}, true).second)
+            std::fprintf(stderr, "[image-alias] compute variant=0x%llx address=0x%llx\n", static_cast<unsigned long long>(shader.PipelineVariantId()), static_cast<unsigned long long>(programAddress));
+    }
     ShaderRecompiler::RuntimeAbi::RequireVersion(shader.runtimeAbiVersion);
     PerformanceTimer timing("Vulkan.Dispatch");
     if (recipeOut != nullptr) *recipeOut = nullptr;

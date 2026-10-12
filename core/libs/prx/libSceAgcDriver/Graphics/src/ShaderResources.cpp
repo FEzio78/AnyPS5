@@ -1363,9 +1363,25 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     PerformanceTimer frameTiming("Resources.Prepare");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
-    aliasProgram = 0;
-    for (const auto& shader : shaders) {
-        if (shader.program != nullptr) aliasProgram ^= shader.program->PipelineVariantId();
+    aliasProgram = shaders.size() == 1 && shaders.front().program != nullptr ? shaders.front().program->PipelineVariantId() : 14695981039346656037ull;
+    if (shaders.size() != 1) {
+        for (const auto& shader : shaders) {
+            aliasProgram = (aliasProgram ^ static_cast<std::uint64_t>(shader.stage)) * 1099511628211ull;
+            if (shader.program != nullptr) aliasProgram = (aliasProgram ^ shader.program->PipelineVariantId()) * 1099511628211ull;
+        }
+    }
+    static const bool traceAliases = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
+    if (traceAliases) {
+        static std::mutex mutex;
+        static std::set<std::uint64_t> reported;
+        std::lock_guard lock(mutex);
+        if (reported.size() < 4096 && reported.insert(aliasProgram).second) {
+            std::fprintf(stderr, "[image-alias] program-set=0x%llx", static_cast<unsigned long long>(aliasProgram));
+            for (const auto& shader : shaders) {
+                if (shader.program != nullptr) std::fprintf(stderr, " stage=%u variant=0x%llx", static_cast<unsigned>(shader.stage), static_cast<unsigned long long>(shader.program->PipelineVariantId()));
+            }
+            std::fprintf(stderr, "\n");
+        }
     }
     if (BuildProfiled()) {
         auto& profile = ThreadBuilds();

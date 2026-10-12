@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -1360,6 +1361,7 @@ void ValidateRuntimeResources(const CompiledShader& shader, std::span<const std:
 }
 
 void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, const ColorTarget* target, std::uint32_t colorAttachments, std::uint64_t indexAddress, std::size_t indexBytes) {
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::BuildA);
     PerformanceTimer frameTiming("Resources.Prepare");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
@@ -1536,6 +1538,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
 
 void ShaderResources::buildComplete() {
     const ImageAliasScope aliasScope(aliasProgram);
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::BuildB);
     PerformanceTimer frameTiming("Resources.Complete");
     Require(!completed, "cannot update a published descriptor heap");
     const auto stageStart = std::chrono::steady_clock::now();
@@ -1621,7 +1624,10 @@ void ShaderResources::buildComplete() {
                 }
                 writes.push_back(write);
             }
-            context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            {
+                GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::DescriptorUpdate);
+                context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets")(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+            }
         }
         for (const auto& allocation : allocations) {
             if (allocation.adjustment == 0) continue;
@@ -2288,6 +2294,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
     const ImageAliasScope aliasScope(aliasProgram);
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::RevalidateFailed);
     ImageProfile::Scope imageTiming(ImageProfile::Revalidate, "cached resources", true);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
@@ -2296,6 +2303,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     static const bool noFast = std::getenv("APS5_NO_FAST_REVALIDATE") != nullptr;
     const auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto finish = [&](bool fast, bool ok, ProofFailure failure = ProofFailure::Other) {
+        descriptorTiming.Outcome(!ok ? GpuDescriptorProfile::RevalidateFailed : fast ? GpuDescriptorProfile::RevalidateFast : GpuDescriptorProfile::RevalidateFull);
         if (profile) countRevalidate(fast, ok, start);
         if (report != nullptr) report->failure = ok ? ProofFailure::None : failure;
         return ok;
@@ -2361,10 +2369,12 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
     // takes the full walk as before.
     bool ownRefreshed = false;
     if (!fast && !overlapping.empty()) {
+        std::optional<GpuDescriptorProfile::Scope> refreshTiming;
         auto fallback = OwnRefreshFallback::Count;
         if (!OwnImageRefreshEnabled()) fallback = OwnRefreshFallback::Disabled;
         else {
             refreshed = overlapping;
+            refreshTiming.emplace(GpuDescriptorProfile::T1Failed);
             fallback = refreshOwnObjects(shaders, refreshed);
         }
         if (fallback == OwnRefreshFallback::Count) {
@@ -2372,6 +2382,7 @@ bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofR
             if (fast) ownRefreshed = true;
             else fallback = OwnRefreshFallback::Rerun;
         }
+        if (refreshTiming.has_value() && ownRefreshed) refreshTiming->Outcome(GpuDescriptorProfile::T1Refresh);
         if (fallback != OwnRefreshFallback::Count) countOwnRefreshFallback(fallback);
     }
     if (report != nullptr) report->path = !fast ? ProofPath::Full : ownRefreshed ? ProofPath::OwnRefreshed : ProofPath::Fast;
@@ -3580,7 +3591,10 @@ void ShaderResources::copyBindings(DrawBindings& result, std::span<const std::pa
         copies.push_back(copy);
     }
     const auto update = context.Resolved(&DeviceFunctions::updateDescriptorSets, "vkUpdateDescriptorSets");
-    update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    {
+        GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::DescriptorUpdate);
+        update(context.device, 0, nullptr, static_cast<std::uint32_t>(copies.size()), copies.data());
+    }
     std::size_t infoCount = 0;
     for (const auto& binding : bindings) infoCount += binding.allocations.size();
     std::vector<VkDescriptorBufferInfo> infos;
@@ -3604,7 +3618,10 @@ void ShaderResources::copyBindings(DrawBindings& result, std::span<const std::pa
         write.pBufferInfo = infos.data() + first;
         writes.push_back(write);
     }
-    update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    {
+        GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::DescriptorUpdate);
+        update(context.device, static_cast<std::uint32_t>(writes.size()), writes.data(), 0, nullptr);
+    }
 }
 
 std::optional<std::shared_ptr<ShaderResources::DispatchBindings>> ShaderResources::PrepareDispatchBindings(Recorder& recorder, std::span<const MovedBuffer> moved) const {

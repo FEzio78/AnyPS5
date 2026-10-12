@@ -6,19 +6,20 @@
 
 namespace AgcDriver::DriverDetail {
 
-void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue) {
+void Driver::noteLabelStore(std::uint64_t address, std::span<const std::byte> bytes, std::uint64_t stamp, std::uint32_t queue, int producerReason) {
     if (bytes.empty() || bytes.size() > 64 || bytes.size() % 4 != 0 || address % 4 != 0) return;
     std::lock_guard lock(labelStoresMutex);
     for (std::size_t offset = 0; offset < bytes.size(); offset += 4) {
         auto& history = labelStores[address + offset];
         std::shift_right(history.begin(), history.end(), 1);
         history[0].stamp = stamp;
+        history[0].producerReason = producerReason;
         history[0].queue = queue;
         std::memcpy(&history[0].value, bytes.data() + offset, 4);
     }
 }
 
-bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer) {
+bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t address, std::size_t bytes, std::uint64_t received, std::uint32_t* writer, int* producerReason) {
     std::lock_guard lock(labelStoresMutex);
     const auto low = labelStores.find(address);
     if (low == labelStores.end()) return false;
@@ -34,6 +35,7 @@ bool Driver::storedSince(std::span<const std::uint32_t> packet, std::uint64_t ad
         }
         if (Pm4::WaitComparesValue(packet, value)) {
             if (writer != nullptr) *writer = store.queue;
+            if (producerReason != nullptr) *producerReason = store.producerReason;
             return true;
         }
     }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #pragma once
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -65,7 +66,7 @@ private:
 class Dispatch {
 public:
     Dispatch(std::uint64_t program, std::array<std::uint32_t, 3> groups, std::size_t words) : previous(active) {
-        if (!Enabled()) return;
+        if (!Enabled() && GpuDescriptorProfile::active == nullptr) return;
         sample.program = program;
         sample.groups = groups;
         sample.words = words;
@@ -73,10 +74,12 @@ public:
         start = std::chrono::steady_clock::now();
     }
     ~Dispatch() {
-        if (!Enabled()) return;
+        if (!Enabled() && GpuDescriptorProfile::active == nullptr) return;
         active = previous;
         const auto now = std::chrono::steady_clock::now();
         const auto ms = std::chrono::duration<double, std::milli>(now - start).count();
+        GpuDescriptorProfile::Add(GpuDescriptorProfile::MutexHold, ms * 1000);
+        if (!Enabled()) return;
         struct Window {
             std::chrono::steady_clock::time_point at = std::chrono::steady_clock::now();
             double total = 0, max = 0;

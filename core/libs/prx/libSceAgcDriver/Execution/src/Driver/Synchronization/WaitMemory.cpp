@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/WaitMemory.hpp"
@@ -88,7 +89,11 @@ void Driver::landPendingWaits(std::uint32_t queue) {
     for (const auto& wait : waits) {
         const auto packet = std::span<const std::uint32_t>(wait.words).first(wait.count);
         ++stats.lands;
-        if (Pm4::WaitSatisfiedUnchecked(packet)) continue;
+        if (Pm4::WaitSatisfiedUnchecked(packet)) {
+            GpuDescriptorProfile::Wait descriptorWait(queue, true);
+            descriptorWait.Satisfied(GpuDescriptorProfile::MemoryAtEntry);
+            continue;
+        }
         const auto started = std::chrono::steady_clock::now();
         waitMemory(packet, queue, none, wait.received, false, true);
         const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
@@ -105,6 +110,7 @@ void Driver::landPendingWaits(std::uint32_t queue) {
 
 void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t queue, const PacketHistory& context, std::uint64_t received, bool heldAtSubmit, bool requireMemory) {
 
+    GpuDescriptorProfile::Wait descriptorWait(queue, requireMemory);
     auto start = std::chrono::steady_clock::now();
     auto lastDone = packetsDone.load();
 
@@ -144,11 +150,14 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     GuestMemory::CheckRange(reinterpret_cast<const void*>(awaited), awaitedBytes, awaitedBytes);
     if (Pm4::WaitSatisfiedUnchecked(packet)) {
         epochPoint.satisfied = true;
+        descriptorWait.Satisfied(GpuDescriptorProfile::MemoryAtEntry);
         ++outcomes.atEntry;
         return;
     }
     if (heldAtSubmit) return;
-    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+    int producerReason = -1;
+    if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &producerReason)) {
+        descriptorWait.Satisfied(producerReason == 0 ? GpuDescriptorProfile::RecorderLabel : producerReason == 5 ? GpuDescriptorProfile::CompletionLabel : producerReason == 1 ? GpuDescriptorProfile::HostLabel : GpuDescriptorProfile::DriverStore);
         epochPoint.driverProduced = epochPoint.satisfied = true;
         if (writer != queue) notePendingWait(packet, queue, received);
         return;
@@ -194,6 +203,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         } else {
             notePendingWait(packet, queue, received);
         }
+        descriptorWait.Satisfied(GpuDescriptorProfile::RecorderLabel);
         epochPoint.driverProduced = epochPoint.satisfied = true;
         return true;
     };
@@ -341,7 +351,8 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
     bool spinning = pauseSpin;
     std::uint32_t polls = 0;
     while (!Pm4::WaitSatisfiedUnchecked(packet)) {
-        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer)) {
+        if (std::uint32_t writer = queue; !requireMemory && storedSince(packet, awaited, awaitedBytes, received, &writer, &producerReason)) {
+            descriptorWait.Satisfied(producerReason == 0 ? GpuDescriptorProfile::RecorderLabel : producerReason == 5 ? GpuDescriptorProfile::CompletionLabel : producerReason == 1 ? GpuDescriptorProfile::HostLabel : GpuDescriptorProfile::DriverStore);
             epochPoint.driverProduced = epochPoint.satisfied = true;
             if (writer != queue) notePendingWait(packet, queue, received);
             return;
@@ -362,7 +373,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         if (requireMemory && (polls & 15u) == 0) {
             std::unique_lock settleLock(GuestMemory::GpuMutex(), std::try_to_lock);
             if (settleLock.owns_lock()) {
-                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) return;
+                if (const auto localDevice = device.Load(); localDevice != nullptr && localDevice->RecordedWritesSettled(awaited, awaitedBytes)) { descriptorWait.Satisfied(GpuDescriptorProfile::Completion); return; }
             }
         }
         if (const auto done = packetsDone.load(); done != lastDone || (!requireMemory && packetsInFlight.load() != 0)) {
@@ -425,6 +436,7 @@ void Driver::waitMemory(std::span<const std::uint32_t> packet, std::uint32_t que
         }
         if (warned) return;
     }
+    descriptorWait.Satisfied(GpuDescriptorProfile::MemoryObserved);
     ++outcomes.polled;
     epochPoint.satisfied = true;
 }

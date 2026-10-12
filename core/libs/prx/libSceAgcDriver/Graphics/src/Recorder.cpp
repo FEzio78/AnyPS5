@@ -1730,7 +1730,7 @@ namespace {
 
 constexpr std::uint32_t MaxTimedRanges = 512;
 constexpr std::size_t CommandClasses = static_cast<std::size_t>(Recorder::CommandClass::Count);
-constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh"};
+constexpr const char* CommandClassNames[CommandClasses] = {"dispatch-lead", "dispatch-trail", "indirect-args", "label-run", "fill", "fill-clear", "copy", "staging-in", "staging-out", "draw", "storage-upload", "storage-writeback", "dcc-clear", "dcc-keys", "present-blit", "shadow-publish", "template-refresh", "detile", "retile", "alias-handoff", "depth-compare-copy", "title-graphics", "cmask-work"};
 // [barriers] counters by class (relaxed: only reported) and the [gputime] totals, which the
 // presenter's thread adds to without the GPU mutex (AddGpuTiming).
 std::atomic<std::uint64_t> classBarriers[CommandClasses]{};
@@ -1809,7 +1809,7 @@ void reportBarriers() {
 
 bool Recorder::GpuTimingEnabled() {
     static const bool enabled = std::getenv("APS5_PROFILE_GPU") != nullptr;
-    return enabled;
+    return enabled || GpuDescriptorProfile::Enabled();
 }
 
 bool Recorder::BatchStampsEnabled() {
@@ -1903,6 +1903,11 @@ std::uint32_t Recorder::BeginGpuTiming(std::uint64_t key) {
     return beginTiming(key);
 }
 
+std::uint32_t Recorder::BeginGpuTiming(CommandClass which, VkCommandBuffer commands) {
+    if (!GpuTimingEnabled() || open == nullptr || open->commands != commands) return NoTiming;
+    return beginTiming(ClassKey(which));
+}
+
 std::uint32_t Recorder::beginTiming(std::uint64_t key) {
     const bool full = GpuTimingEnabled();
     if (!full && !(key == BatchTimingKey && DrawProfiled())) return NoTiming;
@@ -1924,12 +1929,19 @@ std::uint32_t Recorder::beginTiming(std::uint64_t key) {
         function(cmdResetQueryPool, "vkCmdResetQueryPool")(commands, open->queries, 0, queryCount);
     }
     if (open->timedKeys.size() >= queryCount / 2) {
+        GpuDescriptorProfile::DroppedGpu();
         timingDropped.fetch_add(1, std::memory_order_relaxed);
         return NoTiming;
     }
     const auto index = static_cast<std::uint32_t>(open->timedKeys.size());
     open->timedKeys.push_back(key);
     open->timedBytes.push_back(0);
+    if (GpuDescriptorProfile::Enabled()) {
+        const bool commandClass = key >= ClassKey(CommandClass::DispatchLeading) && key < ClassKey(CommandClass::Count);
+        const bool shader = !commandClass && key != BatchTimingKey && GpuDescriptorProfile::active != nullptr && GpuDescriptorProfile::active->key.program == key;
+        const auto* kind = key == BatchTimingKey ? "unclassified" : shader ? "title-compute" : commandClass ? CommandClassNames[key - ClassKey(CommandClass::DispatchLeading)] : "hle-program";
+        open->descriptorTimings.push_back(GpuDescriptorProfile::BeginGpu(GuestMemory::CurrentPacket().queue, kind, shader));
+    }
     // Both stamps wait for everything before them to complete, so the range is the timed work alone
     // (a top-of-pipe stamp is not held back by the barrier that precedes the work).
     context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, open->queries, index * 2);
@@ -2354,6 +2366,10 @@ void Recorder::readGpuTiming(Batch& batch) {
     if (batch.queries == VK_NULL_HANDLE || batch.timedKeys.empty()) return;
     std::vector<std::uint64_t> stamps(batch.timedKeys.size() * 2);
     const auto result = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, batch.queries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+    if (!batch.descriptorTimings.empty()) {
+        GpuDescriptorProfile::ResolveGpu(batch.descriptorTimings, stamps, context.limits.timestampPeriod, result == VK_SUCCESS);
+        batch.descriptorTimings.clear();
+    }
     if (result != VK_SUCCESS) return;
     const auto period = context.limits.timestampPeriod;
     if (!GpuTimingEnabled()) {

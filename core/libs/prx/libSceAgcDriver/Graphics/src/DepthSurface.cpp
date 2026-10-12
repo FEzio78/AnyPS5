@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuWorkTiming.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VulkanDebug.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
@@ -257,6 +258,7 @@ void copyDepthPlane(const Context& context, const GuestTextureResource& resource
     const auto bytes = static_cast<std::size_t>(surface.target.extent.width) * surface.target.extent.height * texelBytes;
     auto staging = std::make_shared<DeviceBuffer>(context, bytes, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     const auto commands = recorder->Commands();
+    GpuWorkTiming descriptorTiming(commands, Recorder::CommandClass::DepthCompareCopy, "depth-compare-copy");
     recorder->Keep(staging, staging->Size());
     VkBufferImageCopy region{};
     region.imageExtent = {surface.target.extent.width, surface.target.extent.height, 1};

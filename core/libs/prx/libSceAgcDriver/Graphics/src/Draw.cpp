@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuWorkTiming.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetTransfer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GpuColorTransfer.hpp"
@@ -1303,6 +1304,7 @@ void recordDrawCommands(const Context& context, VkCommandBuffer commands, const 
     const auto packet = GuestMemory::CurrentPacket();
     const DebugLabel label(context, commands, "draw %u x%u%s rt 0x%llx %ux%u depth 0x%llx (pm4 0x%x queue %u)", draw.indexCount, draw.instanceCount, indirect != nullptr ? " indirect" : "", static_cast<unsigned long long>(state.colors.empty() ? 0 : state.colors.front().address), state.renderExtent.width, state.renderExtent.height, static_cast<unsigned long long>(state.depth ? state.depth->address : 0), packet.opcode, packet.queue);
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
+    GpuWorkTiming descriptorTiming(commands, Recorder::CommandClass::TitleGraphics, "title-graphics");
     const auto* args = indirect != nullptr ? indirect->args : nullptr;
     if (state.stages.mesh && args != nullptr) {
         context.Function<PFN_vkCmdDrawMeshTasksIndirectEXT>("vkCmdDrawMeshTasksIndirectEXT")(commands, argumentBuffer, argumentOffset, 1, sizeof(VkDrawMeshTasksIndirectCommandEXT));

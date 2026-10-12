@@ -40,7 +40,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(label->address, bytes, stamp, submission.queue) : 4;
                 if (reason == 1) GuestMemory::Write(label->address, bytes, 4);
                 if (reason == 0 || reason == 1 || reason == 5) {
-                    noteLabelStore(label->address, bytes, stamp, submission.queue);
+                    noteLabelStore(label->address, bytes, stamp, submission.queue, reason);
                     Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 }
                 countLabelOutcome(reason);
@@ -85,7 +85,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                     GuestMemory::Write(label->address, bytes, 4);
                     wroteOnGpu = true;
                 }
-                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp, submission.queue);
+                if (wroteOnGpu) noteLabelStore(label->address, bytes, stamp, submission.queue, reason);
                 Graphics::Recorder::CloseLabelGroup(GuestMemory::TrackerGeneration());
                 countLabelOutcome(reason);
                 ++immediateLabels;
@@ -119,7 +119,7 @@ bool Driver::preparePacketMemory(const Submission& submission, QueueState& queue
                 recordDeferredLabels(localDevice.get(), submission.queue);
                 const auto stamp = ++eventSerial;
                 const auto reason = localDevice != nullptr ? localDevice->WriteLabelOnGpu(store->address, bytes, stamp, submission.queue) : 4;
-                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue);
+                if (reason == 0 || reason == 1 || reason == 5) noteLabelStore(store->address, bytes, stamp, submission.queue, reason);
                 if (reason == 0 || reason == 5) {
                     if (reason == 0) ++storesOnGpu;
                     else ++storesBehindCompletions;

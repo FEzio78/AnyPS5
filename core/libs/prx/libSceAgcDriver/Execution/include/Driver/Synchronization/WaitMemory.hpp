@@ -16,6 +16,7 @@ inline constexpr const char* LabelRefusalNames[6] = {"none", "trust-off", "queue
 inline constexpr std::chrono::microseconds PollTryInterval{1000};
 
 struct LabelStore {
+    int producerReason = 1;
     std::uint64_t stamp = 0;
     std::uint32_t value = 0;
     std::uint32_t queue = 0xffffffffu;

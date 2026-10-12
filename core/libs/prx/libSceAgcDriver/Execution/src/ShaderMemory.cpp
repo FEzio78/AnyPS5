@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -256,7 +257,19 @@ std::shared_ptr<const ShaderRecompiler::ResourceCapture> ShaderMemory::capture(c
     runtime.readMemory = &read;
     runtime.readSpecializationMemory = &read;
     runtime.accessible = &accessible;
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::Capture);
     auto capture = invocation != nullptr ? invocation->Capture(runtime) : handle != nullptr ? ShaderRecompiler::CaptureResources(request, runtime, *handle) : ShaderRecompiler::CaptureResources(request, runtime);
+    if (GpuDescriptorProfile::active != nullptr) {
+        const auto id = GpuDescriptorProfile::PlanIdentity(capture->plan);
+        GpuDescriptorProfile::active->key.plan = id;
+        if (capture->plan != nullptr) GpuDescriptorProfile::DescribePlan(id, [&] {
+            const auto& plan = *capture->plan;
+            const auto indirect = std::count_if(plan.info.images.begin(), plan.info.images.end(), [](const auto& image) { return image.indirectRoot != ShaderRecompiler::ImageResource::NoIndirectImage; });
+            char text[512];
+            std::snprintf(text, sizeof(text), "buffers=%zu images=%zu samplers=%zu indirect-images=%zu descriptor-sources=%zu srt-reads=%zu pure-slots=%zu specialization-memory=%u srt-complete=%u tracking-complete=%u user-data=%u", plan.info.buffers.size(), plan.info.images.size(), plan.info.samplers.size(), static_cast<std::size_t>(indirect), plan.descriptorSources.size(), plan.srtReads.size(), static_cast<std::size_t>(std::count(plan.pureFlatSlots.begin(), plan.pureFlatSlots.end(), 1)), plan.requiresSpecializationMemory, plan.srtPlanComplete, plan.resourceTrackingComplete, plan.userDataCount);
+            return std::string(text);
+        });
+    }
     if (profile) {
         totals.captureNanoseconds += NanosecondsSince(started);
         totals.resolveNanoseconds += capture->sourceNanoseconds;

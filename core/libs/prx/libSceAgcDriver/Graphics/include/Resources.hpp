@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_RESOURCES_HPP
 
@@ -101,9 +102,15 @@ public:
     void SubmitAndWait();
     void Submit();
     void Wait();
+    static CommandBatch* Find(VkCommandBuffer commands);
+    std::uint32_t BeginGpuTiming(const char* kind);
+    void EndGpuTiming(std::uint32_t index);
 
 private:
     void release() noexcept;
+    void readGpuTiming(bool valid);
+    VkQueryPool profileQueries = VK_NULL_HANDLE;
+    std::vector<GpuDescriptorProfile::GpuTag> profileTimings;
     Context context;
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;

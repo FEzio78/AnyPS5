@@ -1,3 +1,5 @@
+#include "prx/libSceAgcDriver/Graphics/include/GpuWorkTiming.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ImageProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -626,6 +628,8 @@ bool Texture::RefreshDepthCopy() {
     auto* recorder = Recorder::Active();
     std::unique_ptr<CommandBatch> batch;
     const auto commands = recorder != nullptr ? recorder->Commands() : (batch = std::make_unique<CommandBatch>(context))->Handle();
+    std::optional<GpuWorkTiming> descriptorTiming;
+    descriptorTiming.emplace(commands, Recorder::CommandClass::DepthCompareCopy, "depth-compare-copy");
     if (recorder != nullptr) {
         recorder->Keep(storageSource);
         recorder->Keep(owned);
@@ -666,6 +670,7 @@ bool Texture::RefreshDepthCopy() {
     destination.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     destination.newLayout = layout;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &destination);
+    descriptorTiming.reset();
     if (batch) batch->SubmitAndWait();
     depthSourceVersion = storageSource->Version();
     DepthCounts().copied.fetch_add(1, std::memory_order_relaxed);
@@ -1564,12 +1569,13 @@ const char* LookupOutcomes::Name(Kind kind) {
 
 bool LookupOutcomes::Profiled() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
-    return profile;
+    return profile || GpuDescriptorProfile::active != nullptr;
 }
 
 std::chrono::steady_clock::time_point LookupOutcomes::Add(Kind kind, std::chrono::steady_clock::time_point start) {
     const auto now = std::chrono::steady_clock::now();
     auto& outcomes = ThreadLookupOutcomes();
+    GpuDescriptorProfile::Image(static_cast<std::size_t>(kind), std::chrono::duration<double, std::micro>(now - start).count());
     ++outcomes.counts[kind];
     outcomes.ms[kind] += std::chrono::duration<double, std::milli>(now - start).count();
     return now;
@@ -4289,18 +4295,20 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     auto timing = Recorder::NoTiming;
     if (recorder != nullptr) {
         commands = recorder->Commands();
-        timing = recorder->BeginGpuTiming(Recorder::CommandClass::StorageUpload);
+        timing = recorder->BeginGpuTiming(Recorder::CommandClass::AliasHandoff);
         if (auto self = weak_from_this().lock()) recorder->Keep(std::move(self));
         if (auto other = source.weak_from_this().lock()) recorder->Keep(std::move(other));
-        Recorder::CountBarriers(Recorder::CommandClass::StorageUpload, 2);
+        Recorder::CountBarriers(Recorder::CommandClass::AliasHandoff, 2);
         if (Recorder::BarrierValidate()) {
             const std::array<std::pair<VkImage, bool>, 2> images{{{source.image, false}, {image, true}}};
-            recorder->NoteAccess(Recorder::CommandClass::StorageUpload, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
+            recorder->NoteAccess(Recorder::CommandClass::AliasHandoff, Recorder::Access{{}, {}, images, VK_PIPELINE_STAGE_TRANSFER_BIT});
         }
     } else {
         batch = std::make_unique<CommandBatch>(context);
         commands = batch->Handle();
     }
+    std::optional<GpuWorkTiming> descriptorTiming;
+    if (batch) descriptorTiming.emplace(commands, Recorder::CommandClass::AliasHandoff, "alias-handoff");
     VkImageMemoryBarrier barriers[2]{};
     for (auto& barrier : barriers) {
         barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
@@ -4322,6 +4330,7 @@ std::uint64_t StorageTexture::borrowUnits(StorageTexture& source, const std::vec
     copied.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     copied.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
     context.Function<PFN_vkCmdPipelineBarrier>("vkCmdPipelineBarrier")(commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &copied);
+    descriptorTiming.reset();
     if (batch) batch->SubmitAndWait();
     else recorder->EndGpuTiming(timing, bytes);
     countStorageUpload(3, bytes);

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "Optimization/ResourceProgram.hpp"
@@ -14,6 +15,7 @@ void Driver::insertDispatch(std::uint64_t address, std::uint64_t key, bool noDis
     if (!noDispatchCache) {
         auto fresh = std::make_shared<DispatchVariant>();
         fresh->compiled = compiledResult;
+        if (GpuDescriptorProfile::active != nullptr) fresh->profilePlan = GpuDescriptorProfile::active->key.plan;
         fresh->shader = registeredShader;
         fresh->forgetSerial = forgetAtCapture;
 

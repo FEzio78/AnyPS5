@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -85,6 +86,16 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         for (std::uint32_t axis = 0; axis < 3; ++axis) {
             if (threads[axis] % compute.numThreads[axis] != 0) compute.partialThreads = threads;
         }
+    }
+    GpuDescriptorProfile::Invocation descriptorProfile(submission.queue);
+    std::uint64_t profileCode = 0;
+    if (GpuDescriptorProfile::Enabled()) {
+        std::lock_guard lock(snapshot.prepared->mutex);
+        auto& hashes = snapshot.prepared->profileCodeHashes;
+        const auto found = hashes.find(codeOffset);
+        profileCode = found != hashes.end() ? found->second : hashes.emplace(codeOffset, GpuDescriptorProfile::HashCode(std::span(snapshot.code).subspan(codeOffset))).first->second;
+        descriptorProfile.Identify({address, profileCode, 0});
+        descriptorProfile.Attempt();
     }
     ShaderRecompiler::RecompileRequest request{
         {ShaderRecompiler::ShaderStage::Compute, address, std::span(snapshot.code).subspan(codeOffset), snapshot.headerAddress, snapshot.header},
@@ -276,6 +287,10 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         phaseTiming.Phase(PhaseRecompile);
         insertDispatch(address, key, noDispatchCache || !CacheableResult(*compiledResult), profile, registeredShader, forgetAtCapture, memory, shaderMemory, captured, capture, compiledResult, missedEntry, missedDiffering, attachVariant, phaseTiming);
     }
+    if (GpuDescriptorProfile::Enabled()) {
+        const auto plan = capture != nullptr ? GpuDescriptorProfile::PlanIdentity(capture->plan) : keepVariant != nullptr ? keepVariant->profilePlan : 0;
+        descriptorProfile.Identify({address, profileCode, plan});
+    }
     if (resolving) {
         auto& parked = resolvedAhead()[currentPacketOffset()];
         parked = ResolvedDispatch{};
@@ -429,6 +444,8 @@ void Driver::dispatch(QueueState& queue, std::span<const std::uint32_t> packet, 
         }
         break;
     }
+    descriptorProfile.Dispatched();
+    descriptorProfile.Specialization(compiled.specialization);
     phaseTiming.Phase(PhaseDevice);
     if (noteWrites && !writerKeyedEvidence()) noteWrittenBuffers(address, submission.queue, compiled);
     deviceMs += phaseTiming.Elapsed();

@@ -22,6 +22,7 @@ struct Window {
     std::uint64_t id = 0, firstFrame = 0, lastFrame = 0, pendingCpu = 0, pendingGpu = 0, droppedGpu = 0;
     Clock::time_point begin{}, end{};
     std::map<std::pair<std::uint32_t, ClassKey>, Row> rows;
+    std::map<std::uint32_t, Row> otherWaits;
     std::map<std::pair<std::uint32_t, std::string>, Counter> gpu;
     double bookkeepingUs = 0;
 };
@@ -31,6 +32,7 @@ struct State {
     std::shared_ptr<Window> current;
     std::vector<std::shared_ptr<Window>> sealed;
     std::map<std::weak_ptr<const void>, std::uint64_t, std::owner_less<std::weak_ptr<const void>>> plans;
+    std::map<std::uint64_t, std::string> planFacts;
 };
 inline State& Shared() { static State state; return state; }
 inline std::size_t TopN() {
@@ -45,6 +47,7 @@ inline void Print(const Window& window) {
     std::map<std::uint32_t, std::vector<std::pair<ClassKey, const Row*>>> queues;
     for (const auto& [key, row] : window.rows) queues[key.first].emplace_back(key.second, &row);
     char text[320];
+    for (const auto& [queue, row] : window.otherWaits) ProfilePrint_nid_no_patch("[gpu-desc-other-waits] w=%llu q=0x%x label-count=%llu label-us=%.3f label-us/frame=%.3f landing-count=%llu landing-us=%.3f landing-us/frame=%.3f consumer=draw/hle/other-guest-read\n", static_cast<unsigned long long>(window.id), queue, static_cast<unsigned long long>(row.metrics[LabelWait].count), row.metrics[LabelWait].us, row.metrics[LabelWait].PerFrame(frames), static_cast<unsigned long long>(row.metrics[LandingWait].count), row.metrics[LandingWait].us, row.metrics[LandingWait].PerFrame(frames));
     for (auto& [queue, ranked] : queues) {
         std::sort(ranked.begin(), ranked.end(), [](const auto& a, const auto& b) { return a.second->TotalCost() > b.second->TotalCost() || (a.second->TotalCost() == b.second->TotalCost() && a.first < b.first); });
         std::uint64_t dispatches = 0, attempts = 0;
@@ -53,6 +56,7 @@ inline void Print(const Window& window) {
         for (std::size_t rank = 0; rank < std::min(TopN(), ranked.size()); ++rank) {
             const auto& [key, pointer] = ranked[rank];
             const auto& row = *pointer;
+            if (const auto facts = Shared().planFacts.find(key.plan); facts != Shared().planFacts.end()) ProfilePrint_nid_no_patch("[gpu-desc-plan] w=%llu q=0x%x program=0x%llx code=%016llx plan=%llu %s\n", static_cast<unsigned long long>(window.id), queue, static_cast<unsigned long long>(key.program), static_cast<unsigned long long>(key.code), static_cast<unsigned long long>(key.plan), facts->second.c_str());
             std::string metrics;
             const auto append = [&](const char* name, const Counter& counter) {
                 std::snprintf(text, sizeof(text), " %s=%llu,%.3f,%.3f,%.3f", name, static_cast<unsigned long long>(counter.count), counter.us, counter.PerDispatch(row.dispatches), counter.PerFrame(frames));
@@ -78,7 +82,7 @@ inline void Print(const Window& window) {
         (title ? titleUs : emulatorUs) += counter.us;
         ProfilePrint_nid_no_patch("[gpu-desc-work] w=%llu q=0x%x kind=%s count=%llu exclusive-us=%.3f us/frame=%.3f\n", static_cast<unsigned long long>(window.id), key.first, key.second.c_str(), static_cast<unsigned long long>(counter.count), counter.us, counter.PerFrame(frames));
     }
-    ProfilePrint_nid_no_patch("[gpu-desc-frame] w=%llu frames=%llu title-ms/frame=%.4f emulator-ms/frame=%.4f total-covered-ms/frame=%.4f budget-ms=16.6667; disjoint timestamp spans, recording cohort, single VkQueue; untimed standalone work is not included\n", static_cast<unsigned long long>(window.id), static_cast<unsigned long long>(frames), frames == 0 ? 0 : titleUs / frames / 1000, frames == 0 ? 0 : emulatorUs / frames / 1000, frames == 0 ? 0 : (titleUs + emulatorUs) / frames / 1000);
+    ProfilePrint_nid_no_patch("[gpu-desc-frame] w=%llu frames=%llu title-ms/frame=%.4f emulator-ms/frame=%.4f total-covered-ms/frame=%.4f budget-ms=16.6667; disjoint timestamp spans, recording cohort, single VkQueue; unclassified includes uncovered recorder/standalone spans; classification is command time, not shader cycles\n", static_cast<unsigned long long>(window.id), static_cast<unsigned long long>(frames), frames == 0 ? 0 : titleUs / frames / 1000, frames == 0 ? 0 : emulatorUs / frames / 1000, frames == 0 ? 0 : (titleUs + emulatorUs) / frames / 1000);
 }
 
 inline std::shared_ptr<Window> CurrentLocked(State& state, Clock::time_point now) {
@@ -127,14 +131,31 @@ inline std::uint64_t PlanIdentity(const std::shared_ptr<const void>& plan) {
     return id;
 }
 
+template<typename F> void DescribePlan(std::uint64_t id, F&& describe) {
+    auto& state = Shared();
+    std::lock_guard lock(state.mutex);
+    if (!state.planFacts.contains(id)) state.planFacts.emplace(id, std::forward<F>(describe)());
+}
+
 struct Sample {
     std::shared_ptr<Window> window;
     std::uint32_t queue = 0;
     ClassKey key;
     Row row;
+    double childrenUs = 0;
 };
 inline thread_local Sample* active = nullptr;
 inline thread_local std::map<std::uint32_t, Row> waits;
+
+inline void ConsumeOtherWaits(std::uint32_t queue) {
+    if (!Enabled()) return;
+    const auto found = waits.find(queue);
+    if (found == waits.end()) return;
+    auto& state = Shared();
+    std::lock_guard lock(state.mutex);
+    CurrentLocked(state, Clock::now())->otherWaits[queue].Merge(found->second);
+    waits.erase(found);
+}
 
 class Invocation {
 public:
@@ -152,7 +173,9 @@ public:
     }
     ~Invocation() {
         if (sample.window == nullptr) return;
-        sample.row.cpuUs = Microseconds(start);
+        const auto elapsed = Microseconds(start);
+        sample.row.cpuUs = std::max(0.0, elapsed - sample.childrenUs);
+        if (previous != nullptr) previous->childrenUs += elapsed;
         const auto overhead = Clock::now();
         active = previous;
         auto& state = Shared();
@@ -255,6 +278,25 @@ inline void DroppedGpu() {
     auto& state = Shared();
     std::lock_guard lock(state.mutex);
     ++CurrentLocked(state, Clock::now())->droppedGpu;
+}
+
+inline void ResolveGpu(std::span<const GpuTag> tags, std::span<const std::uint64_t> stamps, double period, bool valid = true) {
+    std::vector<GpuInterval> intervals;
+    intervals.reserve(tags.size());
+    for (std::size_t i = 0; i < tags.size(); ++i) {
+        const auto begin = valid ? stamps[i * 2] : 1;
+        const auto end = valid ? stamps[i * 2 + 1] : 0;
+        intervals.push_back({begin, end, tags[i].kind == "unclassified" ? 100u : tags[i].kind.starts_with("title-") ? 0u : 1u, i});
+    }
+    const auto exclusive = ExclusiveTicks(intervals);
+    for (std::size_t i = 0; i < tags.size(); ++i) {
+        const auto& range = intervals[i];
+        const bool good = valid && range.end >= range.begin;
+        EndGpu(tags[i], good ? static_cast<double>(range.end - range.begin) * period / 1000 : 0, exclusive[i] * period / 1000, good);
+    }
+    auto& state = Shared();
+    std::lock_guard lock(state.mutex);
+    PublishLocked(state);
 }
 
 }

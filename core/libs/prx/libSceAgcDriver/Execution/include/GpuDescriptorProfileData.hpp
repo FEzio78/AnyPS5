@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <map>
 #include <span>
+#include <set>
 #include <tuple>
 #include <vector>
 
@@ -26,10 +27,10 @@ inline std::uint64_t HashCode(std::span<const std::uint32_t> code) {
     return hash;
 }
 
-enum Metric : std::size_t { Capture, Validation, BuildA, BuildB, RevalidateFast, RevalidateFull, RevalidateFailed, T1Refresh, DescriptorUpdate, BdaLease, BdaMirror, MutexHold, LabelWait, LandingWait, MetricCount };
-inline constexpr std::array<const char*, MetricCount> MetricNames{"capture", "validation", "build-a", "build-b", "revalidate-fast", "revalidate-full", "revalidate-failed", "t1-refresh", "descriptor-update", "bda-lease", "bda-mirror", "mutex-hold", "label-wait", "landing-wait"};
-enum Producer : std::size_t { MemoryAtEntry, DriverStore, RecorderLabel, Completion, MemoryObserved, Timeout, ProducerCount };
-inline constexpr std::array<const char*, ProducerCount> ProducerNames{"memory-at-entry", "driver-store", "recorder-label", "completion", "memory-observed-unknown", "unsatisfied"};
+enum Metric : std::size_t { Capture, Validation, BuildA, BuildB, RevalidateFast, RevalidateFull, RevalidateFailed, T1Refresh, T1Failed, DescriptorUpdate, BdaLease, BdaMirror, MutexHold, LabelWait, LandingWait, MetricCount };
+inline constexpr std::array<const char*, MetricCount> MetricNames{"capture", "validation", "build-a", "build-b", "revalidate-fast", "revalidate-full", "revalidate-failed", "t1-refresh", "t1-failed", "descriptor-update", "bda-lease", "bda-mirror", "mutex-hold", "label-wait", "landing-wait"};
+enum Producer : std::size_t { MemoryAtEntry, DriverStore, RecorderLabel, Completion, MemoryObserved, Timeout, HostLabel, CompletionLabel, ProducerCount };
+inline constexpr std::array<const char*, ProducerCount> ProducerNames{"memory-at-entry", "driver-store", "gpu-direct-label", "completion-settled", "memory-observed-unknown", "unsatisfied", "host-label", "completion-backed-label"};
 
 struct Counter {
     std::uint64_t count = 0;
@@ -90,18 +91,21 @@ struct GpuInterval {
 
 inline std::vector<double> ExclusiveTicks(std::span<const GpuInterval> ranges) {
     std::vector<double> ticks(ranges.size());
-    std::vector<std::uint64_t> edges;
-    for (const auto& range : ranges) if (range.end >= range.begin) { edges.push_back(range.begin); edges.push_back(range.end); }
+    std::vector<std::tuple<std::uint64_t, bool, std::size_t>> edges;
+    for (std::size_t i = 0; i < ranges.size(); ++i) {
+        const auto& range = ranges[i];
+        if (range.end <= range.begin) continue;
+        edges.emplace_back(range.begin, true, i);
+        edges.emplace_back(range.end, false, i);
+    }
     std::sort(edges.begin(), edges.end());
-    edges.erase(std::unique(edges.begin(), edges.end()), edges.end());
-    for (std::size_t edge = 1; edge < edges.size(); ++edge) {
-        std::size_t chosen = ranges.size();
-        for (std::size_t i = 0; i < ranges.size(); ++i) {
-            const auto& range = ranges[i];
-            if (range.begin > edges[edge - 1] || range.end < edges[edge]) continue;
-            if (chosen == ranges.size() || std::tuple(range.end - range.begin, range.category, i) < std::tuple(ranges[chosen].end - ranges[chosen].begin, ranges[chosen].category, chosen)) chosen = i;
-        }
-        if (chosen != ranges.size()) ticks[chosen] += static_cast<double>(edges[edge] - edges[edge - 1]);
+    std::set<std::tuple<std::uint64_t, std::size_t, std::size_t>> activeRanges;
+    std::uint64_t previous = edges.empty() ? 0 : std::get<0>(edges.front());
+    for (const auto& [at, entering, i] : edges) {
+        if (!activeRanges.empty()) ticks[std::get<2>(*activeRanges.begin())] += static_cast<double>(at - previous);
+        const auto key = std::tuple(ranges[i].end - ranges[i].begin, ranges[i].category, i);
+        if (entering) activeRanges.insert(key); else activeRanges.erase(key);
+        previous = at;
     }
     return ticks;
 }

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/HleProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
@@ -399,6 +400,7 @@ struct VulkanDevice::State {
         // APS5_PROFILE_GPU: the blit's own two timestamps (the [gputime] present-blit class), read
         // when the slot retires, and the swapchain bytes it wrote.
         VkQueryPool queries = VK_NULL_HANDLE;
+        GpuDescriptorProfile::GpuTag descriptorTiming;
         std::uint64_t blitBytes = 0;
     };
     std::vector<PresentSlot> presentSlots;
@@ -558,8 +560,14 @@ struct VulkanDevice::State {
         if (slot.queries != VK_NULL_HANDLE) {
             std::uint64_t stamps[2] = {};
             if (DeviceFunction<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(device, slot.queries, 0, 2, sizeof(stamps), stamps, sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS && stamps[1] > stamps[0]) {
+                GpuDescriptorProfile::EndGpu(slot.descriptorTiming, static_cast<double>(stamps[1] - stamps[0]) * properties.limits.timestampPeriod / 1000, static_cast<double>(stamps[1] - stamps[0]) * properties.limits.timestampPeriod / 1000);
+                slot.descriptorTiming = {};
                 Graphics::Recorder::AddGpuTiming(Graphics::Recorder::CommandClass::PresentBlit, static_cast<double>(stamps[1] - stamps[0]) * properties.limits.timestampPeriod, slot.blitBytes);
             }
+        }
+        if (slot.descriptorTiming.window != nullptr) {
+            GpuDescriptorProfile::EndGpu(slot.descriptorTiming, 0, 0, false);
+            slot.descriptorTiming = {};
         }
         if (!recorder) return;
         const auto afterFlip = recorder->NewestSubmitted() - slot.recorderSerial;
@@ -2680,6 +2688,7 @@ bool VulkanDevice::present(std::uint32_t width, std::uint32_t height, bool opaqu
             if (state->DeviceFunction<PFN_vkCreateQueryPool>("vkCreateQueryPool")(state->device, &info, nullptr, &slot.queries) != VK_SUCCESS) slot.queries = VK_NULL_HANDLE;
         }
         if (slot.queries != VK_NULL_HANDLE) {
+            slot.descriptorTiming = GpuDescriptorProfile::BeginGpu(GuestMemory::CurrentPacket().queue, "present-blit");
             state->DeviceFunction<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, slot.queries, 0, 2);
             state->DeviceFunction<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, slot.queries, 0);
         }

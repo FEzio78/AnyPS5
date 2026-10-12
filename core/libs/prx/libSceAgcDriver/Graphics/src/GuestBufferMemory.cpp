@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -1073,6 +1074,7 @@ void appendBlocks(std::vector<RefreshBlock>& blocks, ImageMirror& mirror, std::u
 
 // Compares the gathered blocks (of one or many mirrors) and counts them.
 void compareBlocks(std::span<const RefreshBlock> blocks) {
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::BdaMirror);
     if (blocks.empty()) return;
     std::uint64_t bytes = 0;
     if (GpuMutexProfile::active != nullptr) for (const auto& block : blocks) bytes += block.length;
@@ -1180,6 +1182,7 @@ std::vector<std::pair<std::size_t, std::uint64_t>> refreshHeapRuns(const GuestBu
 // registered Range object changed (a protection change). Null when the range cannot be mirrored. An
 // existing writable mirror's blocks are appended to `blocks` for the caller's one compare of every
 std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::shared_ptr<const GuestAllocations::Range>& range, std::vector<RefreshBlock>& blocks, bool heap) {
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::BdaMirror);
     auto& state = Mirrors();
     std::shared_ptr<ImageMirror> mirror;
     {
@@ -1998,6 +2001,7 @@ void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
 }
 
 void GuestBufferMemory::AcquireRegistered() {
+    GpuDescriptorProfile::Scope descriptorTiming(GpuDescriptorProfile::BdaLease);
     GpuMutexProfile::Scope mutexTiming(GpuMutexProfile::Acquire);
     Require(!uploaded && regions.empty() && lease.empty() && space == nullptr, "guest allocation lease must precede resource registration");
     ensurePinWaiter();

@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GpuDescriptorProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include <cstdlib>
@@ -30,6 +31,8 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
             std::vector<ShaderRecompiler::MemoryRegion> regions;
 
             std::vector<std::pair<std::uint32_t, std::uint32_t>> liveData;
+            std::optional<GpuDescriptorProfile::Scope> descriptorValidation;
+            descriptorValidation.emplace(GpuDescriptorProfile::Validation);
             const auto waitedBeforeValidate = profile ? Graphics::Recorder::ThreadWaitedMs() : 0.0;
             if (!stampValidate()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DispatchCache);
@@ -85,6 +88,7 @@ void Driver::lookupDispatch(std::uint64_t address, const Submission& submission,
                 }
                 if (current) outcome = EntryOutcome::Equal;
             }
+            descriptorValidation.reset();
             phaseTiming.Phase(PhaseValidate);
             if (profile) {
                 const auto waited = std::min(Graphics::Recorder::ThreadWaitedMs() - waitedBeforeValidate, phaseMs[PhaseValidate]);

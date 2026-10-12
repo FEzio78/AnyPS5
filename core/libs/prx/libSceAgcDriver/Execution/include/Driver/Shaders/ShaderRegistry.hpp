@@ -51,6 +51,7 @@ struct PreparedShaderState {
         std::weak_ptr<const ShaderRegistry> registry;
         std::vector<std::weak_ptr<const ShaderSnapshot>> stages;
     };
+    std::map<std::size_t, std::uint64_t> profileCodeHashes;
     std::vector<Entry> entries;
     std::vector<std::vector<std::uint64_t>> registeredAbis;
     std::vector<GraphicsAbi> graphicsAbis;

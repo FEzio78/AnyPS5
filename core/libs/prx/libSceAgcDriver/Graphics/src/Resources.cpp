@@ -327,6 +327,44 @@ VkImageView RenderTarget::View() const {
     return view;
 }
 
+namespace {
+thread_local std::map<VkCommandBuffer, CommandBatch*> profileBatches;
+}
+
+CommandBatch* CommandBatch::Find(VkCommandBuffer commands) {
+    const auto found = profileBatches.find(commands);
+    return found == profileBatches.end() ? nullptr : found->second;
+}
+
+std::uint32_t CommandBatch::BeginGpuTiming(const char* kind) {
+    if (!GpuDescriptorProfile::Enabled()) return Recorder::NoTiming;
+    if (profileQueries == VK_NULL_HANDLE) {
+        VkQueryPoolCreateInfo info{VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        info.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        info.queryCount = 1024;
+        if (context.Function<PFN_vkCreateQueryPool>("vkCreateQueryPool")(context.device, &info, nullptr, &profileQueries) != VK_SUCCESS) { GpuDescriptorProfile::DroppedGpu(); return Recorder::NoTiming; }
+        context.Function<PFN_vkCmdResetQueryPool>("vkCmdResetQueryPool")(commands, profileQueries, 0, 1024);
+    }
+    if (profileTimings.size() == 512) { GpuDescriptorProfile::DroppedGpu(); return Recorder::NoTiming; }
+    const auto index = static_cast<std::uint32_t>(profileTimings.size());
+    profileTimings.push_back(GpuDescriptorProfile::BeginGpu(GuestMemory::CurrentPacket().queue, kind));
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profileQueries, index * 2);
+    return index;
+}
+
+void CommandBatch::EndGpuTiming(std::uint32_t index) {
+    if (index == Recorder::NoTiming) return;
+    context.Function<PFN_vkCmdWriteTimestamp>("vkCmdWriteTimestamp")(commands, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, profileQueries, index * 2 + 1);
+}
+
+void CommandBatch::readGpuTiming(bool valid) {
+    if (profileTimings.empty()) return;
+    std::vector<std::uint64_t> stamps(profileTimings.size() * 2);
+    if (valid) valid = context.Function<PFN_vkGetQueryPoolResults>("vkGetQueryPoolResults")(context.device, profileQueries, 0, static_cast<std::uint32_t>(stamps.size()), stamps.size() * sizeof(std::uint64_t), stamps.data(), sizeof(std::uint64_t), VK_QUERY_RESULT_64_BIT) == VK_SUCCESS;
+    GpuDescriptorProfile::ResolveGpu(profileTimings, stamps, context.limits.timestampPeriod, valid);
+    profileTimings.clear();
+}
+
 CommandBatch::CommandBatch(const Context& context) : context(context) {
     // Records into the device's one command pool and submits to its queue: device-lock work only.
     GuestMemory::AssertGpuLockHeld("CommandBatch");
@@ -343,6 +381,10 @@ CommandBatch::CommandBatch(const Context& context) : context(context) {
         Check(context.Function<PFN_vkBeginCommandBuffer>("vkBeginCommandBuffer")(commands, &begin), "vkBeginCommandBuffer");
         // Work recorded so far goes first in queue order, so this batch sees its results.
         if (auto* recorder = Recorder::Active(); recorder != nullptr && recorder->Recording()) recorder->Submit();
+        if (GpuDescriptorProfile::Enabled()) {
+            profileBatches.emplace(commands, this);
+            BeginGpuTiming("unclassified");
+        }
     } catch (...) {
         release();
         throw;
@@ -358,6 +400,11 @@ void CommandBatch::release() noexcept {
         auto result = context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence);
         if (result == VK_NOT_READY) result = context.Function<PFN_vkQueueWaitIdle>("vkQueueWaitIdle")(context.queue);
         if (result != VK_SUCCESS && result != VK_ERROR_DEVICE_LOST) std::terminate();
+    }
+    if (GpuDescriptorProfile::Enabled()) {
+        readGpuTiming(submitted && context.Function<PFN_vkGetFenceStatus>("vkGetFenceStatus")(context.device, fence) == VK_SUCCESS);
+        profileBatches.erase(commands);
+        if (profileQueries != VK_NULL_HANDLE) context.Function<PFN_vkDestroyQueryPool>("vkDestroyQueryPool")(context.device, profileQueries, nullptr);
     }
     if (commands) context.Function<PFN_vkFreeCommandBuffers>("vkFreeCommandBuffers")(context.device, context.pool, 1, &commands);
     if (fence) context.Function<PFN_vkDestroyFence>("vkDestroyFence")(context.device, fence, nullptr);
@@ -376,6 +423,7 @@ void CommandBatch::SubmitAndWait() {
 void CommandBatch::Submit() {
     PerformanceTimer timing("Graphics.Submit");
     Require(!submitted, "command batch has already been submitted");
+    if (!profileTimings.empty()) EndGpuTiming(0);
     Check(context.Function<PFN_vkEndCommandBuffer>("vkEndCommandBuffer")(commands), "vkEndCommandBuffer");
     VkSubmitInfo submission{VK_STRUCTURE_TYPE_SUBMIT_INFO};
     submission.commandBufferCount = 1;
@@ -394,6 +442,7 @@ void CommandBatch::Wait() {
     const auto result = context.Function<PFN_vkWaitForFences>("vkWaitForFences")(context.device, 1, &fence, VK_TRUE, 5'000'000'000ULL);
     timing.Mark("fence_wait");
     if (result == VK_SUCCESS || result == VK_ERROR_DEVICE_LOST) pending = false;
+    readGpuTiming(result == VK_SUCCESS);
     Check(result, "vkWaitForFences graphics");
     // Recorded batches preceded this one, so their completions (write-backs) can run now.
     if (auto* recorder = Recorder::Active()) recorder->Reap();

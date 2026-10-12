@@ -129,6 +129,8 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
+    std::uint64_t controlAddress = 0, patternAddress = 0;
+    std::array<std::uint32_t, 2> controlValue{};
     std::unique_lock inputLock(GuestMemory::GpuMutex(), std::defer_lock);
     if (dwordFill) {
         base = dwordFill->base;
@@ -143,12 +145,16 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         recordLabelsForPacket(localDevice.get(), queueId);
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->control), 8)) return false;
         std::array<std::uint32_t, 2> control;
+        if (VulkanDevice::GpuCopyFillHle() && (Graphics::Recorder::SnapshotWriteOverlaps(range->control, 8) || Graphics::Recorder::SnapshotWriteOverlaps(range->source, 4))) { timing.Path("control-pending-kernel"); return false; }
         GuestMemory::Read(range->control, std::as_writable_bytes(std::span(control)), 4);
         const auto count = range->UniformBytes(control[0], control[1]);
         if (!count) return false;
         if (*count == 0) return true;
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(range->source), 4)) return false;
         GuestMemory::Read(range->source, std::as_writable_bytes(std::span(pattern).first(1)), 4);
+        controlAddress = range->control;
+        patternAddress = range->source;
+        controlValue = control;
         std::fill(pattern.begin() + 1, pattern.end(), pattern[0]);
         base = range->destination;
         bytes = *count;
@@ -167,6 +173,47 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         bytes = static_cast<std::size_t>(records * 16u);
         pattern = {userData[4], userData[5], userData[6], userData[7]};
     }
+    if (inputLock.owns_lock() && VulkanDevice::GpuCopyFillHle()) inputLock.unlock();
+    std::shared_ptr<PreparedCopyFill> prepared;
+    if (bytes != 0 && VulkanDevice::GpuCopyFillHle()) {
+        GuestMemory::CheckRange(reinterpret_cast<const void*>(base), bytes, 16, true);
+        prepared = localDevice->PrepareCopyFill(base, 0, bytes);
+        timing.Phase("prepare-access");
+    }
+    if (bytes != 0 && VulkanDevice::GpuCopyFillHle()) {
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
+        std::unique_lock gpuLock(GuestMemory::GpuMutex());
+        timing.Phase("mutex-wait");
+        recordLabelsForPacket(localDevice.get(), queueId);
+        timing.Phase("labels");
+        if (controlAddress != 0) {
+            if (Graphics::Recorder::SnapshotWriteOverlaps(controlAddress, 8) || Graphics::Recorder::SnapshotWriteOverlaps(patternAddress, 4) || !GuestMemory::Accessible(reinterpret_cast<const void*>(controlAddress), 8) || !GuestMemory::Accessible(reinterpret_cast<const void*>(patternAddress), 4)) { timing.Path("control-pending-kernel"); return false; }
+            std::array<std::uint32_t, 2> current;
+            std::uint32_t word;
+            std::memcpy(current.data(), reinterpret_cast<const void*>(controlAddress), 8);
+            std::memcpy(&word, reinterpret_cast<const void*>(patternAddress), 4);
+            if (current != controlValue || word != pattern[0]) { timing.Path("control-changed-kernel"); return false; }
+        }
+        timing.Phase("control-revalidate");
+        const auto coverage = Graphics::StorageTexture::ClassifyFill(base, bytes);
+        const bool keys = coverage.cover == Graphics::StorageTexture::FillCover::Keys && std::all_of(pattern.begin(), pattern.end(), [&](auto word) { return word == (pattern[0] & 0xffu) * 0x01010101u; });
+        if (keys) {
+            Graphics::StorageTexture::NoteKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
+            Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
+        }
+        timing.Phase("keys");
+        const auto stored = localDevice->FillBuffer(base, bytes, pattern, prepared);
+        timing.Phase("device");
+        gpuLock.unlock();
+        if (stored) {
+            noteForeignWriter(base, base + bytes, queueId);
+            timing.Phase("journal");
+            timing.Path("gpu");
+            return true;
+        }
+        timing.Path("unbacked-kernel");
+        return false;
+    }
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     static std::atomic<std::uint64_t> fills{0}, filledBytes{0}, cpuFills{0};
 
@@ -184,7 +231,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     if (bytes != 0) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         timing.Phase("decode-control");
-        std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        std::unique_lock gpuLock(GuestMemory::GpuMutex());
         timing.Phase("mutex-wait");
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto phaseStart = holdStart;
@@ -236,7 +283,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             if (Graphics::StorageTexture::FlushPending(base, bytes, nullptr, "buffer fill", Graphics::PublishScope::PartialUnits)) ++flushed;
         }
         phase(FillFlush);
-        const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern, prepared);
         timing.Path(cleared ? "image" : stored ? "gpu" : "cpu-unbacked");
         phase(FillDevice);
         if (uniformKeysFill && stored && !cleared) {

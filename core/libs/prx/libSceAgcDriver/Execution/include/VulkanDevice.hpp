@@ -23,6 +23,7 @@ class StorageTexture;
 
 // Stage A of a dispatch's resource build (see VulkanDevice::PrepareDispatch); opaque to callers.
 struct PreparedDispatch;
+struct PreparedCopyFill;
 // The unlocked pre-checks of a recipe hit (see VulkanDevice::PrepareRecipe); opaque to callers.
 struct RecipeHit;
 // The record tail shared by an ordinary dispatch and a recipe hit (VulkanDevice::recordDispatch).
@@ -87,7 +88,7 @@ public:
     // batches are retired first, and it waits only for stores a batch's completion makes on the
     // CPU (a copied buffer's write-back, a deferred label). Debug aid: APS5_FILL_SYNC=1 waits for
     // every recorded store over the range.
-    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern);
+    bool FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, const std::shared_ptr<PreparedCopyFill>& prepared = {});
     bool DumpSamplesOnGpu(std::uint64_t address);
     // Copies `bytes` of guest memory from `source` to `destination` (disjoint ranges) in place of the
     // engine's memcpy kernel (Driver.cpp copyBuffer). `path` 0: copied on the CPU at once, when
@@ -142,7 +143,10 @@ public:
         bool readerOpen;
     };
     using CopyWriterNote = std::function<void(std::span<const std::byte> value, std::uint64_t generation)>;
-    CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter);
+    static bool GpuCopyFillHle();
+    std::shared_ptr<PreparedCopyFill> PrepareCopyFill(std::uint64_t destination, std::uint64_t source, std::size_t bytes);
+    const char* RecordCopyFill(const std::shared_ptr<PreparedCopyFill>& prepared, std::span<const std::uint32_t> pattern, std::uint64_t programAddress, const CopyWriterNote& noteWriter);
+    CopyOutcome CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter, const std::shared_ptr<PreparedCopyFill>& prepared = {});
     // APS5_COPY_VERIFY=1 totals: CPU copies verified, whose source bytes changed over the sync (a
     // producer the rule missed), whose destination bytes were overwritten (a store the rule
     // missed), and whose destination an unsignaled batch read in place (the rule's own answer

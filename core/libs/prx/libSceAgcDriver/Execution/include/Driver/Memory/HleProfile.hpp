@@ -12,7 +12,7 @@ namespace AgcDriver {
 
 class HleProfile {
 public:
-    explicit HleProfile(const char* row) : row(row), enabled(std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+    explicit HleProfile(const char* row) : row(row), enabled(Enabled()) {
         if (enabled) started = phaseStart = Clock::now();
     }
     void Phase(const char* name) {
@@ -48,6 +48,7 @@ public:
         std::fprintf(stderr, "%s\n", line.c_str());
     }
 private:
+    static bool Enabled() { static const bool value = std::getenv("APS5_PROFILE_DRAW") != nullptr; return value; }
     using Clock = std::chrono::steady_clock;
     struct Totals {
         std::map<std::string, std::uint64_t> paths;

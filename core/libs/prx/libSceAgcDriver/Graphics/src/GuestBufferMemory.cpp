@@ -1225,7 +1225,7 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         }
     }
     try {
-        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT);
+        mirror->buffer = std::make_shared<Buffer>(context, range->bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT);
     } catch (const std::runtime_error& error) {
         if (heap) throw std::runtime_error(heapMirrorError(*range, heapMirrorsBeside(*range), error.what()));
         std::fprintf(stderr, "[gpu] image mirror of 0x%llx+0x%llx failed: %s; falling back to copies\n", static_cast<unsigned long long>(range->address), static_cast<unsigned long long>(range->bytes), error.what());
@@ -1941,6 +1941,17 @@ GuestBufferMemory::GuestBufferMemory(const Context& context) : context(context) 
 
 bool GuestBufferMemory::WritesOverlap(std::uint64_t address, std::size_t bytes) const {
     return std::any_of(writes.begin(), writes.end(), [&](const auto& range) { return address < range.second && range.first < address + bytes; });
+}
+
+bool GuestBufferMemory::CpuWritesOverlap(std::uint64_t address, std::size_t bytes) const {
+    for (const auto& [begin, end] : writes) {
+        if (address >= end || begin >= address + bytes) continue;
+        const auto* region = owner(begin);
+        if (region == nullptr || region->direct != nullptr || (region->gpuCopy && (region->copiedBack || region->deviceLocal))) continue;
+        if (region->mirror != nullptr && (!region->mirror->writable || (region->mirror->heap && ResidentHeapMirrors()))) continue;
+        return true;
+    }
+    return false;
 }
 
 void GuestBufferMemory::CountAddressBuild(double snapshotsUs) {
@@ -3502,6 +3513,60 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     std::lock_guard lock(state.mutex);
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration};
+}
+
+TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t address, std::size_t bytes, bool writable) {
+    if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {};
+    {
+        auto& mirrors = Mirrors();
+        std::lock_guard lock(mirrors.mutex);
+        if (mirrors.device == context.device) {
+            auto found = mirrors.entries.upper_bound(address);
+            if (found != mirrors.entries.begin()) {
+                const auto& mirror = std::prev(found)->second;
+                const auto lease = mirror->range.lock();
+                if (lease != nullptr && address >= mirror->base && address + bytes <= mirror->base + mirror->bytes && (!writable || mirror->writable) && ((!mirror->heap && !mirror->writable) || (mirror->heap && ResidentHeapMirrors()))) {
+                    return {mirror->buffer->Handle(), mirror->base, lease, mirror, {}};
+                }
+            }
+        }
+    }
+    auto& imports = Imports();
+    std::lock_guard lock(imports.mutex);
+    if (importsStale(context, imports)) return {};
+    const auto* entry = findImport(imports, address, address + bytes);
+    if (entry == nullptr || entry->range == nullptr || (writable && !entry->range->writable)) return {};
+    return {entry->buffer, entry->base, entry->range, {}, {imports.device, imports.epoch, imports.refreshedGeneration}};
+}
+
+bool ValidateTransferBuffer(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("ValidateTransferBuffer");
+    if (buffer.buffer == VK_NULL_HANDLE || buffer.lease == nullptr) return false;
+    if (buffer.mirror == nullptr) return HostImportsUnchanged(context, buffer.imports);
+    auto& mirror = *buffer.mirror;
+    if (!mirror.heap) return !mirror.writable;
+    if (mirror.forgetSerial != GuestMemory::ForgetSerial()) return false;
+    const auto begin = std::max(mirror.base, address / 65536 * 65536);
+    const auto end = std::min(mirror.base + mirror.bytes, (address + bytes + 65535) / 65536 * 65536);
+    GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+    const auto first = static_cast<std::size_t>(address / 65536 - mirror.base / 65536);
+    const auto count = static_cast<std::size_t>((address + bytes - 1) / 65536 - address / 65536 + 1);
+    thread_local std::vector<std::uint8_t> changed, cpu;
+    changed.resize(count);
+    cpu.resize(count);
+    if (!GuestMemory::ChangedBlocks(address, bytes, std::span(mirror.generations).subspan(first, count), changed, cpu)) return false;
+    if (std::any_of(cpu.begin(), cpu.end(), [](auto value) { return value != 0; })) return false;
+    return true;
+}
+
+void NoteTransferWrite(Recorder& recorder, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("NoteTransferWrite");
+    GuestMemory::MarkWritten(address, bytes);
+    if (buffer.mirror != nullptr) {
+        recorder.OnComplete([mirror = buffer.mirror, lease = buffer.lease, address, bytes] {
+            deferMirrorWrite(*mirror, address, address + bytes);
+        });
+    }
 }
 
 }

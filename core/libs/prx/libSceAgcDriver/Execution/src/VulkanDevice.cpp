@@ -1700,8 +1700,133 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
     return true;
 }
 
-bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+struct PreparedCopyFill {
+    Graphics::TransferBuffer destinationBuffer, sourceBuffer;
+    std::uint64_t destination = 0, source = 0;
+    std::size_t bytes = 0;
+};
+
+bool VulkanDevice::GpuCopyFillHle() {
+    static const bool enabled = std::getenv("APS5_NO_GPU_COPY_FILL_HLE") == nullptr;
+    return enabled;
+}
+
+std::shared_ptr<PreparedCopyFill> VulkanDevice::PrepareCopyFill(std::uint64_t destination, std::uint64_t source, std::size_t bytes) {
+    if (!GpuCopyFillHle()) return {};
+    HleProfile timing(source == 0 ? "fill-hle-prepare" : "copy-hle-prepare");
+    auto prepared = std::make_shared<PreparedCopyFill>();
+    prepared->destination = destination;
+    prepared->source = source;
+    prepared->bytes = bytes;
+    const auto context = graphicsContext();
+    prepared->destinationBuffer = Graphics::PrepareTransferBuffer(context, destination, bytes, true);
+    timing.Phase("destination-lookup");
+    if (source != 0) prepared->sourceBuffer = Graphics::PrepareTransferBuffer(context, source, bytes, false);
+    timing.Phase("source-lookup");
+    timing.Path(prepared->destinationBuffer.buffer != VK_NULL_HANDLE && (source == 0 || prepared->sourceBuffer.buffer != VK_NULL_HANDLE) ? "ready" : "lookup-miss");
+    return prepared;
+}
+
+const char* VulkanDevice::RecordCopyFill(const std::shared_ptr<PreparedCopyFill>& prepared, std::span<const std::uint32_t> pattern, std::uint64_t programAddress, const CopyWriterNote& noteWriter) {
+    GuestMemory::AssertGpuLockHeld("RecordCopyFill");
+    const bool fill = !pattern.empty();
+    HleProfile timing(fill ? "fill-hle-record" : "copy-hle-record");
+    const auto refuse = [&](const char* reason) { timing.Path(reason); return reason; };
+    if (!prepared || !state->recorder) return refuse("unprepared");
+    const auto destination = prepared->destination, source = prepared->source;
+    const auto bytes = prepared->bytes;
+    if (bytes == 0 || bytes % (fill ? 16 : 4) != 0 || destination % (fill ? 16 : 4) != 0 || (!fill && source % 4 != 0)) return refuse("shape");
+    if (!fill && source < destination + bytes && destination < source + bytes) return refuse("overlap-kernel");
+    const auto context = graphicsContext();
+    if (!Graphics::ValidateTransferBuffer(context, prepared->destinationBuffer, destination, bytes) || (!fill && !Graphics::ValidateTransferBuffer(context, prepared->sourceBuffer, source, bytes))) return refuse("unbacked-stale-or-cpu-dirty");
+    timing.Phase("revalidate");
+    auto& recorder = *state->recorder;
+    const auto completion = [&](std::uint64_t address) {
+        if (!recorder.PendingWriteOverlaps(address, bytes)) return false;
+        if (Graphics::Recorder::PendingCompletionLabels() != 0 && recorder.PendingLabelIn(address, bytes)) return true;
+        if (std::any_of(state->copiedWriters->begin(), state->copiedWriters->end(), [&](const auto& writer) { return writer->CpuWritesOverlap(address, bytes); })) return true;
+        const auto writers = Graphics::DrawCopiedWriters();
+        return std::any_of(writers->begin(), writers->end(), [&](const auto& writer) { return writer->CpuWritesOverlap(address, bytes); });
+    };
+    if (completion(destination) || (!fill && completion(source))) return refuse("completion-store");
+    timing.Phase("pending-completion");
+    if (!fill) Graphics::StorageTexture::FlushPending(source, bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
+    Graphics::StorageTexture::DiscardPendingInside(destination, bytes);
+    Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, fill ? "buffer fill" : "buffer copy destination", Graphics::PublishScope::PartialUnits);
+    timing.Phase("image-publication");
+    if (!Graphics::ValidateTransferBuffer(context, prepared->destinationBuffer, destination, bytes) || (!fill && !Graphics::ValidateTransferBuffer(context, prepared->sourceBuffer, source, bytes))) return refuse("publication-changed-backing");
+    recorder.Keep(prepared);
+    Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
+    timing.Phase("keep-lease");
+    if (!fill) {
+        recorder.FlushKeyStoresOverlapping(source, bytes);
+        recorder.FlushStoresOverlapping(source, bytes);
+    }
+    recorder.FlushKeyStoresOverlapping(destination, bytes);
+    recorder.FlushStoresOverlapping(destination, bytes);
+    timing.Phase("labels-keys");
+    using CommandClass = Graphics::Recorder::CommandClass;
+    const auto kind = fill ? CommandClass::Fill : CommandClass::Copy;
+    VkAccessFlags covered = 0;
+    const auto commands = recorder.Commands(&covered);
+    const auto classTiming = recorder.BeginGpuTiming(kind);
+    const auto gpuTiming = fill ? 0 : recorder.BeginGpuTiming(programAddress);
+    const std::pair<std::uint64_t, std::uint64_t> read{source, source + bytes}, written{destination, destination + bytes};
+    if (Graphics::Recorder::BarrierValidate()) recorder.NoteAccess(kind, Graphics::Recorder::Access{fill ? std::span<const std::pair<std::uint64_t, std::uint64_t>>{} : std::span(&read, 1), std::span(&written, 1), {}, VK_PIPELINE_STAGE_TRANSFER_BIT});
+    const VkAccessFlags transfer = fill ? VK_ACCESS_TRANSFER_WRITE_BIT : VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    if ((covered & transfer) == transfer && Graphics::Recorder::MergeBarriers()) Graphics::Recorder::CountMerged(kind);
+    else {
+        Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_HOST_WRITE_BIT, transfer);
+        Graphics::Recorder::CountBarriers(kind);
+    }
+    timing.Phase("hazards-leading-barrier");
+    const auto buffer = prepared->destinationBuffer.buffer;
+    const auto offset = destination - prepared->destinationBuffer.base;
+    bool uniform = fill && std::all_of(pattern.begin(), pattern.end(), [&](auto word) { return word == pattern[0]; });
+    const auto copy = context.Resolved(&Graphics::DeviceFunctions::cmdCopyBuffer, "vkCmdCopyBuffer");
+    if (!fill) {
+        const VkBufferCopy region{source - prepared->sourceBuffer.base, offset, bytes};
+        copy(commands, prepared->sourceBuffer.buffer, buffer, 1, &region);
+    } else if (uniform) context.Resolved(&Graphics::DeviceFunctions::cmdFillBuffer, "vkCmdFillBuffer")(commands, buffer, offset, bytes, pattern[0]);
+    else {
+        context.Resolved(&Graphics::DeviceFunctions::cmdUpdateBuffer, "vkCmdUpdateBuffer")(commands, buffer, offset, 16, pattern.data());
+        for (std::size_t done = 16; done < bytes;) {
+            Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_READ_BIT);
+            Graphics::Recorder::CountBarriers(kind);
+            const auto chunk = std::min(done, bytes - done);
+            const VkBufferCopy region{offset, offset + done, chunk};
+            copy(commands, buffer, buffer, 1, &region);
+            done += chunk;
+        }
+    }
+    timing.Phase("command");
+    constexpr VkAccessFlags visible = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_INDIRECT_COMMAND_READ_BIT | VK_ACCESS_HOST_READ_BIT;
+    Graphics::RecordMemoryBarrier(context, commands, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT, visible);
+    Graphics::Recorder::CountBarriers(kind);
+    if (!fill) recorder.EndGpuTiming(gpuTiming, bytes);
+    recorder.EndGpuTiming(classTiming, bytes);
+    recorder.MarkCovered(visible);
+    timing.Phase("trailing-barrier");
+    if (!fill) recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
+    timing.Phase("read-tracking");
+    if (noteWriter) noteWriter({}, 0);
+    timing.Phase("journal");
+    if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(destination, bytes, static_cast<std::uint8_t>(pattern[0]));
+    else recorder.NotePendingWrite(destination, bytes, fill ? Graphics::Recorder::WriterKind::Fill : Graphics::Recorder::WriterKind::Copy);
+    timing.Phase("write-tracking");
+    Graphics::NoteTransferWrite(recorder, prepared->destinationBuffer, destination, bytes);
+    timing.Phase("mark-written");
+    timing.Path(prepared->destinationBuffer.mirror != nullptr || prepared->sourceBuffer.mirror != nullptr ? "gpu-mirror" : uniform ? "gpu-import-uniform" : fill ? "gpu-import-pattern" : "gpu-import");
+    return nullptr;
+}
+
+bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, const std::shared_ptr<PreparedCopyFill>& prepared) {
     HleProfile hle("fill-hle-device");
+    if (GpuCopyFillHle()) {
+        const auto transfer = prepared ? prepared : PrepareCopyFill(address, 0, bytes);
+        if (RecordCopyFill(transfer, pattern, 0, {}) == nullptr) { hle.Path("gpu-prepared"); return true; }
+        hle.Phase("prepared-fallback");
+    }
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
@@ -1946,10 +2071,19 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
     return {copiesAliased.load(std::memory_order_relaxed), copyAliasCreated.load(std::memory_order_relaxed), copyAliasNoSource.load(std::memory_order_relaxed), copyAliasShape.load(std::memory_order_relaxed), copyAliasRefused.load(std::memory_order_relaxed)};
 }
 
-VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
+VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter, const std::shared_ptr<PreparedCopyFill>& prepared) {
     HleProfile hle("copy-hle-device");
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (!state->recorder || bytes == 0) return outcome;
+    if (source < destination + bytes && destination < source + bytes) { outcome.path = 6; hle.Path("overlap-kernel"); return outcome; }
+    if (GpuCopyFillHle()) {
+        if (bytes > gpuMax) { outcome.path = 8; hle.Path("gpu-limit-kernel"); return outcome; }
+        const auto transfer = prepared ? prepared : PrepareCopyFill(destination, source, bytes);
+        if (RecordCopyFill(transfer, {}, programAddress, noteWriter) == nullptr) { outcome.path = 1; hle.Path("gpu-prepared"); return outcome; }
+        hle.Phase("prepared-fallback");
+        cpuMax = 0;
+        knownMax = 0;
+    }
     auto& recorder = *state->recorder;
     // Finished batches were retired by the caller (Driver.cpp copyBuffer, on the graphics worker
     // only, as WriteLabelOnGpu reaps), so their writes neither refuse the CPU copy nor force a wait.

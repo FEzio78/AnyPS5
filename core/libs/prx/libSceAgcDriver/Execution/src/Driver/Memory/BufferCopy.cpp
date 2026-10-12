@@ -122,14 +122,14 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
     timing.Phase("decode");
-    std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    std::unique_lock gpuLock(GuestMemory::GpuMutex());
     timing.Phase("mutex-wait");
     const auto locked = std::chrono::steady_clock::now();
 
     recordLabelsForPacket(localDevice.get(), queueId);
 
     timing.Phase("labels");
-    if (queueId == 0) localDevice->ReapRecorded();
+    if (queueId == 0 && !VulkanDevice::GpuCopyFillHle()) localDevice->ReapRecorded();
     timing.Phase("reap");
 
     const auto labelPending = [&](std::uint64_t address, std::size_t bytes) {
@@ -141,7 +141,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     const bool recordAccessible = GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8);
 
     bool published = false;
-    if (!recordAccessible || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || Graphics::StorageTexture::FlushPending(record, 8, nullptr, "buffer copy count", Graphics::PublishScope::Whole, &published) || published || labelPending(record, 8)) {
+    if (!recordAccessible || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || (VulkanDevice::GpuCopyFillHle() ? Graphics::StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{{record, record + 8}}}) : Graphics::StorageTexture::FlushPending(record, 8, nullptr, "buffer copy count", Graphics::PublishScope::Whole, &published)) || published || labelPending(record, 8)) {
         if (traceCopy()) traceCopyPending(recordAccessible ? "count record" : "inaccessible count record", record, 8, source, destination, 0, localDevice);
         countCopy(CopyRecordPending, 0, started, locked);
         return false;
@@ -159,14 +159,32 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         countCopy(CopyOverlapping, bytes, started, locked);
         return false;
     }
+    std::shared_ptr<PreparedCopyFill> prepared;
+    if (VulkanDevice::GpuCopyFillHle()) {
+        timing.Phase("control-decision");
+        gpuLock.unlock();
+    }
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes, true)) {
         countCopy(CopyInaccessible, bytes, started, locked);
         return false;
     }
 
-    timing.Phase("control-pending-access");
-    const auto outcome = localDevice->CopyBuffer(destination, source, bytes, cpuMax, gpuMax, copyKnownValues() ? KnownValueMaxBytes : 0, programAddress, queueId, [&](std::span<const std::byte> value, std::uint64_t generation) { noteCopyWriter(programAddress, destination, destination + bytes, queueId, value, generation); });
+    timing.Phase("access");
+    if (VulkanDevice::GpuCopyFillHle()) {
+        prepared = localDevice->PrepareCopyFill(destination, source, bytes);
+        timing.Phase("prepare");
+        GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+        gpuLock.lock();
+        timing.Phase("record-mutex-wait");
+        std::array<std::uint32_t, 2> current;
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8) || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || labelPending(record, 8) || Graphics::StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{{record, record + 8}}})) { timing.Path("control-pending-kernel"); return false; }
+        std::memcpy(current.data(), reinterpret_cast<const void*>(record), 8);
+        if (current[0] != count || current[1] != period) { timing.Path("control-changed-kernel"); return false; }
+        timing.Phase("control-revalidate");
+    }
+    const auto outcome = localDevice->CopyBuffer(destination, source, bytes, cpuMax, gpuMax, copyKnownValues() ? KnownValueMaxBytes : 0, programAddress, queueId, [&](std::span<const std::byte> value, std::uint64_t generation) { noteCopyWriter(programAddress, destination, destination + bytes, queueId, value, generation); }, prepared);
     timing.Phase("device");
+    if (gpuLock.owns_lock()) gpuLock.unlock();
     timing.Path(outcome.path == CopyCpu ? "cpu" : outcome.path == CopyGpu ? "gpu" : outcome.path == CopyAliased ? "image" : "kernel");
     countCopy(outcome.path, bytes, started, locked, &outcome);
     if (traceCopy() && bytes <= cpuMax && outcome.path != CopyCpu) traceCopyRefused(outcome, source, destination, bytes, localDevice);

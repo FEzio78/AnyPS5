@@ -91,6 +91,16 @@ struct HostImportsProof {
     std::uint64_t epoch = 0;
     std::uint64_t refreshedGeneration = 0;
 };
+struct TransferBuffer {
+    VkBuffer buffer = VK_NULL_HANDLE;
+    std::uint64_t base = 0;
+    std::shared_ptr<const GuestAllocations::Range> lease;
+    std::shared_ptr<ImageMirror> mirror;
+    HostImportsProof imports;
+};
+TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t address, std::size_t bytes, bool writable);
+bool ValidateTransferBuffer(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes);
+void NoteTransferWrite(Recorder& recorder, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes);
 // Whether the table still matches `proof` (one lock); false for an empty or stale proof.
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof);
 // The table's identity when it is reconciled with the live registry (one lock), else empty.
@@ -231,6 +241,7 @@ public:
     struct AddressSpace;
     void WriteBack();
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const;
+    bool CpuWritesOverlap(std::uint64_t address, std::size_t bytes) const;
     // Guest ranges the shader may write through descriptors, as [begin, end).
     const std::vector<std::pair<std::uint64_t, std::uint64_t>>& Writes() const { return writes; }
     // Whether any written range lives in a copied buffer, so a write-back must run once the GPU is done.

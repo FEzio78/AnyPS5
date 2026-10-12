@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/HleProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferFill.hpp"
 #include "ThreadOwned.hpp"
@@ -124,6 +125,7 @@ void Driver::fillClearCount(const Graphics::StorageTexture::FillCoverage& covera
 bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice) {
     const auto dwordFill = MatchDwordPatternFill(packet, code, userData, compute);
     if (!dwordFill && !matchesFillKernel(code, userData, compute)) return false;
+    HleProfile timing("fill-hle");
     std::uint64_t base;
     std::size_t bytes;
     std::array<std::uint32_t, 4> pattern;
@@ -181,10 +183,13 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     filledBytes += bytes;
     if (bytes != 0) {
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
+        timing.Phase("decode-control");
         std::lock_guard gpuLock(GuestMemory::GpuMutex());
+        timing.Phase("mutex-wait");
         const auto holdStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         auto phaseStart = holdStart;
         const auto phase = [&](FillPhase which) {
+            timing.Phase(fillPhaseNames[which]);
             if (!profile) return;
             const auto now = std::chrono::steady_clock::now();
             fillPhaseMs[which] += std::chrono::duration<double, std::milli>(now - phaseStart).count();
@@ -232,6 +237,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
         phase(FillFlush);
         const bool stored = cleared || localDevice->FillBuffer(base, bytes, pattern);
+        timing.Path(cleared ? "image" : stored ? "gpu" : "cpu-unbacked");
         phase(FillDevice);
         if (uniformKeysFill && stored && !cleared) {
             Graphics::DccKeys filled = Graphics::DccKeys::Mixed;

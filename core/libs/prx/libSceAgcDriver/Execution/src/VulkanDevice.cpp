@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/HleProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GpuMutexProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
@@ -1700,6 +1701,7 @@ bool VulkanDevice::DumpSamplesOnGpu(std::uint64_t address) {
 }
 
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern) {
+    HleProfile hle("fill-hle-device");
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
     // Finished batches are retired first (one fence status check, as WriteLabelOnGpu does): their
@@ -1709,6 +1711,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     if (OpportunisticReap()) recorder.Reap();
     const auto context = graphicsContext();
     const Graphics::HostImport* import = Graphics::HostImportFor(context, address, bytes);
+    hle.Phase("reap-import");
     if (import == nullptr) return false;
     // Earlier recorded work that stores into the range must land before the fill, or it would
     // overwrite the fill later. Stores the GPU makes (direct dispatch writes, GPU labels, earlier
@@ -1784,6 +1787,7 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
         phaseStart = now;
     };
     phase(decideMs);
+    hle.Phase("pending-sync");
     using CommandClass = Graphics::Recorder::CommandClass;
     // A queued DCC key store over the range must land before the fill.
     recorder.FlushKeyStoresOverlapping(address, bytes);
@@ -1875,10 +1879,13 @@ bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::spa
     recorder.EndGpuTiming(timing, bytes);
     recorder.MarkCovered(filledAccess);
     phase(recordMs);
+    hle.Phase("hazards-barriers-record");
     if (uniform && pattern[0] == (pattern[0] & 0xffu) * 0x01010101u) recorder.NotePendingFill(address, bytes, static_cast<std::uint8_t>(pattern[0]));
     else recorder.NotePendingWrite(address, bytes, Graphics::Recorder::WriterKind::Fill);
     GuestMemory::MarkWritten(address, bytes);
     phase(notesMs);
+    hle.Phase("write-tracking-mark");
+    hle.Path(uniform ? "gpu-uniform" : "gpu-pattern");
     return true;
 }
 
@@ -1940,6 +1947,7 @@ VulkanDevice::CopyAliasing VulkanDevice::CopyAliasCounts() {
 }
 
 VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, std::uint64_t source, std::size_t bytes, std::size_t cpuMax, std::size_t gpuMax, std::size_t knownMax, std::uint64_t programAddress, std::uint32_t queue, const CopyWriterNote& noteWriter) {
+    HleProfile hle("copy-hle-device");
     CopyOutcome outcome{2, false, 0, CopyOutcome::None, false, false, 0, 0, 0, 0, false};
     if (!state->recorder || bytes == 0) return outcome;
     auto& recorder = *state->recorder;
@@ -1987,6 +1995,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         return CopyOutcome::None;
     };
     outcome.reason = refusal();
+    hle.Phase("cpu-decision-pending");
     if (outcome.reason == CopyOutcome::SourcePending && waitForSource && queue != 0) {
         // The experiment: only when the producer is the oldest batch in flight (the wait finishes
         // nothing else), never on the frame-critical queue 0, unlocked (this hold is the outermost).
@@ -2006,6 +2015,8 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         if (verify) expected.assign(reinterpret_cast<const std::byte*>(source), reinterpret_cast<const std::byte*>(source) + bytes);
         GuestMemory::StoreOwnBytes(destination, bytes, [&] { std::memcpy(reinterpret_cast<void*>(destination), reinterpret_cast<const void*>(source), bytes); });
         outcome.path = 0;
+        hle.Path("cpu");
+        hle.Phase("cpu-store");
         outcome.sourceSettledBySignal = settledBySignal;
         if (verify) {
             // The rule's reader answer without the fence shortcut: a reader still unsignaled now
@@ -2047,6 +2058,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         }
         outcome.syncMs = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - syncStart).count();
     }
+    hle.Phase("pending-sync");
     // A whole surface copied into another: a device copy between their images, whose results reach
     // the destination's memory through the image's deferred write-back (nothing crosses to host
     // memory for the copy itself).
@@ -2054,8 +2066,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
         noteWriter({}, 0);
         recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
         outcome.path = 3;
+        hle.Path("image");
         return outcome;
     }
+    hle.Phase("image-alias");
     if (bytes > gpuMax) {
         outcome.path = 8;
         return outcome;
@@ -2067,8 +2081,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, "buffer copy destination", Graphics::PublishScope::PartialUnits);
     // Looked up after the sync (its completions' write-backs can refresh the import table and
     // retire an import) and the flushes (which may import memory themselves).
+    hle.Phase("image-flush");
     const Graphics::HostImport* destinationImport = Graphics::HostImportFor(context, destination, bytes);
     const Graphics::HostImport* sourceImport = destinationImport != nullptr ? Graphics::HostImportFor(context, source, bytes) : nullptr;
+    hle.Phase("imports");
     if (destinationImport == nullptr || sourceImport == nullptr) return outcome;
     using CommandClass = Graphics::Recorder::CommandClass;
     // A queued DCC key store over either range must land before the transfer reads or writes it.
@@ -2105,16 +2121,22 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     Graphics::Recorder::CountBarriers(CommandClass::Copy);
     recorder.EndGpuTiming(classTiming, bytes);
     recorder.MarkCovered(copiedAccess);
+    hle.Phase("hazards-barriers-record");
     recorder.NotePendingRead(source, bytes, Graphics::Recorder::ReadKind::CopySource);
+    hle.Phase("read-tracking");
     // The destination's bytes after the transfer are the source's now when nothing recorded,
     // pending or still to land can change the source before the transfer reads it (a CPU store
     // to it in between is a hardware race too): the caller's ring entry carries them, stamped
     // with the generation this store gets, and goes in ahead of the note.
     const auto generation = GuestMemory::MarkWritten(destination, bytes);
+    hle.Phase("mark-written");
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
     noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
+    hle.Phase("journal");
     recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
+    hle.Phase("write-tracking");
+    hle.Path("gpu");
     outcome.path = 1;
     return outcome;
 }

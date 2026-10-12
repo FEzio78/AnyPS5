@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver/Memory/HleProfile.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -93,6 +94,7 @@ bool Driver::knownValueVerify() {
 
 bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<const std::uint32_t> packet, std::span<const std::uint32_t> code, const std::vector<std::uint32_t>& userData, const ShaderRecompiler::ShaderComputeStageInfo& compute, const std::shared_ptr<VulkanDevice>& localDevice, std::uint64_t programAddress) {
     if (!matchesCopyKernel(code, userData, compute)) return false;
+    HleProfile timing("copy-hle");
     const auto started = std::chrono::steady_clock::now();
     static const std::size_t cpuMax = [] {
         if (std::getenv("APS5_NO_CPU_COPY") != nullptr) return std::size_t{0};
@@ -119,12 +121,16 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+    timing.Phase("decode");
     std::lock_guard gpuLock(GuestMemory::GpuMutex());
+    timing.Phase("mutex-wait");
     const auto locked = std::chrono::steady_clock::now();
 
     recordLabelsForPacket(localDevice.get(), queueId);
 
+    timing.Phase("labels");
     if (queueId == 0) localDevice->ReapRecorded();
+    timing.Phase("reap");
 
     const auto labelPending = [&](std::uint64_t address, std::size_t bytes) {
         for (auto dword = address & ~std::uint64_t{3}; dword < address + bytes; dword += 4) {
@@ -158,7 +164,10 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         return false;
     }
 
+    timing.Phase("control-pending-access");
     const auto outcome = localDevice->CopyBuffer(destination, source, bytes, cpuMax, gpuMax, copyKnownValues() ? KnownValueMaxBytes : 0, programAddress, queueId, [&](std::span<const std::byte> value, std::uint64_t generation) { noteCopyWriter(programAddress, destination, destination + bytes, queueId, value, generation); });
+    timing.Phase("device");
+    timing.Path(outcome.path == CopyCpu ? "cpu" : outcome.path == CopyGpu ? "gpu" : outcome.path == CopyAliased ? "image" : "kernel");
     countCopy(outcome.path, bytes, started, locked, &outcome);
     if (traceCopy() && bytes <= cpuMax && outcome.path != CopyCpu) traceCopyRefused(outcome, source, destination, bytes, localDevice);
     if (outcome.path == CopyNotImported || outcome.path == CopyOverGpuMax) return false;

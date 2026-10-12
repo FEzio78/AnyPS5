@@ -140,6 +140,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         const auto range = DecodePatternFillRange(userData, packet);
         if (!range) return false;
         if (range->invocations == 0) return true;
+        if (VulkanDevice::GpuCopyFillHle()) { timing.Path("dynamic-pattern-kernel"); return false; }
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Fill);
         inputLock.lock();
         recordLabelsForPacket(localDevice.get(), queueId);
@@ -204,6 +205,20 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         timing.Phase("keys");
         const auto stored = localDevice->FillBuffer(base, bytes, pattern, prepared);
         timing.Phase("device");
+        if (keys && stored) {
+            Graphics::DccKeys filled = Graphics::DccKeys::Mixed;
+            switch (pattern[0] & 0xffu) {
+                case 0x00: filled = Graphics::DccKeys::Clear0000; break;
+                case 0x40: filled = Graphics::DccKeys::Clear0001; break;
+                case 0x80: filled = Graphics::DccKeys::Clear1110; break;
+                case 0xc0: filled = Graphics::DccKeys::Clear1111; break;
+                case 0x20: filled = Graphics::DccKeys::ClearRegister; break;
+                case 0xff: filled = Graphics::DccKeys::Uncompressed; break;
+                default: break;
+            }
+            if (filled != Graphics::DccKeys::Mixed) Graphics::NoteKeysFillOnGpu(base, bytes, filled);
+        }
+        timing.Phase("key-proof");
         gpuLock.unlock();
         if (stored) {
             noteForeignWriter(base, base + bytes, queueId);

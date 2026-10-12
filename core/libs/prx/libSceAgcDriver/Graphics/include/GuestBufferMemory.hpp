@@ -99,7 +99,7 @@ struct TransferBuffer {
     HostImportsProof imports;
 };
 TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t address, std::size_t bytes, bool writable);
-bool ValidateTransferBuffer(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes);
+const char* TransferBufferRefusal(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes);
 void NoteTransferWrite(Recorder& recorder, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes);
 // Whether the table still matches `proof` (one lock); false for an empty or stale proof.
 bool HostImportsUnchanged(const Context& context, const HostImportsProof& proof);

@@ -3539,13 +3539,13 @@ TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t addre
     return {entry->buffer, entry->base, entry->range, {}, {imports.device, imports.epoch, imports.refreshedGeneration}};
 }
 
-bool ValidateTransferBuffer(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes) {
-    GuestMemory::AssertGpuLockHeld("ValidateTransferBuffer");
-    if (buffer.buffer == VK_NULL_HANDLE || buffer.lease == nullptr) return false;
-    if (buffer.mirror == nullptr) return HostImportsUnchanged(context, buffer.imports);
+const char* TransferBufferRefusal(const Context& context, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("TransferBufferRefusal");
+    if (buffer.buffer == VK_NULL_HANDLE || buffer.lease == nullptr) return "backing-missing";
+    if (buffer.mirror == nullptr) return HostImportsUnchanged(context, buffer.imports) ? nullptr : "import-stale";
     auto& mirror = *buffer.mirror;
-    if (!mirror.heap) return !mirror.writable;
-    if (mirror.forgetSerial != GuestMemory::ForgetSerial()) return false;
+    if (!mirror.heap) return mirror.writable ? "mirror-not-resident" : nullptr;
+    if (mirror.forgetSerial != GuestMemory::ForgetSerial()) return "mirror-forgotten";
     const auto begin = std::max(mirror.base, address / 65536 * 65536);
     const auto end = std::min(mirror.base + mirror.bytes, (address + bytes + 65535) / 65536 * 65536);
     GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
@@ -3554,9 +3554,9 @@ bool ValidateTransferBuffer(const Context& context, const TransferBuffer& buffer
     thread_local std::vector<std::uint8_t> changed, cpu;
     changed.resize(count);
     cpu.resize(count);
-    if (!GuestMemory::ChangedBlocks(address, bytes, std::span(mirror.generations).subspan(first, count), changed, cpu)) return false;
-    if (std::any_of(cpu.begin(), cpu.end(), [](auto value) { return value != 0; })) return false;
-    return true;
+    if (!GuestMemory::ChangedBlocks(address, bytes, std::span(mirror.generations).subspan(first, count), changed, cpu)) return "mirror-cpu-dirty";
+    if (std::any_of(cpu.begin(), cpu.end(), [](auto value) { return value != 0; })) return "mirror-cpu-dirty";
+    return nullptr;
 }
 
 void NoteTransferWrite(Recorder& recorder, const TransferBuffer& buffer, std::uint64_t address, std::size_t bytes) {

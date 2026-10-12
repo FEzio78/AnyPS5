@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
@@ -101,6 +102,7 @@ void RecordDispatch(AgcDriver::VulkanDevice& device, const GuestBlock& input, co
 }
 
 int main() {
+    struct ProfileDrain { ~ProfileDrain() { AgcDriverShutdown_nid_postfix(); } } drain;
     try {
         const auto device = OpenVulkanTestDevice();
         if (!device) return VulkanTestSkipped;
@@ -121,10 +123,11 @@ int main() {
         }
         Require(outcome.path == 1, "copied writer: the copy did not run as a transfer between the host imports (path " + std::to_string(outcome.path) + ")");
         Require(!outcome.synced, "copied writer: a copy of what an address-based dispatch stored through a bound buffer waited for its batch, although no CPU write-back follows it");
-        device->WaitIdle();
+        std::array<std::byte, OutputBytes> observed;
+        AgcDriver::GuestMemory::Read(destination.Address(), observed);
         Require(std::any_of(output.Data(), output.Data() + OutputBytes, [](std::uint8_t byte) { return byte != Fill; }), "copied writer: the dispatch stored nothing");
         for (std::uint32_t offset = 0; offset < OutputBytes; ++offset) {
-            Require(destination.Data()[offset] == output.Data()[offset], "copied writer: copied byte " + std::to_string(offset) + " is " + std::to_string(destination.Data()[offset]) + ", the dispatch stored " + std::to_string(output.Data()[offset]));
+            Require(static_cast<std::uint8_t>(observed[offset]) == output.Data()[offset], "copied writer: copied byte " + std::to_string(offset) + " is " + std::to_string(destination.Data()[offset]) + ", the dispatch stored " + std::to_string(output.Data()[offset]));
         }
         std::puts("copied writer copy tests passed");
         return 0;

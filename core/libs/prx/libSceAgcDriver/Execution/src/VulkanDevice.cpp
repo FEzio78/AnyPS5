@@ -1704,6 +1704,7 @@ struct PreparedCopyFill {
     Graphics::TransferBuffer destinationBuffer, sourceBuffer;
     std::uint64_t destination = 0, source = 0;
     std::size_t bytes = 0;
+    double publicationWaitMs = 0;
 };
 
 bool VulkanDevice::GpuCopyFillHle() {
@@ -1732,13 +1733,16 @@ const char* VulkanDevice::RecordCopyFill(const std::shared_ptr<PreparedCopyFill>
     const bool fill = !pattern.empty();
     HleProfile timing(fill ? "fill-hle-record" : "copy-hle-record");
     const auto refuse = [&](const char* reason) { timing.Path(reason); return reason; };
+    if (!GpuCopyFillHle()) return refuse("opt-out");
+    if (fill ? std::getenv("APS5_FILL_SYNC") != nullptr : std::getenv("APS5_COPY_SYNC") != nullptr) return refuse("debug-sync");
     if (!prepared || !state->recorder) return refuse("unprepared");
     const auto destination = prepared->destination, source = prepared->source;
     const auto bytes = prepared->bytes;
-    if (bytes == 0 || bytes % (fill ? 16 : 4) != 0 || destination % (fill ? 16 : 4) != 0 || (!fill && source % 4 != 0)) return refuse("shape");
+    if ((fill && pattern.size() != 4) || bytes > std::numeric_limits<std::uint64_t>::max() - destination || (!fill && bytes > std::numeric_limits<std::uint64_t>::max() - source) || bytes == 0 || bytes % (fill ? 16 : 4) != 0 || destination % (fill ? 16 : 4) != 0 || (!fill && source % 4 != 0)) return refuse("shape");
     if (!fill && source < destination + bytes && destination < source + bytes) return refuse("overlap-kernel");
     const auto context = graphicsContext();
-    if (!Graphics::ValidateTransferBuffer(context, prepared->destinationBuffer, destination, bytes) || (!fill && !Graphics::ValidateTransferBuffer(context, prepared->sourceBuffer, source, bytes))) return refuse("unbacked-stale-or-cpu-dirty");
+    if (const auto reason = Graphics::TransferBufferRefusal(context, prepared->destinationBuffer, destination, bytes)) return refuse(reason);
+    if (!fill) if (const auto reason = Graphics::TransferBufferRefusal(context, prepared->sourceBuffer, source, bytes)) return refuse(reason);
     timing.Phase("revalidate");
     auto& recorder = *state->recorder;
     const auto completion = [&](std::uint64_t address) {
@@ -1750,11 +1754,15 @@ const char* VulkanDevice::RecordCopyFill(const std::shared_ptr<PreparedCopyFill>
     };
     if (completion(destination) || (!fill && completion(source))) return refuse("completion-store");
     timing.Phase("pending-completion");
+    const auto waitedBeforePublication = Graphics::Recorder::ThreadWaitedMs();
     if (!fill) Graphics::StorageTexture::FlushPending(source, bytes, nullptr, "buffer copy source", Graphics::PublishScope::Whole);
     Graphics::StorageTexture::DiscardPendingInside(destination, bytes);
     Graphics::StorageTexture::FlushPending(destination, bytes, nullptr, fill ? "buffer fill" : "buffer copy destination", Graphics::PublishScope::PartialUnits);
+    prepared->publicationWaitMs = Graphics::Recorder::ThreadWaitedMs() - waitedBeforePublication;
+    if (prepared->publicationWaitMs > 0) timing.Count("publication-wait");
     timing.Phase("image-publication");
-    if (!Graphics::ValidateTransferBuffer(context, prepared->destinationBuffer, destination, bytes) || (!fill && !Graphics::ValidateTransferBuffer(context, prepared->sourceBuffer, source, bytes))) return refuse("publication-changed-backing");
+    if (const auto reason = Graphics::TransferBufferRefusal(context, prepared->destinationBuffer, destination, bytes)) return refuse(reason);
+    if (!fill) if (const auto reason = Graphics::TransferBufferRefusal(context, prepared->sourceBuffer, source, bytes)) return refuse(reason);
     recorder.Keep(prepared);
     Graphics::CountLeaseOutcome(false, recorder.Submissions() + 1);
     timing.Phase("keep-lease");
@@ -1823,9 +1831,10 @@ const char* VulkanDevice::RecordCopyFill(const std::shared_ptr<PreparedCopyFill>
 bool VulkanDevice::FillBuffer(std::uint64_t address, std::size_t bytes, std::span<const std::uint32_t, 4> pattern, const std::shared_ptr<PreparedCopyFill>& prepared) {
     HleProfile hle("fill-hle-device");
     if (GpuCopyFillHle()) {
-        const auto transfer = prepared ? prepared : PrepareCopyFill(address, 0, bytes);
-        if (RecordCopyFill(transfer, pattern, 0, {}) == nullptr) { hle.Path("gpu-prepared"); return true; }
+        const auto transfer = prepared && prepared->destination == address && prepared->source == 0 && prepared->bytes == bytes ? prepared : PrepareCopyFill(address, 0, bytes);
+        if (RecordCopyFill(transfer, pattern, 0, {}) == nullptr) { hle.Path("gpu-prepared"); if (transfer->publicationWaitMs > 0) hle.Count("publication-wait"); return true; }
         hle.Phase("prepared-fallback");
+        if (transfer->destinationBuffer.mirror != nullptr) { hle.Path("mirror-refresh-kernel"); return false; }
     }
     if (!state->recorder || bytes == 0 || bytes % 16 != 0 || address % 16 != 0) return false;
     auto& recorder = *state->recorder;
@@ -2078,9 +2087,10 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     if (source < destination + bytes && destination < source + bytes) { outcome.path = 6; hle.Path("overlap-kernel"); return outcome; }
     if (GpuCopyFillHle()) {
         if (bytes > gpuMax) { outcome.path = 8; hle.Path("gpu-limit-kernel"); return outcome; }
-        const auto transfer = prepared ? prepared : PrepareCopyFill(destination, source, bytes);
-        if (RecordCopyFill(transfer, {}, programAddress, noteWriter) == nullptr) { outcome.path = 1; hle.Path("gpu-prepared"); return outcome; }
+        const auto transfer = prepared && prepared->destination == destination && prepared->source == source && prepared->bytes == bytes ? prepared : PrepareCopyFill(destination, source, bytes);
+        if (RecordCopyFill(transfer, {}, programAddress, noteWriter) == nullptr) { outcome.path = 1; outcome.synced = transfer->publicationWaitMs > 0; outcome.syncMs = transfer->publicationWaitMs; if (outcome.synced) hle.Count("publication-wait"); hle.Path("gpu-prepared"); return outcome; }
         hle.Phase("prepared-fallback");
+        if (transfer->destinationBuffer.mirror != nullptr || transfer->sourceBuffer.mirror != nullptr) { hle.Path("mirror-refresh-kernel"); return outcome; }
         cpuMax = 0;
         knownMax = 0;
     }
@@ -2197,7 +2207,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     // the destination's memory through the image's deferred write-back (nothing crosses to host
     // memory for the copy itself).
     if (AliasCopy(context, destination, source, bytes)) {
-        noteWriter({}, 0);
+        if (noteWriter) noteWriter({}, 0);
         recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
         outcome.path = 3;
         hle.Path("image");
@@ -2266,7 +2276,7 @@ VulkanDevice::CopyOutcome VulkanDevice::CopyBuffer(std::uint64_t destination, st
     hle.Phase("mark-written");
     const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> sourceRange{{{source, source + bytes}}};
     const bool sourceCurrent = bytes <= knownMax && generation != 0 && !recorder.PendingWriteOverlaps(source, bytes) && !recorder.PendingLabelIn(source, bytes) && !completionStoreOverlaps(source) && !Graphics::StorageTexture::AnyPendingOverlaps(sourceRange) && !Graphics::AnyShadowedOverlaps(sourceRange);
-    noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
+    if (noteWriter) noteWriter(sourceCurrent ? std::span(reinterpret_cast<const std::byte*>(source), bytes) : std::span<const std::byte>{}, sourceCurrent ? generation : 0);
     hle.Phase("journal");
     recorder.NotePendingWrite(destination, bytes, Graphics::Recorder::WriterKind::Copy);
     hle.Phase("write-tracking");

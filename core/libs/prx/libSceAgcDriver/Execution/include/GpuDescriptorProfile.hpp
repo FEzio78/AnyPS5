@@ -145,16 +145,19 @@ struct Sample {
     double childrenUs = 0;
 };
 inline thread_local Sample* active = nullptr;
-inline thread_local std::map<std::uint32_t, Row> waits;
+inline std::map<std::uint32_t, Row>& Waits() {
+    static thread_local std::map<std::uint32_t, Row> waits;
+    return waits;
+}
 
 inline void ConsumeOtherWaits(std::uint32_t queue) {
     if (!Enabled()) return;
-    const auto found = waits.find(queue);
-    if (found == waits.end()) return;
+    const auto found = Waits().find(queue);
+    if (found == Waits().end()) return;
     auto& state = Shared();
     std::lock_guard lock(state.mutex);
     CurrentLocked(state, Clock::now())->otherWaits[queue].Merge(found->second);
-    waits.erase(found);
+    Waits().erase(found);
 }
 
 class Invocation {
@@ -189,9 +192,9 @@ public:
     void Dispatched() {
         if (sample.window == nullptr) return;
         ++sample.row.dispatches;
-        if (const auto found = waits.find(sample.queue); found != waits.end()) {
+        if (const auto found = Waits().find(sample.queue); found != Waits().end()) {
             sample.row.Merge(found->second);
-            waits.erase(found);
+            Waits().erase(found);
         }
     }
     void Attempt() { if (sample.window != nullptr) ++sample.row.attempts; }
@@ -230,7 +233,7 @@ public:
     ~Wait() {
         if (!enabled) return;
         const auto us = Microseconds(start);
-        auto& row = waits[queue];
+        auto& row = Waits()[queue];
         row.metrics[landing ? LandingWait : LabelWait].Add(us);
         row.producers[producer].Add(us);
     }

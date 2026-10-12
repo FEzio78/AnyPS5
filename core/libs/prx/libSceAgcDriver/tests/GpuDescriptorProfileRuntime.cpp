@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
         Require(Shared().current->rows.empty());
         Require(Shared().frames == 1 && old->lastFrame == 0);
     } else {
-        Require(Shared().current == nullptr && waits.empty());
+        Require(Shared().current == nullptr && Waits().empty());
     }
     if (argc > 2 && std::string_view(argv[2]) == "bench") {
         constexpr unsigned iterations = 200000;

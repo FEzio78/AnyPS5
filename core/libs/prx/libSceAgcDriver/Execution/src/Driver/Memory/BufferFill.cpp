@@ -184,9 +184,27 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             Graphics::StorageTexture::ClearByKeysFill(base, bytes, static_cast<std::uint8_t>(pattern[0]));
         }
         timing.Phase("keys");
-        const auto stored = localDevice->FillBuffer(base, bytes, pattern, prepared);
+        // A fill over a cached storage image clears the image on the GPU, as the locked path does,
+        // instead of storing the pattern into the import (over PCIe for host memory) for the image
+        // to upload again: discard the results inside, publish the others' over the range, clear.
+        bool cleared = false;
+        if (fillClearEnabled()) {
+            const auto discarded = Graphics::StorageTexture::DiscardPendingInside(base, bytes);
+            const char* refusal = nullptr;
+            if (coverage.image != nullptr) {
+                if (fillClearExactOnly() && (coverage.cover != Graphics::StorageTexture::FillCover::Exact || coverage.others != 0)) {
+                    refusal = "exact only";
+                } else {
+                    Graphics::StorageTexture::FlushPending(base, bytes, coverage.image.get(), "buffer fill", Graphics::PublishScope::PartialUnits);
+                    cleared = coverage.image->FillClear(pattern, coverage.layer, refusal);
+                }
+            }
+            fillClearCount(coverage, bytes, pattern, discarded, cleared, refusal);
+            timing.Phase("image-clear");
+        }
+        const auto stored = cleared || localDevice->FillBuffer(base, bytes, pattern, prepared);
         timing.Phase("device");
-        if (keys && stored) {
+        if (keys && stored && !cleared) {
             Graphics::DccKeys filled = Graphics::DccKeys::Mixed;
             switch (pattern[0] & 0xffu) {
                 case 0x00: filled = Graphics::DccKeys::Clear0000; break;
@@ -204,7 +222,7 @@ bool Driver::fillBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         if (stored) {
             noteForeignWriter(base, base + bytes, queueId);
             timing.Phase("journal");
-            timing.Path("gpu");
+            timing.Path(cleared ? "gpu-image-clear" : "gpu");
             return true;
         }
         timing.Path("unbacked-kernel");

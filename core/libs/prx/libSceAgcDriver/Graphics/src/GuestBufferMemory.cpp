@@ -1572,6 +1572,19 @@ void FlushHeapMirrorWrites(std::uint64_t address, std::size_t bytes, bool force)
     pendingHeapMirrors.store(std::any_of(state.entries.begin(), state.entries.end(), [](const auto& entry) { return !entry.second->pendingWrites.empty(); }), std::memory_order_release);
 }
 
+bool ResidentMirrorWriteOverlaps(std::uint64_t address, std::size_t bytes) {
+    GuestMemory::AssertGpuLockHeld("ResidentMirrorWriteOverlaps");
+    if (!pendingHeapMirrors.load(std::memory_order_acquire)) return false;
+    auto& mirrors = Mirrors();
+    std::lock_guard lock(mirrors.mutex);
+    auto found = mirrors.entries.upper_bound(address);
+    if (found != mirrors.entries.begin()) --found;
+    for (; found != mirrors.entries.end() && found->first < address + bytes; ++found) {
+        for (const auto& [begin, end] : found->second->pendingWrites) if (address < end && begin < address + bytes) return true;
+    }
+    return false;
+}
+
 bool StoreHeapMirrorResults(std::uint64_t address, std::span<const std::byte> current, std::span<const std::byte> original) {
     if (!ResidentHeapMirrors() || GuestMemory::CurrentReadSite() != GuestMemory::ReadSite::MirrorRefresh || current.empty()) return false;
     GuestMemory::AssertGpuLockHeld("StoreHeapMirrorResults");

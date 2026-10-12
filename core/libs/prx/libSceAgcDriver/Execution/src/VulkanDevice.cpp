@@ -1734,7 +1734,8 @@ const char* VulkanDevice::RecordCopyFill(const std::shared_ptr<PreparedCopyFill>
     HleProfile timing(fill ? "fill-hle-record" : "copy-hle-record");
     const auto refuse = [&](const char* reason) { timing.Path(reason); return reason; };
     if (!GpuCopyFillHle()) return refuse("opt-out");
-    if (fill ? std::getenv("APS5_FILL_SYNC") != nullptr : std::getenv("APS5_COPY_SYNC") != nullptr) return refuse("debug-sync");
+    static const bool fillSync = std::getenv("APS5_FILL_SYNC") != nullptr, copySync = std::getenv("APS5_COPY_SYNC") != nullptr;
+    if (fill ? fillSync : copySync) return refuse("debug-sync");
     if (!prepared || !state->recorder) return refuse("unprepared");
     const auto destination = prepared->destination, source = prepared->source;
     const auto bytes = prepared->bytes;

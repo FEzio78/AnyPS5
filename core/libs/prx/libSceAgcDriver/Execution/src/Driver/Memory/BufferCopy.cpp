@@ -3,6 +3,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/UnitShadow.hpp"
 #include <cstdlib>
 #include <cstring>
 #include <functional>
@@ -117,6 +118,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         }
     }
     if (groups[1] != 1 || groups[2] != 1) {
+        timing.Path("shape-kernel");
         countCopy(CopyShape, 0, started, started);
         return false;
     }
@@ -124,7 +126,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     timing.Phase("decode");
     std::unique_lock gpuLock(GuestMemory::GpuMutex());
     timing.Phase("mutex-wait");
-    const auto locked = std::chrono::steady_clock::now();
+    auto locked = std::chrono::steady_clock::now();
 
     recordLabelsForPacket(localDevice.get(), queueId);
 
@@ -140,9 +142,11 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     };
     const bool recordAccessible = GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8);
 
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> controlRange{{{record, record + 8}}};
     bool published = false;
-    if (!recordAccessible || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || (VulkanDevice::GpuCopyFillHle() ? Graphics::StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{{record, record + 8}}}) : Graphics::StorageTexture::FlushPending(record, 8, nullptr, "buffer copy count", Graphics::PublishScope::Whole, &published)) || published || labelPending(record, 8)) {
+    if (!recordAccessible || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || (VulkanDevice::GpuCopyFillHle() ? (Graphics::StorageTexture::AnyPendingOverlaps(controlRange) || Graphics::AnyShadowedOverlaps(controlRange) || Graphics::ResidentMirrorWriteOverlaps(record, 8)) : Graphics::StorageTexture::FlushPending(record, 8, nullptr, "buffer copy count", Graphics::PublishScope::Whole, &published)) || published || labelPending(record, 8)) {
         if (traceCopy()) traceCopyPending(recordAccessible ? "count record" : "inaccessible count record", record, 8, source, destination, 0, localDevice);
+        timing.Path("control-pending-kernel");
         countCopy(CopyRecordPending, 0, started, locked);
         return false;
     }
@@ -152,10 +156,12 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
     const auto bytes = static_cast<std::size_t>(count) * 4u;
 
     if (count == 0 || period < count || groups[0] != (count + 63u) / 64u || count > userData[2] || count > userData[6] || bytes > (16u << 20u) || source % 4 != 0 || destination % 4 != 0 || (record < destination + bytes && destination < record + 8)) {
+        timing.Path("shape-kernel");
         countCopy(CopyShape, bytes, started, locked);
         return false;
     }
     if (source < destination + bytes && destination < source + bytes) {
+        timing.Path("overlap-kernel");
         countCopy(CopyOverlapping, bytes, started, locked);
         return false;
     }
@@ -165,6 +171,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         gpuLock.unlock();
     }
     if (!GuestMemory::Accessible(reinterpret_cast<const void*>(source), bytes) || !GuestMemory::Accessible(reinterpret_cast<const void*>(destination), bytes, true)) {
+        timing.Path("inaccessible-kernel");
         countCopy(CopyInaccessible, bytes, started, locked);
         return false;
     }
@@ -174,10 +181,12 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
         prepared = localDevice->PrepareCopyFill(destination, source, bytes);
         timing.Phase("prepare");
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Copy);
+        const auto recordWaitStart = std::chrono::steady_clock::now();
         gpuLock.lock();
+        locked += std::chrono::steady_clock::now() - recordWaitStart;
         timing.Phase("record-mutex-wait");
         std::array<std::uint32_t, 2> current;
-        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8) || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || labelPending(record, 8) || Graphics::StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{{record, record + 8}}})) { timing.Path("control-pending-kernel"); return false; }
+        if (!GuestMemory::Accessible(reinterpret_cast<const void*>(record), 8) || Graphics::Recorder::SnapshotWriteOverlaps(record, 8) || labelPending(record, 8) || (Graphics::StorageTexture::AnyPendingOverlaps(controlRange) || Graphics::AnyShadowedOverlaps(controlRange) || Graphics::ResidentMirrorWriteOverlaps(record, 8))) { timing.Path("control-pending-kernel"); return false; }
         std::memcpy(current.data(), reinterpret_cast<const void*>(record), 8);
         if (current[0] != count || current[1] != period) { timing.Path("control-changed-kernel"); return false; }
         timing.Phase("control-revalidate");

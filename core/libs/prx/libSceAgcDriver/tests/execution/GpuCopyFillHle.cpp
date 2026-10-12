@@ -216,6 +216,17 @@ int main(int argc, char**) {
             GuestMemory::Read(output.Address(), std::as_writable_bytes(std::span(pixels)));
             for (std::size_t i = 0; i < pixels.size(); ++i) Require(pixels[i] == static_cast<float>((color >> ((i % 4) * 8)) & 255) / 255.0f, "cached image load missed the GPU fill");
         }
+        if (resident) {
+            Fill(*device, source, pattern);
+            {
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                device->WaitIdle();
+                Require(Graphics::ResidentMirrorWriteOverlaps(source.Address(), 8), "completed resident write was treated as current CPU metadata");
+            }
+            Read(source);
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            Require(!Graphics::ResidentMirrorWriteOverlaps(source.Address(), 8), "resident metadata stayed pending after a CPU read");
+        }
         std::puts("GPU copy/fill HLE tests passed");
         return 0;
     } catch (const std::exception& error) {

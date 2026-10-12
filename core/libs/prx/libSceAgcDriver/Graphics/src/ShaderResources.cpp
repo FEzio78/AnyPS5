@@ -933,6 +933,7 @@ std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context
     // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
     // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+    StorageTexture::TraceAliases(resource, guestBytes, "creation");
     if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip, importRefresh)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
@@ -1366,6 +1367,10 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
     PerformanceTimer frameTiming("Resources.Prepare");
     const auto stageStart = std::chrono::steady_clock::now();
     phaseStart = stageStart;
+    aliasProgram = 0;
+    for (const auto& shader : shaders) {
+        if (shader.program != nullptr) aliasProgram ^= shader.program->PipelineVariantId();
+    }
     if (BuildProfiled()) {
         auto& profile = ThreadBuilds();
         if (++profile.builds % 1000 == 0) profile.merge();
@@ -1518,6 +1523,7 @@ void ShaderResources::buildPrepare(std::span<const CompiledShader> shaders, cons
 }
 
 void ShaderResources::buildComplete() {
+    const ImageAliasScope aliasScope(aliasProgram);
     PerformanceTimer frameTiming("Resources.Complete");
     Require(!completed, "cannot update a published descriptor heap");
     const auto stageStart = std::chrono::steady_clock::now();
@@ -2269,6 +2275,7 @@ ShaderResources::OwnRefreshFallback ShaderResources::refreshOwnObjects(std::span
 }
 
 bool ShaderResources::Revalidate(std::span<const CompiledShader> shaders, ProofReport* report) {
+    const ImageAliasScope aliasScope(aliasProgram);
     ImageProfile::Scope imageTiming(ImageProfile::Revalidate, "cached resources", true);
     if (report != nullptr) *report = {ProofPath::Full, ProofFailure::Other};
     if (!reusable || shaders.empty()) return false;
@@ -3641,6 +3648,7 @@ bool SkipWriteBack() {
 }
 
 void ShaderResources::WriteBack() {
+    const ImageAliasScope aliasScope(aliasProgram);
     WriteBackBuffers();
     for (std::size_t index = 0; index < storageTextures.size(); ++index) {
         if (storageWritten[index] && DepthSurfaceAt(storageTextures[index]->Descriptor().baseAddress)) CopyImageToDepthPlane(context, storageTextures[index]->Descriptor(), storageTextures[index]->Image());
@@ -3672,6 +3680,7 @@ MarkTimes& MarkTiming() {
 }
 
 void ShaderResources::MarkGpuWrites(Recorder& recorder, const DispatchBindings* overrides) {
+    const ImageAliasScope aliasScope(aliasProgram);
     static const bool timed = std::getenv("APS5_PROFILE_DRAW") != nullptr;
     auto lap = timed ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const auto elapsed = [&] {

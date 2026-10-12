@@ -26,6 +26,16 @@ class StorageTexture;
 class DeviceBuffer;
 struct HostImport;
 
+class ImageAliasScope {
+public:
+    explicit ImageAliasScope(std::uint64_t program);
+    ~ImageAliasScope();
+    ImageAliasScope(const ImageAliasScope&) = delete;
+    ImageAliasScope& operator=(const ImageAliasScope&) = delete;
+private:
+    std::uint64_t previous;
+};
+
 // The Vulkan format storage images of a guest format use (sRGB formats store as their UNORM form).
 // Throws when the format has no storage form; the query is cached per format (a lookup cost a
 // vkGetPhysicalDeviceFormatProperties call before).
@@ -309,6 +319,7 @@ public:
     // was still current (nothing uploaded).
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
+    static void TraceAliases(const GuestTextureResource& descriptor, std::uint64_t bytes, const char* reason);
     void EnableImportRefresh() { importRefresh = true; }
     void DisableImportRefresh() { importRefresh = false; }
     bool ImportRefreshed() const { return importRefresh; }
@@ -538,6 +549,7 @@ private:
     // Results are on the GPU only (guarded by the pending-write registry lock).
     bool dirty = false;
     std::uint64_t version = 0;
+    std::uint64_t lastWriterProgram = 0;
     // `original` holds the guest bytes; false after a GPU-side clear, which never read them.
     bool originalValid = true;
     bool importRefresh = false;

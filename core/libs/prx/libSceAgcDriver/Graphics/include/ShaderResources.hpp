@@ -492,6 +492,7 @@ private:
     // The compute constructor's shader and captured regions: the caller's objects, valid only until
     // the build (Complete() for a deferred one) is done, and reset then (forgetDeferredInputs).
     CompiledShader deferredCompute{};
+    std::uint64_t aliasProgram = 0;
     std::span<const GuestMemorySnapshot> deferredSnapshots;
     // The deferred build is address-based: everything runs in Complete().
     bool lockedBuild = false;

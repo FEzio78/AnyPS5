@@ -38,6 +38,8 @@ namespace AgcDriver::Graphics {
 
 namespace {
 
+thread_local std::uint64_t aliasProgram = 0;
+
 // APS5_PROFILE_DRAW: accumulate texture setup phases and report every 200 textures.
 struct TextureProfile {
     double allocate = 0, read = 0, gpu = 0, view = 0;
@@ -1535,6 +1537,7 @@ bool StorageTexture::ImportRefreshCurrent() const {
 }
 
 bool StorageTexture::Refresh() {
+    TraceAliases(descriptor, guestBytes, "refresh");
     ImageProfile::Scope imageTiming(ImageProfile::StorageRefresh, "refresh");
     imageTiming.Describe({descriptor.baseAddress, guestBytes, descriptor.format, descriptor.width, descriptor.height});
     const bool profile = LookupOutcomes::Profiled();
@@ -2892,6 +2895,7 @@ bool StorageTexture::keysFillMatches(std::uint64_t address, std::size_t bytes, b
 }
 
 void StorageTexture::MarkDirty() {
+    lastWriterProgram = aliasProgram;
     if (descriptor.dccAddress != 0 && IsDccClear(uploadedKeys) && !IsDccClear(filledKeys)) {
         traceKeyStore("first write", descriptor, guestBytes);
         MarkDccUncompressed(context, descriptor.dccAddress, guestBytes, DccKeyCount(descriptor, guestBytes));
@@ -3915,6 +3919,46 @@ void StorageTexture::blockGenerations(std::vector<std::uint64_t>& generations) c
     for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
         const auto end = layerBegin(layer) + layerBytes(layer);
         for (auto at = layerBegin(layer) & ~(block - 1); at < end; at += block) generations[static_cast<std::size_t>((at - spanBegin) / block)] = layerGeneration[layer];
+    }
+}
+
+ImageAliasScope::ImageAliasScope(std::uint64_t program) : previous(std::exchange(aliasProgram, program)) {}
+
+ImageAliasScope::~ImageAliasScope() {
+    aliasProgram = previous;
+}
+
+void StorageTexture::TraceAliases(const GuestTextureResource& descriptor, std::uint64_t bytes, const char* reason) {
+    static const bool enabled = std::getenv("APS5_TRACE_IMAGE_ALIASES") != nullptr;
+    if (!enabled) return;
+    const auto signature = [](const GuestTextureResource& d) {
+        return std::array<std::uint64_t, 18>{d.baseAddress, d.format, d.width, d.height, d.depthOrLastArray, d.baseArray, d.mipCount, d.baseLevel, d.lastLevel, static_cast<std::uint64_t>(d.tileMode), static_cast<std::uint64_t>(d.dimension), d.pipeBankXor, d.dccAddress, d.allocatedMipCount, d.bcSwizzle, d.minLod, static_cast<std::uint64_t>(d.dstSelX | (d.dstSelY << 8) | (d.dstSelZ << 16) | (d.dstSelW << 24)), static_cast<std::uint64_t>(d.dccAlphaOnMsb | (d.dccPipeAligned << 1))};
+    };
+    const auto describe = [](const char* role, const GuestTextureResource& d, std::uint64_t size) {
+        std::fprintf(stderr, "[image-alias] %s address=0x%llx bytes=%llu format=%u extent=%ux%ux%u layers=%u..%u mips=%u..%u/%u allocated=%u tile=%u xor=%u dimension=%u dcc=0x%llx alpha=%u pipe=%u swizzle=%u,%u,%u,%u bc=%u minLod=%u\n", role, static_cast<unsigned long long>(d.baseAddress), static_cast<unsigned long long>(size), d.format, d.width, d.height, d.dimension == TextureDimension::k3D ? d.depthOrLastArray + 1 : 1, d.baseArray, d.depthOrLastArray, d.baseLevel, d.lastLevel, d.mipCount, d.allocatedMipCount, static_cast<unsigned>(d.tileMode), d.pipeBankXor, static_cast<unsigned>(d.dimension), static_cast<unsigned long long>(d.dccAddress), d.dccAlphaOnMsb, d.dccPipeAligned, d.dstSelX, d.dstSelY, d.dstSelZ, d.dstSelW, d.bcSwizzle, d.minLod);
+    };
+    using Pair = std::tuple<std::array<std::uint64_t, 18>, std::array<std::uint64_t, 18>, std::uint64_t, std::uint64_t>;
+    static std::map<Pair, std::uint64_t> pairs;
+    static std::uint64_t overflow = 0;
+    auto& pending = Pending();
+    std::lock_guard lock(pending.mutex);
+    for (const auto* source : pending.textures) {
+        if (&source->descriptor == &descriptor || !source->pendingUnitInside(descriptor.baseAddress, static_cast<std::size_t>(bytes))) continue;
+        const Pair key{signature(source->descriptor), signature(descriptor), source->lastWriterProgram, aliasProgram};
+        auto it = pairs.find(key);
+        if (it == pairs.end()) {
+            if (pairs.size() == 4096) { ++overflow; continue; }
+            it = pairs.emplace(key, 0).first;
+        }
+        const auto count = ++it->second;
+        if (!std::has_single_bit(count)) continue;
+        const auto& from = source->descriptor;
+        const bool layout = from.tileMode == descriptor.tileMode && from.pipeBankXor == descriptor.pipeBankXor && BytesPerElement(from.format) == BytesPerElement(descriptor.format);
+        const bool shape = from.baseAddress == descriptor.baseAddress && source->guestBytes == bytes && from.width == descriptor.width && from.height == descriptor.height && from.mipCount == descriptor.mipCount && from.depthOrLastArray == descriptor.depthOrLastArray && from.dimension == descriptor.dimension;
+        const char* kind = !layout ? "byte-layout" : !shape ? "subset-or-overlap" : from.format != descriptor.format ? "format" : "descriptor-key";
+        std::fprintf(stderr, "[image-alias] pair count=%llu kind=%s reason=%s producer=0x%llx consumer=0x%llx sourceVersion=%llu pairs=%zu overflow=%llu\n", static_cast<unsigned long long>(count), kind, reason, static_cast<unsigned long long>(source->lastWriterProgram), static_cast<unsigned long long>(aliasProgram), static_cast<unsigned long long>(source->version), pairs.size(), static_cast<unsigned long long>(overflow));
+        describe("source", from, source->guestBytes);
+        describe("destination", descriptor, bytes);
     }
 }
 

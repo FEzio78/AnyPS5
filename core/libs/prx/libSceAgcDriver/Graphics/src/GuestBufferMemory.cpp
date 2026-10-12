@@ -3530,6 +3530,7 @@ HostImportsProof HostImportsIdentity(const Context& context) {
 
 TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t address, std::size_t bytes, bool writable) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return {};
+    TransferBuffer mirrored;
     {
         auto& mirrors = Mirrors();
         std::lock_guard lock(mirrors.mutex);
@@ -3539,10 +3540,18 @@ TransferBuffer PrepareTransferBuffer(const Context& context, std::uint64_t addre
                 const auto& mirror = std::prev(found)->second;
                 const auto lease = mirror->range.lock();
                 if (lease != nullptr && address >= mirror->base && address + bytes <= mirror->base + mirror->bytes && (!writable || mirror->writable) && ((!mirror->heap && !mirror->writable) || (mirror->heap && ResidentHeapMirrors()))) {
-                    return {mirror->buffer->Handle(), mirror->base, lease, mirror, {}};
+                    mirrored = {mirror->buffer->Handle(), mirror->base, lease, mirror, {}};
                 }
             }
         }
+    }
+    if (mirrored.buffer != VK_NULL_HANDLE) {
+        if (mirrored.mirror->heap) {
+            const auto begin = std::max(mirrored.base, address / 65536 * 65536);
+            const auto end = std::min(mirrored.base + mirrored.mirror->bytes, (address + bytes + 65535) / 65536 * 65536);
+            GuestMemory::CollectWrites(begin, static_cast<std::size_t>(end - begin));
+        }
+        return mirrored;
     }
     auto& imports = Imports();
     std::lock_guard lock(imports.mutex);

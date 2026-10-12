@@ -256,6 +256,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        // The color targets' pages are collected before the mutex, as dispatches precollect their
+        // surfaces: the locked target refresh then finds the walk in the worker's collect memo.
+        // APS5_NO_DRAW_TARGET_PRECOLLECT=1 walks them under the mutex as before.
+        static const bool precollectTargets = std::getenv("APS5_NO_DRAW_TARGET_PRECOLLECT") == nullptr;
+        if (precollectTargets) {
+            for (const auto& color : graphics.colors) {
+                if (color.address != 0 && color.bytes != 0) GuestMemory::CollectWrites(color.address, color.bytes);
+            }
+        }
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();

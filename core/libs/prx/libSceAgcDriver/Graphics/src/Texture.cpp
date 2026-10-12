@@ -4199,6 +4199,9 @@ bool StorageTexture::writeAlias() {
     }
     if (gpuAliasPlan.kind != AliasKind::Subset) {
         Require(trackedLayers == source->trackedLayers, "identical alias has different ownership units");
+        originalValid = source->originalValid;
+        original = std::move(source->original);
+        generationBaseline = std::move(source->generationBaseline);
         layerPending = source->layerPending;
         reconcilePending();
         for (std::uint32_t unit = 0; unit < source->trackedLayers; ++unit) source->layerPending[unit] = false;

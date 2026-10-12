@@ -929,12 +929,8 @@ std::shared_ptr<StorageTexture> cachedGuestStorageTexture(const Context& context
         if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         return it->texture;
     }
-    // Results other images hold over this memory reach it before the new image reads it: a hit's
-    // Refresh flushes them, the constructor's upload does not, and a GPU-direct upload reads the
-    // import buffer without the flush hook. The flush is recorded ahead of the upload in the batch.
     if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
     StorageTexture::TraceAliases(resource, guestBytes, "creation");
-    if (StorageTexture::FlushPending(resource.baseAddress, static_cast<std::size_t>(guestBytes), nullptr, "storage image creation", PublishScope::None) && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
     CachedStorageTexture entry{key, mip, std::make_shared<StorageTexture>(context, *context.detiler, resource, mip, importRefresh)};
     // The constructor's upload may have recorded into the open batch (a GPU clear, a direct
     // detile) before the image could keep itself (no weak_from_this yet): the batch keeps it here,

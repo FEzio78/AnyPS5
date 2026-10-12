@@ -173,7 +173,7 @@ public:
     // any unit was: a reader of the import must sync for a publish as for a store. Only images
     // with a pending unit inside the range are stored (APS5_NO_FLUSH_PRETEST=1 lists every
     // overlapping pending image, as before).
-    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr);
+    static bool FlushPending(std::uint64_t address, std::size_t bytes, const StorageTexture* except = nullptr, const char* reason = "memory access", PublishScope scope = PublishScope::Whole, bool* published = nullptr, const StorageTexture* aliasConsumer = nullptr);
     static void FlushAllPending(const char* reason);
     static bool StoreAtFlipRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
@@ -320,6 +320,20 @@ public:
     // Keeps the image current with guest memory (see GuestMemory::CollectWrites).
     bool Refresh();
     static void TraceAliases(const GuestTextureResource& descriptor, std::uint64_t bytes, const char* reason);
+    enum class AliasKind { Identical, Format, Subset, Layout };
+    struct AliasPlan {
+        AliasKind kind = AliasKind::Layout;
+        std::vector<VkImageCopy> regions;
+    };
+    struct AliasCounts {
+        std::array<std::uint64_t, 4> gpu{};
+        std::array<std::uint64_t, 4> guest{};
+        std::uint64_t reused = 0;
+        std::uint64_t subsetWrites = 0;
+    };
+    static AliasPlan PlanAlias(const GuestTextureResource& source, const GuestTextureResource& destination);
+    static AliasCounts AliasCounters();
+    static bool GpuAliasHandoffEnabled();
     void EnableImportRefresh() { importRefresh = true; }
     void DisableImportRefresh() { importRefresh = false; }
     bool ImportRefreshed() const { return importRefresh; }
@@ -411,6 +425,10 @@ private:
     bool refreshProved();
     void takeRefreshProof(bool aliased);
     bool otherPendingOverlaps() const;
+    bool handoffAlias(bool discard = false);
+    bool servedByAlias(const StorageTexture* source) const;
+    void copyAlias(StorageTexture& source, std::span<const VkImageCopy> regions, bool discard = false);
+    bool writeAlias();
     // Marks `count` tracked layers from `first` pending and registers the image (MarkDirty's
     // registration; APS5_EAGER_WRITEBACK=1 stores at once instead).
     void markLayersPending(std::uint32_t first, std::uint32_t count);
@@ -528,6 +546,9 @@ private:
     // (the resource cache's serial memo) hold only while this image's version does, so the next
     // write here bumps the pending serial although the image was pending already.
     bool lent = false;
+    std::weak_ptr<StorageTexture> gpuAliasSource;
+    std::uint64_t gpuAliasVersion = 0;
+    AliasPlan gpuAliasPlan;
     VkImage image = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize memoryBytes = 0;

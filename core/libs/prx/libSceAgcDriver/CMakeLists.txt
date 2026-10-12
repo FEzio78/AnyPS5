@@ -253,6 +253,10 @@ set_target_properties(libSceAgcDriver PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(libSceAgcDriver)
 
 if(BUILD_TESTING)
+    add_test_executable(agc_gpu_descriptor_profile_tests tests/GpuDescriptorProfile.cpp)
+    target_include_directories(agc_gpu_descriptor_profile_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test(NAME agc_gpu_descriptor_profile COMMAND agc_gpu_descriptor_profile_tests)
+
     add_test_executable(agc_write_watch_coverage_tests tests/WriteWatchCoverage.cpp)
     target_include_directories(agc_write_watch_coverage_tests PRIVATE ${LIBS_INCLUDE_DIR})
     target_link_libraries(agc_write_watch_coverage_tests PRIVATE libc)

@@ -231,11 +231,7 @@ void Driver::execute(const Submission& submission) {
             flipHold.Release();
             submission.flips.at(cursor)->GpuReady(frame);
         } else if (opcode == 0x15 || opcode == 0x16) {
-            // A direct dispatch reads guest memory only through the capture hooks, which sync on the
-            // pending writes they overlap: its deferred waits on recorded labels need not land.
-            // APS5_NO_LAND_WAITS_BEFORE_DIRECT=1 (experiment) skips the landing for direct dispatches.
-            static const bool skipDirectLanding = std::getenv("APS5_NO_LAND_WAITS_BEFORE_DIRECT") != nullptr;
-            if (opcode == 0x16 || !skipDirectLanding) landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue);
             currentPacketOffset() = cursor;
             if (gateOpened()) {
                 gateOpened() = false;
@@ -263,8 +259,7 @@ void Driver::execute(const Submission& submission) {
                 }
             }
         } else if (drawPacket) {
-            static const bool skipDrawLanding = std::getenv("APS5_NO_LAND_WAITS_BEFORE_DRAW") != nullptr;
-            if (!skipDrawLanding) landPendingWaits(submission.queue);
+            landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
                 static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;

@@ -20,6 +20,7 @@ class IRenderingWait {
 public:
     virtual ~IRenderingWait() = default;
     virtual void Wait() = 0;
+    virtual bool Poll() { Wait(); return true; }
 };
 
 struct FlipInfo {

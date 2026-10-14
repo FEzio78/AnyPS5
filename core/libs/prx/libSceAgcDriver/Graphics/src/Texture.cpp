@@ -1016,6 +1016,7 @@ struct PendingWrites {
 // the store runs after the lock is released, like every other flush site.
 bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end);
 void UnwatchStoreHook(std::uint64_t address, std::uint64_t end);
+void EnsureUnwatchHooks();
 
 PendingWrites& Pending() {
     static PendingWrites pending;
@@ -1034,7 +1035,8 @@ void EnsureUnwatchHooks() {
 }
 
 bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end) {
-    return StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{address, end}});
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, end}}};
+    return StorageTexture::AnyPendingOverlaps(range);
 }
 
 void UnwatchStoreHook(std::uint64_t address, std::uint64_t end) {

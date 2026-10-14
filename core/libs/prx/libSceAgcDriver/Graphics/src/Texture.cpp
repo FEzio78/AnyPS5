@@ -1193,9 +1193,31 @@ struct PendingWrites {
     std::vector<StorageTexture*> flushing;
 };
 
+bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end);
+void UnwatchStoreHook(std::uint64_t address, std::uint64_t end);
+void EnsureUnwatchHooks();
+
 PendingWrites& Pending() {
     static PendingWrites pending;
+    EnsureUnwatchHooks();
     return pending;
+}
+
+void EnsureUnwatchHooks() {
+    static const bool registered = [] {
+        GuestMemory::SetUnwatchHooks(&UnwatchPendingHook, &UnwatchStoreHook);
+        return true;
+    }();
+    static_cast<void>(registered);
+}
+
+bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, end}}};
+    return StorageTexture::AnyPendingOverlaps(range);
+}
+
+void UnwatchStoreHook(std::uint64_t address, std::uint64_t end) {
+    StorageTexture::FlushPending(address, static_cast<std::size_t>(end - address), nullptr, "range left the write watch");
 }
 
 // See StorageTexture::PendingSerial: bumped after every mutation of the registry above.

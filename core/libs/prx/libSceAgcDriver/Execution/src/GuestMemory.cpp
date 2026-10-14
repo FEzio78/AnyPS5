@@ -95,6 +95,8 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+std::atomic<bool (*)(std::uint64_t, std::uint64_t)> unwatchPendingHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> unwatchHook{nullptr};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1243,9 +1245,15 @@ void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     beforeUnwatch(address, bytes);
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
+    const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+    const bool pendingOverRange = pendingHook != nullptr && pendingHook(address, address + bytes);
     unwatchLocked(tracker, address, bytes);
+    lock.unlock();
+    if (pendingOverRange) {
+        if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(address, address + bytes);
+    }
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {
@@ -1282,8 +1290,14 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     }
     if (!imported) return false;
     if (!staysWatched) {
+        const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+        const bool pendingOverRange = pendingHook != nullptr && pendingHook(first, stop);
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, address, bytes);
+        lock.unlock();
+        if (pendingOverRange) {
+            if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(first, stop);
+        }
         return true;
     }
     const WindowCopy window{first, saved};
@@ -1959,6 +1973,13 @@ unsigned long long CodeOffset(const void* address) {
 namespace {
 std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 }
+
+void SetUnwatchHooks(bool (*pending)(std::uint64_t, std::uint64_t), void (*store)(std::uint64_t, std::uint64_t)) {
+    unwatchPendingHook.store(pending, std::memory_order_release);
+    unwatchHook.store(store, std::memory_order_release);
+}
+
+std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);

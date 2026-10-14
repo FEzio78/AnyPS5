@@ -1,0 +1,24 @@
+
+Microsoft (R) Windows Debugger Version 10.0.22621.755 AMD64
+Copyright (c) Microsoft Corporation. All rights reserved.
+
+
+Loading Dump File [D:\Apps-Bats\Hermes-Lab\AnyPS5\repo\build\core\libs\libs\libSceAgcDriver.prx]
+Symbol search path is: srv*
+Executable search path is: 
+ModLoad: 00000002`98e10000 00000002`9a0a0000   D:\Apps-Bats\Hermes-Lab\AnyPS5\repo\build\core\libs\libs\libSceAgcDriver.prx
+libSceAgcDriver+0x12ef:
+00000002`98e112ef 55              push    rbp
+0:000> cdb: Reading initial command 'ln 0x6240; ln 0x3533; ln 0x1719; ln 0x60; q'
+quit:
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\atlmfc.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\ObjectiveC.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\concurrency.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\cpp_rest.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\stl.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Data.Json.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Geolocation.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Devices.Sensors.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\Windows.Media.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\windows.natvis'
+NatVis script unloaded from 'C:\Program Files\Windows Kits\10\Debuggers\x64\Visualizers\winrt.natvis'

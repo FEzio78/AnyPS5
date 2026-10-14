@@ -201,7 +201,23 @@ void Driver::execute(const Submission& submission) {
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
-            timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            // The rendering wait is a GPU-side buffer-reuse semaphore on hardware: the command
+            // processor never stalls on it. Blocking the queue worker here deadlocks the whole
+            // pipeline when the presenter's input (the flip request this worker must still queue
+            // through GpuReady) is gated on the very worker that is parked: the game's render
+            // threads then fill the flip queue behind WaitForFlipRoom and nothing advances.
+            // Park the wait only when explicitly asked (APS5_SYNC_FLIP), like the flip path
+            // below; otherwise poll it off the worker so the submission keeps making progress.
+            static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
+            if (syncFlip) {
+                timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            } else {
+                auto& renderingWait = submission.renderingWaits.at(cursor);
+                while (!renderingWait->Poll()) {
+                    CheckFailure();
+                    PollSleep();
+                }
+            }
         } else if (header == FlipPacketHeader) {
             CheckFailure();
             std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;

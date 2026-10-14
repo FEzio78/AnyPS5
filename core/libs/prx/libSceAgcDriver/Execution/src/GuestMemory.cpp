@@ -86,6 +86,10 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// Set by the graphics layer (SetUnwatchHooks): the pending check ImportWatched's !staysWatched
+// path runs under the tracker lock, and the store it runs after the lock is released.
+std::atomic<bool (*)(std::uint64_t, std::uint64_t)> unwatchPendingHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> unwatchHook{nullptr};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1228,11 +1232,14 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
         // only its pending mutex), store them while the range is still watched, then unwatch.
         // The store runs after the tracker lock is released, like every other flush site, because
         // the store path collects writes and takes the tracker lock itself.
-        const bool pendingOverRange = unwatchPendingHook.load(std::memory_order_acquire) != nullptr && unwatchPendingHook.load(std::memory_order_relaxed)(first, stop);
+        const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+        const bool pendingOverRange = pendingHook != nullptr && pendingHook(first, stop);
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, address, bytes);
         lock.unlock();
-        if (pendingOverRange && const auto hook = unwatchHook.load(std::memory_order_acquire)) hook(first, stop);
+        if (pendingOverRange) {
+            if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(first, stop);
+        }
         return true;
     }
     const WindowCopy window{first, saved};
@@ -1833,11 +1840,6 @@ std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);
-}
-
-namespace {
-std::atomic<bool (*)(std::uint64_t, std::uint64_t)> unwatchPendingHook{nullptr};
-std::atomic<void (*)(std::uint64_t, std::uint64_t)> unwatchHook{nullptr};
 }
 
 void SetUnwatchHooks(bool (*pending)(std::uint64_t, std::uint64_t), void (*store)(std::uint64_t, std::uint64_t)) {

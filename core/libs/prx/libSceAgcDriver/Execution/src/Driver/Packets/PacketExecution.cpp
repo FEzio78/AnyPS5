@@ -202,7 +202,16 @@ void Driver::execute(const Submission& submission) {
         if (!waitPacket) ++packetsInFlight;
         recent.Record(cursor);
         if (header == RenderingWaitPacketHeader) {
-            timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            static const bool syncFlip = std::getenv("APS5_SYNC_FLIP") != nullptr;
+            if (syncFlip) {
+                timed(&WorkerProfile::waitMs, [&] { submission.renderingWaits.at(cursor)->Wait(); });
+            } else {
+                auto& renderingWait = submission.renderingWaits.at(cursor);
+                while (!renderingWait->Poll()) {
+                    CheckFailure();
+                    PollSleep();
+                }
+            }
         } else if (header == FlipPacketHeader) {
             CheckFailure();
             std::uint64_t batchesAtFlip = 0, unsignaledAtFlip = 0;

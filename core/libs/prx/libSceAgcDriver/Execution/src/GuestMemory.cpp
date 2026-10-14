@@ -1199,9 +1199,21 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
+    // Pending storage results over a range that leaves the write watch have no saved guest
+    // bytes, and storing them later throws (docs/dev/debt/libSceAgcDriver.md: unimplemented).
+    // Ask the graphics layer whether any result is pending over the range (the check takes only
+    // its pending mutex), store them while the range is still watched, then unwatch. The store
+    // runs after the tracker lock is released, like every other flush site, because the store
+    // path collects writes and takes the tracker lock itself.
+    const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+    const bool pendingOverRange = pendingHook != nullptr && pendingHook(address, address + bytes);
     unwatchLocked(tracker, address, bytes);
+    lock.unlock();
+    if (pendingOverRange) {
+        if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(address, address + bytes);
+    }
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched) {

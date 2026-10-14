@@ -188,6 +188,12 @@ unsigned long long CodeOffset(const void* address);
 // calls FlushGpuWrites itself.
 void SetFlushHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 void SetReadGuard(void (*guard)(std::uint64_t address, std::size_t bytes));
+// A range that leaves the write watch while storage results are pending over it has no saved
+// guest bytes and storing those results later throws. The graphics layer registers a pair: a
+// pending check that runs under the tracker lock (it must take no lock this interface holds)
+// and a store that runs after the lock is released. ImportWatched's !staysWatched path calls
+// both around the unwatch; without them the check is skipped and the store never runs.
+void SetUnwatchHooks(bool (*pending)(std::uint64_t address, std::uint64_t end), void (*store)(std::uint64_t address, std::uint64_t end));
 void FlushGpuWrites(std::uint64_t address, std::size_t bytes);
 // Moves with every ForgetPages call (the libc invalidator: memory unmapped or re-registered): odd
 // while the call stores its page states, moved past it after, so a reader that loads an even

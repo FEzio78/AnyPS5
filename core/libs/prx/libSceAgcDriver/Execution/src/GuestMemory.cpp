@@ -2,7 +2,6 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/WriteWatchCoverage.hpp"
-#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
@@ -1224,16 +1223,16 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     if (!import()) return false;
     if (!staysWatched) {
         // Pending storage results over a range that leaves the write watch have no saved guest
-        // bytes, and storing them later throws (docs/dev/debt/libSceAgcDriver.md). Store them
-        // now, while the range is still watched and the block stamps still decide the keep
-        // blocks. The check runs under the tracker lock (it takes only the pending mutex); the
-        // store itself runs after the lock is released, like every other flush site, because the
-        // store path collects writes and needs the tracker lock itself.
-        const bool pendingOverRange = StorageTexture::AnyPendingOverlaps(std::array<std::pair<std::uint64_t, std::uint64_t>, 1>{{first, stop}});
+        // bytes, and storing them later throws (docs/dev/debt/libSceAgcDriver.md: unimplemented).
+        // Ask the graphics layer whether any result is pending over the range (the check takes
+        // only its pending mutex), store them while the range is still watched, then unwatch.
+        // The store runs after the tracker lock is released, like every other flush site, because
+        // the store path collects writes and takes the tracker lock itself.
+        const bool pendingOverRange = unwatchPendingHook.load(std::memory_order_acquire) != nullptr && unwatchPendingHook.load(std::memory_order_relaxed)(first, stop);
         if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
         unwatchLocked(tracker, address, bytes);
         lock.unlock();
-        if (pendingOverRange) StorageTexture::FlushPending(first, static_cast<std::size_t>(stop - first), nullptr, "range left the write watch");
+        if (pendingOverRange && const auto hook = unwatchHook.load(std::memory_order_acquire)) hook(first, stop);
         return true;
     }
     const WindowCopy window{first, saved};
@@ -1834,6 +1833,16 @@ std::atomic<void (*)(std::uint64_t, std::size_t)> flushHook{nullptr};
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);
+}
+
+namespace {
+std::atomic<bool (*)(std::uint64_t, std::uint64_t)> unwatchPendingHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> unwatchHook{nullptr};
+}
+
+void SetUnwatchHooks(bool (*pending)(std::uint64_t, std::uint64_t), void (*store)(std::uint64_t, std::uint64_t)) {
+    unwatchPendingHook.store(pending, std::memory_order_release);
+    unwatchHook.store(store, std::memory_order_release);
 }
 
 std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};

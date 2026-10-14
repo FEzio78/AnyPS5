@@ -117,6 +117,10 @@ std::atomic<std::uint64_t> collectDirtyRuns{0};
 #endif
 std::atomic<std::uint64_t> trackerWaits{0};
 std::atomic<std::uint64_t> trackerAcquisitions{0};
+// Set by the graphics layer (SetUnwatchHooks): the pending check ImportWatched's !staysWatched
+// path runs under the tracker lock, and the store it runs after the lock is released.
+std::atomic<bool (*)(std::uint64_t, std::uint64_t)> unwatchPendingHook{nullptr};
+std::atomic<void (*)(std::uint64_t, std::uint64_t)> unwatchHook{nullptr};
 std::uintptr_t PagesBase();
 std::size_t PagesSize();
 std::uintptr_t ImagePagesBase();
@@ -1411,9 +1415,21 @@ void unwatchLocked(WriteTracker& tracker, std::uint64_t address, std::size_t byt
 void Unwatch(std::uint64_t address, std::size_t bytes) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return;
     auto& tracker = Tracker();
-    const auto lock = lockTracker(tracker);
+    auto lock = lockTracker(tracker);
     tracker.initialize();
+    // Pending storage results over a range that leaves the write watch have no saved guest
+    // bytes, and storing them later throws (docs/dev/debt/libSceAgcDriver.md: unimplemented).
+    // Ask the graphics layer whether any result is pending over the range (the check takes only
+    // its pending mutex), store them while the range is still watched, then unwatch. The store
+    // runs after the tracker lock is released, like every other flush site, because the store
+    // path collects writes and takes the tracker lock itself.
+    const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+    const bool pendingOverRange = pendingHook != nullptr && pendingHook(address, address + bytes);
     unwatchLocked(tracker, address, bytes);
+    lock.unlock();
+    if (pendingOverRange) {
+        if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(address, address + bytes);
+    }
 }
 
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import) {
@@ -1431,7 +1447,19 @@ bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function
     const bool covered = tracker.covers(first, static_cast<std::size_t>(stop - first));
     const bool before = covered && walkWrites(tracker, first, stop, StampKind::Cpu, true);
     if (!import()) return false;
+    // Pending storage results over a range that leaves the write watch have no saved guest bytes,
+    // and storing them later throws (docs/dev/debt/libSceAgcDriver.md: unimplemented). Ask the
+    // graphics layer whether any result is pending over the range (the check takes only its
+    // pending mutex), store them while the range is still watched, then unwatch. The store runs
+    // after the tracker lock is released, like every other flush site, because the store path
+    // collects writes and takes the tracker lock itself.
+    const auto pendingHook = unwatchPendingHook.load(std::memory_order_acquire);
+    const bool pendingOverRange = pendingHook != nullptr && pendingHook(first, stop);
     if (!before || !walkWrites(tracker, first, stop, StampKind::ImportWindow, true)) unwatchLocked(tracker, first, static_cast<std::size_t>(stop - first));
+    lock.unlock();
+    if (pendingOverRange) {
+        if (const auto storeHook = unwatchHook.load(std::memory_order_acquire)) storeHook(first, stop);
+    }
     return true;
 }
 
@@ -2032,6 +2060,13 @@ bool equalsCommittedBytes(std::uint64_t address, std::span<const std::byte> byte
 }
 
 }
+
+void SetUnwatchHooks(bool (*pending)(std::uint64_t, std::uint64_t), void (*store)(std::uint64_t, std::uint64_t)) {
+    unwatchPendingHook.store(pending, std::memory_order_release);
+    unwatchHook.store(store, std::memory_order_release);
+}
+
+std::atomic<void (*)(std::uint64_t, std::size_t)> readGuard{nullptr};
 
 void SetFlushHook(void (*hook)(std::uint64_t, std::size_t)) {
     flushHook.store(hook, std::memory_order_release);

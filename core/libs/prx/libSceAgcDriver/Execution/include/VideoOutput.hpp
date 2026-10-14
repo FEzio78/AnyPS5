@@ -23,7 +23,8 @@ public:
     // Non-blocking completion check for callers that must not park (the queue worker polls
     // this so a rendering wait cannot deadlock the submission pipeline). Returns true when
     // the wait is satisfied or the output is closing/failed; Wait() must then return at once.
-    virtual bool Poll() = 0;
+    // The default parks in Wait() for implementations that have no cheaper check.
+    virtual bool Poll() { Wait(); return true; }
 };
 
 struct FlipInfo {

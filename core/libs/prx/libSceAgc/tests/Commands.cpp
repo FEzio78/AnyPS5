@@ -1,6 +1,7 @@
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include "prx/libSceAgc/Command/include/Memory.hpp"
 #include "prx/libSceAgc/Command/include/RegisterDefaults.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 
 #include <algorithm>
@@ -8,6 +9,8 @@
 #include <cstdio>
 #include <stdexcept>
 #include <cstring>
+#include <memory>
+#include <span>
 #include <string>
 
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbEventWrite(CommandBuffer* buf, std::uint8_t eventType, const volatile void* address);
@@ -47,6 +50,10 @@ extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, std::uint32_t shaderType, const volatile void* indirectBaseAddr);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer* buf, std::uint32_t indexCount);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexSize(CommandBuffer* buf, std::uint8_t indexSize, std::uint8_t cachePolicy);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexIndirectArgs(CommandBuffer* buf, const volatile void* attributes, std::uint16_t attributeIndex);
+extern "C" std::uint32_t APS5_VABI sceAgcDcbSetIndexIndirectArgsGetSize();
 extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
 extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
@@ -334,6 +341,67 @@ void testIndirectBase() {
     const auto before = storage.words;
     expectFailure([&] { sceAgcDcbSetBaseIndirectArgs(&storage.buffer, 0, reinterpret_cast<const volatile void*>(address + 4)); });
     check(storage.words == before, "misaligned indirect base modified packet memory");
+}
+
+AgcDriver::Pm4::DrawParameters resolveIndirectDraw(const Storage& storage, const std::uint32_t* draw) {
+    auto queue = std::make_unique<AgcDriver::QueueState>();
+    for (const auto* packet = storage.words.data(); packet != draw; packet += AgcDriver::Pm4::PacketWords(*packet)) {
+        const std::span<const std::uint32_t> words(packet, AgcDriver::Pm4::PacketWords(*packet));
+        AgcDriver::Pm4::Validate(words, 0);
+        AgcDriver::Pm4::Execute(words, *queue);
+    }
+    const auto resolved = AgcDriver::Pm4::ResolveDraw(std::span<const std::uint32_t>(draw, AgcDriver::Pm4::PacketWords(*draw)), *queue);
+    check(resolved.indirect.has_value(), "DRAW_INDEX_INDIRECT did not resolve to an indirect draw");
+    return resolved;
+}
+
+void testIndexIndirectArgs() {
+    alignas(16) static std::array<std::uint32_t, 16> indices{};
+    alignas(16) static std::array<std::uint32_t, 8> records{};
+    alignas(8) static std::array<std::uint32_t, 5> arguments{6, 1, 2, 3, 0};
+    const auto indexAddress = reinterpret_cast<std::uintptr_t>(indices.data());
+    records.fill(0xdeadbeefu);
+    records[4] = static_cast<std::uint32_t>(indexAddress);
+    records[5] = static_cast<std::uint32_t>(indexAddress >> 32u);
+    records[6] = 12;
+    records[7] = 1;
+
+    Storage indirect;
+    indirect.words.fill(0xdeadbeefu);
+    const auto* attributes = sceAgcDcbSetIndexIndirectArgs(&indirect.buffer, records.data(), 1);
+    const auto base = reinterpret_cast<std::uintptr_t>(records.data());
+    const std::array<std::uint32_t, 4> expected{0xc0029100u, static_cast<std::uint32_t>(base), static_cast<std::uint32_t>(base >> 32u), 1};
+    check(attributes == indirect.words.data() && std::equal(expected.begin(), expected.end(), attributes), "INDEX_ATTRIBUTES_INDIRECT packet mismatch");
+    const auto size = sceAgcDcbSetIndexIndirectArgsGetSize();
+    check(size == AgcDriver::Pm4::PacketWords(attributes[0]) * sizeof(std::uint32_t) && indirect.buffer.cursor_up == attributes + size / sizeof(std::uint32_t) && *indirect.buffer.cursor_up == 0xdeadbeefu, "index indirect size differs from the packet it writes");
+    sceAgcDcbSetBaseIndirectArgs(&indirect.buffer, 0, arguments.data());
+    const auto* draw = sceAgcDcbDrawIndexIndirect(&indirect.buffer, 0, 0);
+
+    Storage direct;
+    sceAgcDcbSetIndexBuffer(&direct.buffer, indexAddress);
+    sceAgcDcbSetIndexCount(&direct.buffer, 12);
+    sceAgcDcbSetIndexSize(&direct.buffer, 1, 0);
+    sceAgcDcbSetBaseIndirectArgs(&direct.buffer, 0, arguments.data());
+    const auto* directDraw = sceAgcDcbDrawIndexIndirect(&direct.buffer, 0, 0);
+
+    const auto fromRecord = resolveIndirectDraw(indirect, draw);
+    const auto fromPackets = resolveIndirectDraw(direct, directDraw);
+    check(fromRecord.indexAddress == indexAddress && fromRecord.indexCount == 12 && fromRecord.indexSize == 4 && fromRecord.indirect->arguments == reinterpret_cast<std::uintptr_t>(arguments.data()), "DRAW_INDEX_INDIRECT after the index indirect arguments binds the wrong index buffer");
+    check(fromRecord.indexAddress == fromPackets.indexAddress && fromRecord.indexCount == fromPackets.indexCount && fromRecord.indexSize == fromPackets.indexSize &&
+        fromRecord.flags == fromPackets.flags && fromRecord.indexed == fromPackets.indexed && fromRecord.indirect->arguments == fromPackets.indirect->arguments &&
+        fromRecord.indirect->recordBytes == fromPackets.indirect->recordBytes && fromRecord.indirect->baseVertexLocation == fromPackets.indirect->baseVertexLocation,
+        "DRAW_INDEX_INDIRECT after the index indirect arguments differs from the same draw after the direct index packets");
+    const auto record = AgcDriver::Pm4::ReadDrawArguments(*fromRecord.indirect, 0);
+    check(record.count == 6 && record.instances == 1 && record.firstVertexOrIndex == 2 && record.vertexOffset == 3, "DRAW_INDEX_INDIRECT did not read its arguments from the indirect base");
+
+    Storage wide;
+    const auto* index = sceAgcDcbSetIndexIndirectArgs(&wide.buffer, records.data(), 0xfedcu);
+    check(index[3] == 0xfedcu && wide.buffer.cursor_up == index + size / sizeof(std::uint32_t), "attribute index is not the packet's fourth dword");
+    const auto before = wide.words;
+    expectFailure([&] { sceAgcDcbSetIndexIndirectArgs(&wide.buffer, records.data() + 2, 0); });
+    expectFailure([&] { sceAgcDcbSetIndexIndirectArgs(&wide.buffer, nullptr, 0); });
+    expectFailure([&] { sceAgcDcbSetIndexIndirectArgs(nullptr, records.data(), 0); });
+    check(wide.words == before && wide.buffer.cursor_up == index + size / sizeof(std::uint32_t), "invalid index indirect arguments modified the buffer");
 }
 
 void testContextState() {
@@ -718,6 +786,7 @@ int main(int argc, char** argv) {
         testWorkloadStreams();
         testIndexBuffer();
         testIndirectBase();
+        testIndexIndirectArgs();
         testContextState();
         testFlip();
         testRegisters();

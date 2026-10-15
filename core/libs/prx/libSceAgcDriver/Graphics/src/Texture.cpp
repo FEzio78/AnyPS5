@@ -1698,7 +1698,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh: cpu writes", "refresh: alias", "refresh: compare", "refresh: compare keys", "refresh: scan blocks"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh: cpu writes", "refresh: alias", "refresh: compare", "refresh: compare keys", "refresh: scan blocks", "refresh: byte compare"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -1796,10 +1796,16 @@ bool StorageTexture::Refresh() {
     bool direct = false;
     DccKeys keys = uploadedKeys;
     {
+        // Fork-only: the byte compare against `original`, charged separately. It is the only full
+        // surface memcmp in the refresh and runs whenever a layer moved but the image may still hold
+        // the content; the rest of the compare is per-layer stamp reads.
+        const auto equalsStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-            return GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
+            const auto result = GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
+            if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshEqualsOriginal, equalsStart);
+            return result;
         };
         const auto scanBlocks = [&] {
             blockGenerations(generations);

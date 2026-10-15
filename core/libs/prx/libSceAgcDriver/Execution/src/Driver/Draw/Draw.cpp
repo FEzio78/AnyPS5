@@ -8,11 +8,67 @@
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
+#include <unordered_set>
 
 namespace AgcDriver::DriverDetail {
+
+namespace {
+
+// Fork-only: single-record indirect draws whose front program took the CPU path, by program and
+// patch locations. Such a draw is patched with its arguments before its stages are captured, so
+// the CPU path does not capture and materialize the patched stage a second time.
+// APS5_NO_INDIRECT_PREPATCH=1 turns this off.
+struct CpuIndirectPrograms {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> keys;
+    std::atomic<std::uint64_t> prepatched{0}, skipped{0}, rematerialized{0}, forcedCpu{0};
+};
+
+CpuIndirectPrograms& CpuIndirect() {
+    static auto* programs = new CpuIndirectPrograms;
+    return *programs;
+}
+
+bool IndirectPrepatchEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_INDIRECT_PREPATCH") == nullptr;
+    return enabled;
+}
+
+bool CpuIndirectKnown(std::uint64_t key) {
+    auto& programs = CpuIndirect();
+    std::lock_guard lock(programs.mutex);
+    return programs.keys.contains(key);
+}
+
+void NoteCpuIndirect(std::uint64_t key) {
+    auto& programs = CpuIndirect();
+    std::lock_guard lock(programs.mutex);
+    if (programs.keys.size() >= 65536) programs.keys.clear();
+    programs.keys.insert(key);
+}
+
+void ReportCpuIndirect() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now)) return;
+    auto& programs = CpuIndirect();
+    std::size_t known = 0;
+    {
+        std::lock_guard lock(programs.mutex);
+        known = programs.keys.size();
+    }
+    std::fprintf(stderr, "[indirect-prepatch] lifetime: %llu draws prepatched, %llu second captures skipped, %llu rematerialized anyway, %llu forced to the CPU path; %zu programs known\n", static_cast<unsigned long long>(programs.prepatched.load()), static_cast<unsigned long long>(programs.skipped.load()), static_cast<unsigned long long>(programs.rematerialized.load()), static_cast<unsigned long long>(programs.forcedCpu.load()), known);
+}
+
+}
 
 DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packet, const Submission& submission, std::string& rejected) {
     PerformanceTimer timing("Driver.Draw");
@@ -221,6 +277,33 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
+    std::optional<Pm4::DrawArguments> prepatched;
+    std::uint64_t prepatchKey = 0;
+    const bool prepatchEligible = IndirectPrepatchEnabled() && drawParameters.indirect && !drawParameters.indirect->countIndirect && drawParameters.indirect->count == 1 && !graphics.stages.tessellation && !graphics.stages.mesh && !graphics.rectList && !programs.empty();
+    if (prepatchEligible) {
+        const auto& indirect = *drawParameters.indirect;
+        prepatchKey = 0xcbf29ce484222325ull;
+        const auto mix = [&](std::uint64_t value) { prepatchKey = (prepatchKey ^ value) * 0x100000001b3ull; };
+        mix(reinterpret_cast<std::uintptr_t>(programs.front().snapshot.get()));
+        mix(programs.front().codeOffset);
+        mix(indirect.opcode);
+        mix(indirect.recordBytes);
+        mix(indirect.baseVertexLocation);
+        mix(indirect.startInstanceLocation);
+        mix(indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u);
+        if (CpuIndirectKnown(prepatchKey)) {
+            recordQueuedLabelsBeforeRead(submission.queue);
+            prepatched = Pm4::ReadDrawArguments(indirect, 0);
+            const auto patch = [&](std::uint32_t location, std::uint32_t value) {
+                if (const auto word = locate(location)) programs[word->first].userData[word->second] = value;
+            };
+            patch(indirect.baseVertexLocation, indirect.recordBytes == 20 ? prepatched->vertexOffset : prepatched->firstVertexOrIndex);
+            patch(indirect.startInstanceLocation, prepatched->firstInstance);
+            if (indirect.drawIndexEnabled) patch(indirect.drawIndexLocation, 0u);
+            ++CpuIndirect().prepatched;
+        }
+        if (profile) ReportCpuIndirect();
+    }
     std::vector<ShaderRecompiler::MemoryRegion> memory;
     std::vector<ShaderRecompiler::LinkedProgram> linked;
     for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -398,6 +481,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            // A prepatched draw's user words hold its arguments, which only the CPU path expects.
+            if (prepatched && !indirectCpu) {
+                indirectCpu = Graphics::IndirectDrawPath::NotFolded;
+                ++CpuIndirect().forcedCpu;
+            }
+            if (prepatchEligible && !prepatched && indirectCpu) NoteCpuIndirect(prepatchKey);
         } else if (i == 0) {
             fold(result, drawParameters);
         }
@@ -530,6 +619,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             if (graphics.stages.mesh) {
                 setMeshIndexBuffer(direct);
                 patched.insert(0);
+            }
+            // The stages were captured with these same arguments already (prepatched above).
+            const bool capturedPatched = std::all_of(patched.begin(), patched.end(), [&](std::size_t index) { return recompiled[index] && !reused[index]; });
+            const bool samePrepatch = prepatched && record == 0 && capturedPatched && arguments.count == prepatched->count && arguments.instances == prepatched->instances && arguments.firstVertexOrIndex == prepatched->firstVertexOrIndex && arguments.vertexOffset == prepatched->vertexOffset && arguments.firstInstance == prepatched->firstInstance;
+            if (samePrepatch) {
+                ++CpuIndirect().skipped;
+                patched.clear();
+            } else if (prepatched) {
+                ++CpuIndirect().rematerialized;
             }
             for (const auto programIndex : patched) {
                 auto& result = results[resultIndex[programIndex]];

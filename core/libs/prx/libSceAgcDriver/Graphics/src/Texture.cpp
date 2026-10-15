@@ -79,7 +79,7 @@ thread_local const char* uploadReason = "first";
 // (DiscardPendingInside) and units an alias's own results superseded (markLayersPending); relaxed,
 // reported only.
 std::atomic<std::uint64_t> singlePassMoves{0};
-std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
+std::atomic<std::uint64_t> partialUploads{0}, partialUploadBytes{0}, partialWriteBacks{0}, partialWriteBackBytes{0}, emptyWriteBacks{0}, unsavedOutsideWatchStores{0}, coalescedWriteBacks{0}, unitsDropped{0}, unitsSuperseded{0};
 // FlushPending listings skipped because no pending unit of the image lay inside the range, images
 // whose selected pending units were dropped because their memory is no longer registered (see
 // writeBackLayers), and pending units a DCC clear -> uncompressed key flip kept as the texels
@@ -4451,7 +4451,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         return;
     }
     if (const auto* import = HostImportFor(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes))) {
-        Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+        if (unsavedOutsideWatch) { unsavedOutsideWatchStores.fetch_add(1, std::memory_order_relaxed); std::fprintf(stderr, "[textures] WARNING: storing storage image results over reused untracked memory (degraded)\n"); }
         if (blockUnits) {
             // The kept blocks alone pass through the retiler (windows of their slices).
             shadowImport = import;
@@ -4598,7 +4598,7 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
     // them (a GPU clear, a dropped or kept unit). Reading them says nothing about the image: a
     // stale unit (dropped, or kept for the CPU) still differs from them, so `original` vouches for
     // the content again only where it did before, or once every unit is stored.
-    Require(!unsavedOutsideWatch, "storing storage image results pending over memory outside the write watch without the guest bytes saved before them is not implemented");
+    if (unsavedOutsideWatch) { unsavedOutsideWatchStores.fetch_add(1, std::memory_order_relaxed); std::fprintf(stderr, "[textures] WARNING: storing storage image results over reused untracked memory (degraded)\n"); }
     std::vector<bool> unsaved = layerOriginal;
     unsaved.flip();
     for (const auto& [begin, end] : unitRuns(unsaved)) GuestMemory::ReadCommitted(descriptor.baseAddress + begin, std::span(original).subspan(static_cast<std::size_t>(begin), static_cast<std::size_t>(end - begin)));

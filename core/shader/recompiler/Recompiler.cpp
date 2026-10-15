@@ -515,8 +515,21 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     bool registration = request.target.registrationModules && (request.shader.stage == ShaderStage::Vertex || request.shader.stage == ShaderStage::Fragment);
     program.Metadata().bindingLayoutComplete = false;
     const bool stencilExportWithoutExtension = request.shader.stage == ShaderStage::Fragment && std::ranges::any_of(program.Info().outputs, [](const StageOutput& output) { return output.kind == StageOutputKind::StencilRef; }) && std::ranges::find(request.target.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == request.target.supportedCapabilities.end();
-    const bool stencilReplay = stencilExportWithoutExtension && (!StencilExportFallbackEnabled() || StencilReplayProvable(program, inputInfo.pixel != nullptr && inputInfo.pixel->psEarlyZ, inputInfo.pixel != nullptr && inputInfo.pixel->psOrderedPixelShader));
-    auto bindings = bindingAllocator.Allocate(program, request.layout, registration, stencilReplay);
+    bool stencilReplay = stencilExportWithoutExtension && (!StencilExportFallbackEnabled() || StencilReplayProvable(program, inputInfo.pixel != nullptr && inputInfo.pixel->psEarlyZ, inputInfo.pixel != nullptr && inputInfo.pixel->psOrderedPixelShader));
+    bool stencilDropped = stencilExportWithoutExtension && !stencilReplay;
+    const auto allocate = [&](bool registrationModules) {
+        if (stencilReplay && StencilExportFallbackEnabled()) {
+            try {
+                return bindingAllocator.Allocate(program, request.layout, registrationModules, true);
+            } catch (const std::runtime_error& error) {
+                if (std::string_view(error.what()).find("unused push constant dword") == std::string_view::npos) throw;
+                stencilReplay = false;
+                stencilDropped = true;
+            }
+        }
+        return bindingAllocator.Allocate(program, request.layout, registrationModules, stencilReplay);
+    };
+    auto bindings = allocate(registration);
 
     SpirvTargetOptions targetOptions {};
     targetOptions.vulkanVersion = request.target.vulkanVersion;
@@ -531,6 +544,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     targetOptions.registrationModules = registration;
     targetOptions.fragmentDescriptorSet = request.target.registrationModules;
     targetOptions.float16DenormPreserve = request.target.float16DenormPreserve;
+    targetOptions.dropStencilExport = stencilDropped;
 
     constexpr SpirvEmitter spirvEmitter;
     CompiledShaderArtifact result;
@@ -539,8 +553,9 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
     if (registration && result.spirv.size() > request.target.registrationWordLimit) {
         registration = false;
         program.Metadata().bindingLayoutComplete = false;
-        bindings = bindingAllocator.Allocate(program, request.layout, false, stencilReplay);
+        bindings = allocate(false);
         targetOptions.registrationModules = false;
+        targetOptions.dropStencilExport = stencilDropped;
         result.spirv = spirvEmitter.Emit(program, inputInfo, bindings, targetOptions);
     }
     result.registrationModule = registration;

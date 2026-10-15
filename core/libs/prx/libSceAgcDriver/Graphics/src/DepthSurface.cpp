@@ -13,9 +13,11 @@
 #include <array>
 #include <atomic>
 #include <bit>
+#include <chrono>
 #include <limits>
 #include <shared_mutex>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -30,6 +32,42 @@ namespace AgcDriver::Graphics {
 namespace {
 
 std::uint64_t depthWrites = 0;
+
+// Fork-only APS5_PROFILE_DRAW counters for DepthSurfaceTexture, reported every 10 s.
+struct DepthLookupProfile {
+    std::atomic<std::uint64_t> calls{0}, scanned{0}, held{0}, declined{0}, sampled{0}, copied{0};
+    std::atomic<std::uint64_t> scanUs{0}, gpuLockUs{0}, surfacesLockUs{0}, sampledUs{0}, copiedUs{0};
+    std::atomic<std::uint64_t> layersSkipped{0}, layersGpuCopied{0}, layersDrawn{0}, layersGuestKept{0}, layersGuestRead{0}, guestReadBytes{0}, guestReadUs{0}, loopUs{0}, recordUs{0};
+    std::atomic<std::uint64_t> readUntracked{0}, readNotCovered{0}, readFirst{0}, readShapeChanged{0}, readPendingGpuWrite{0}, readWritten{0};
+    std::atomic<std::uint64_t> lastReadAddress{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+DepthLookupProfile& DepthLookups() {
+    static DepthLookupProfile profile;
+    return profile;
+}
+
+bool DepthLookupProfiled() {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    return profile;
+}
+
+std::uint64_t MicrosSince(std::chrono::steady_clock::time_point start) {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+}
+
+void ReportDepthLookups() {
+    auto& p = DepthLookups();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = p.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !p.lastReport.compare_exchange_strong(last, now)) return;
+    const auto ms = [](const std::atomic<std::uint64_t>& us) { return static_cast<double>(us.load(std::memory_order_relaxed)) / 1000.0; };
+    const auto n = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[depth-lookup] lifetime: %llu calls (scan %.0f ms), %llu held a depth surface: gpu mutex wait %.0f ms, surfaces mutex wait %.0f ms, %llu declined after the locks, %llu sampled views %.0f ms, %llu plane copies %.0f ms\n", n(p.calls), ms(p.scanUs), n(p.held), ms(p.gpuLockUs), ms(p.surfacesLockUs), n(p.declined), n(p.sampled), ms(p.sampledUs), n(p.copied), ms(p.copiedUs));
+    std::fprintf(stderr, "[depth-lookup] plane copy layers: %llu unchanged, %llu GPU-copied (%llu of them the drawn depth target), %llu guest kept, %llu guest read on the CPU (%.0f MiB, %.0f ms); layer loop %.0f ms, record %.0f ms\n", n(p.layersSkipped), n(p.layersGpuCopied), n(p.layersDrawn), n(p.layersGuestKept), n(p.layersGuestRead), static_cast<double>(p.guestReadBytes.load(std::memory_order_relaxed)) / 1048576.0, ms(p.guestReadUs), ms(p.loopUs), ms(p.recordUs));
+    std::fprintf(stderr, "[depth-lookup] why guest layers were read: untracked (no write generation) %llu (%llu outside write-watch coverage), first use %llu, shape changed %llu, pending GPU write %llu, written since %llu; last read layer 0x%llx\n", n(p.readUntracked), n(p.readNotCovered), n(p.readFirst), n(p.readShapeChanged), n(p.readPendingGpuWrite), n(p.readWritten), n(p.lastReadAddress));
+}
 
 Recorder* RecorderFor(const Context& context) {
     auto* recorder = Recorder::Active();
@@ -703,29 +741,70 @@ public:
         std::vector<std::shared_ptr<Buffer>> uploads;
         std::vector<std::uint32_t> uploadLayers;
         std::vector<std::uint32_t> copiedLayers;
+        const bool profile = DepthLookupProfiled();
+        auto& stats = DepthLookups();
+        const auto count = [&](std::atomic<std::uint64_t>& counter, std::uint64_t value = 1) {
+            if (profile) counter.fetch_add(value, std::memory_order_relaxed);
+        };
+        const auto loopStart = std::chrono::steady_clock::now();
         for (std::uint32_t layer = 0; layer < layers; ++layer) {
             auto& held = guestLayers[layer];
             auto& surface = surfaceLayers[layer];
             if (slices[layer].image != VK_NULL_HANDLE) {
                 held = {};
-                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) continue;
+                if (slices[layer].written != 0 && surface.image == slices[layer].image && surface.written == slices[layer].written) {
+                    count(stats.layersSkipped);
+                    continue;
+                }
                 surface = slices[layer];
                 copiedLayers.push_back(layer);
+                count(stats.layersGpuCopied);
+                if (slices[layer].written == 0) count(stats.layersDrawn);
                 continue;
             }
             surface = {};
-            const GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
-            if (held.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation)) {
+            GuestLayer current{resource.baseAddress + geometry.GuestLayerOffset(layer), geometry.layerBytes, resource.tileMode, geometry.thick, GuestMemory::CollectWrites(resource.baseAddress + geometry.GuestLayerOffset(layer), static_cast<std::size_t>(geometry.layerBytes))};
+            // A partially committed layer has no generation of its own; its committed pages do.
+            if (current.generation == 0) {
+                std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+                if (const auto partial = GuestMemory::CollectCommittedWrites(current.address, static_cast<std::size_t>(current.bytes), ranges); partial != 0) {
+                    current.generation = partial;
+                    current.committed = std::move(ranges);
+                }
+            }
+            const auto unchanged = [&] {
+                if (held.committed != current.committed) return false;
+                if (current.committed.has_value()) return GuestMemory::UnchangedCommittedSince(*current.committed, held.generation);
+                return GuestMemory::UnchangedSince(current.address, static_cast<std::size_t>(current.bytes), held.generation);
+            };
+            if (held.generation != 0 && current.generation != 0 && held.address == current.address && held.bytes == current.bytes && held.tileMode == current.tileMode && held.thick == current.thick && !Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes)) && unchanged()) {
                 held.generation = current.generation;
+                count(stats.layersGuestKept);
                 continue;
             }
+            if (profile) {
+                if (current.generation == 0) count(stats.readUntracked);
+                else if (held.generation == 0) count(stats.readFirst);
+                else if (held.address != current.address || held.bytes != current.bytes || held.tileMode != current.tileMode || held.thick != current.thick) count(stats.readShapeChanged);
+                else if (Recorder::SnapshotWriteOverlaps(current.address, static_cast<std::size_t>(current.bytes))) count(stats.readPendingGpuWrite);
+                else count(stats.readWritten);
+                if (current.generation == 0 && GuestMemory::WriteWatched() && !GuestMemory::Watched(current.address, static_cast<std::size_t>(current.bytes))) count(stats.readNotCovered);
+            }
+            const auto readStart = std::chrono::steady_clock::now();
             auto upload = std::make_shared<Buffer>(context, static_cast<std::size_t>(geometry.layerBytes), VK_BUFFER_USAGE_STORAGE_BUFFER_BIT);
             GuestMemory::ReadCommitted(current.address, upload->Bytes().first(static_cast<std::size_t>(geometry.layerBytes)));
+            count(stats.layersGuestRead);
+            if (profile) stats.lastReadAddress.store(current.address, std::memory_order_relaxed);
+            count(stats.guestReadBytes, geometry.layerBytes);
+            count(stats.guestReadUs, MicrosSince(readStart));
             uploads.push_back(std::move(upload));
             uploadLayers.push_back(layer);
             held = current;
         }
+        count(stats.loopUs, MicrosSince(loopStart));
+        const auto recordStart = std::chrono::steady_clock::now();
         if (!copiedLayers.empty() || !uploads.empty()) record(slices, resource, geometry, copiedLayers, uploads, uploadLayers);
+        count(stats.recordUs, MicrosSince(recordStart));
         const std::array<std::uint32_t, 6> key{static_cast<std::uint32_t>(components.r), static_cast<std::uint32_t>(components.g), static_cast<std::uint32_t>(components.b), static_cast<std::uint32_t>(components.a), static_cast<std::uint32_t>(viewType), baseLayer};
         auto& texture = textures[key];
         if (texture == nullptr) {
@@ -747,6 +826,7 @@ private:
         TextureTileMode tileMode = TextureTileMode::kLinear;
         bool thick = false;
         std::uint64_t generation = 0;
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     };
 
     VkImage image = VK_NULL_HANDLE;
@@ -1317,16 +1397,50 @@ void ClearDepthSurfaces(VkDevice device) {
     UpdateResidentImageUnmapObserver_nid_no_patch();
 }
 
+
 std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components) {
+    const bool profile = DepthLookupProfiled();
+    auto& stats = DepthLookups();
+    if (profile) {
+        stats.calls.fetch_add(1, std::memory_order_relaxed);
+        ReportDepthLookups();
+    }
     const auto held = [&](const auto& surface) {
         return surface->active->load(std::memory_order_acquire) && surface->context.device == context.device && !surface->retired && (surface->target.address == resource.baseAddress || (surface->target.stencilAddress != 0 && surface->target.stencilAddress == resource.baseAddress));
     };
+    auto stepStart = std::chrono::steady_clock::now();
     {
         std::lock_guard lock(surfacesMutex());
-        if (std::none_of(surfaces().begin(), surfaces().end(), held)) return nullptr;
+        const bool none = std::none_of(surfaces().begin(), surfaces().end(), held);
+        if (profile) {
+            stats.scanned.fetch_add(1, std::memory_order_relaxed);
+            stats.scanUs.fetch_add(MicrosSince(stepStart), std::memory_order_relaxed);
+        }
+        if (none) return nullptr;
     }
+    if (profile) stats.held.fetch_add(1, std::memory_order_relaxed);
+    stepStart = std::chrono::steady_clock::now();
     std::lock_guard gpu(GuestMemory::GpuMutex());
+    if (profile) stats.gpuLockUs.fetch_add(MicrosSince(stepStart), std::memory_order_relaxed);
+    stepStart = std::chrono::steady_clock::now();
     std::lock_guard lock(surfacesMutex());
+    if (profile) stats.surfacesLockUs.fetch_add(MicrosSince(stepStart), std::memory_order_relaxed);
+    const auto workStart = std::chrono::steady_clock::now();
+    bool copied = false;
+    bool served = false;
+    struct WorkTimer {
+        bool profile;
+        const bool& copied;
+        const bool& served;
+        std::chrono::steady_clock::time_point start;
+        DepthLookupProfile& stats;
+        ~WorkTimer() {
+            if (!profile) return;
+            if (!served) { stats.declined.fetch_add(1, std::memory_order_relaxed); return; }
+            (copied ? stats.copied : stats.sampled).fetch_add(1, std::memory_order_relaxed);
+            (copied ? stats.copiedUs : stats.sampledUs).fetch_add(MicrosSince(start), std::memory_order_relaxed);
+        }
+    } workTimer{profile, copied, served, workStart, stats};
     auto* found = planeSurface(context.device, resource.baseAddress);
     if (found == nullptr) return nullptr;
     const auto& base = found->target;
@@ -1359,7 +1473,10 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
         return nullptr;
     }
     found->ApplyFastClear();
-    if (sampled) return found->Sampled(words, resource, components, found == drawnDepth);
+    if (sampled) {
+        served = true;
+        return found->Sampled(words, resource, components, found == drawnDepth);
+    }
     Require(found->hostFormat == base.format, "sampling several slices or an integer view of a depth plane that the device stores in another depth format is not implemented");
     const auto layers = cube ? 6u : layered ? resource.depthOrLastArray + 1u : 1u;
     if (!planes) {
@@ -1381,6 +1498,8 @@ std::shared_ptr<Texture> DepthSurfaceTexture(const Context& context, std::span<c
     if (copy == nullptr) {
         copy = std::make_unique<DepthPlaneCopy>(context, base.extent, imageFormat, layers);
     }
+    served = true;
+    copied = true;
     return copy->Refresh(slices, resource, components, cube || resource.dimension == TextureDimension::k2DArray ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D, layered && !cube ? resource.baseArray : 0u);
 }
 

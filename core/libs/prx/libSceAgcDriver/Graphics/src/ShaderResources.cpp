@@ -3941,7 +3941,13 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
     if (DepthSurfaceAt(address)) { counters.fastDepthSurface.fetch_add(1, std::memory_order_relaxed); return nullptr; }
-    if (GuestMemory::CollectWrites(address, bytes) == 0) { counters.fastUnwatched.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    // The collect proves a snapshot's bytes unchanged; a storage-sourced view follows its GPU image
+    // instead, and the checks below (PendingStorageOverlaps, StorageImageCached, the source's
+    // generation and keys) are what prove that current. A heap the write watch cannot cover — a
+    // guest range the arena could not reserve, so it is tracked as a host region — must not send
+    // those views to the full lookup: Demon's Souls (PPSA01341) samples 713689 storage images per
+    // run with 0 fast hits, and 7711 of every 10 s declined here alone.
+    if (record.source == nullptr && GuestMemory::CollectWrites(address, bytes) == 0) { counters.fastUnwatched.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     if (PendingStorageOverlaps(address, bytes, record.source.get())) { counters.fastPendingStorage.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     auto keys = record.keys;
     if (record.resource.dccAddress != 0) {

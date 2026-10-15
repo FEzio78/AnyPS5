@@ -1799,7 +1799,13 @@ bool StorageTexture::Refresh() {
         const auto equalsOriginal = [&] {
             // Named for the [hooksync] attribution: the compare goes through the flush hook.
             const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::TextureCompare);
-            const auto result = GuestMemory::EqualsCommitted(descriptor.baseAddress, original);
+            // Unsynced: the guarding condition above already excluded every layer holding pending
+            // results (pendingChanged), so the bytes being compared are ones the CPU wrote and no
+            // recorded GPU work needs to land for the answer to mean what it says. Flushing here
+            // made the GPU's results visible over exactly the range whose equality to `original` is
+            // the question, and each flush stalled the CPU: Demon's Souls (PPSA01341) paid ~8.5 ms
+            // per call, ~10 calls per 10 s, from this one site.
+            const auto result = GuestMemory::EqualsCommittedUnsynced(descriptor.baseAddress, original);
             if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshEqualsOriginal, equalsStart);
             return result;
         };

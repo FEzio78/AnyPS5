@@ -1283,10 +1283,15 @@ VkDescriptorPool CreateSetPool(const Context& context, std::span<const VkDescrip
 // worker.
 constexpr std::size_t BuildPhaseCount = static_cast<std::size_t>(ShaderResources::BuildPhase::Count);
 constexpr std::array<const char*, BuildPhaseCount> BuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B"};
+// Fork-only: the resolveImageTables and finishImageTables part of the images phase, to find the
+// per-dispatch cost that the [indirect] line's image lookups do not cover.
+constexpr std::size_t BuildPhaseImageTables = BuildPhaseCount;
+constexpr std::size_t BuildPhaseExtendedCount = BuildPhaseCount + 1u;
+constexpr std::array<const char*, BuildPhaseExtendedCount> ExtendedBuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B", "image tables"};
 
 struct BuildProfile {
     std::mutex mutex;
-    std::array<double, BuildPhaseCount> ms{};
+    std::array<double, BuildPhaseExtendedCount> ms{};
     std::uint64_t builds = 0;
 };
 
@@ -1301,19 +1306,19 @@ bool BuildProfiled() {
 }
 
 struct ThreadBuildProfile {
-    std::array<double, BuildPhaseCount> ms{};
+    std::array<double, BuildPhaseExtendedCount> ms{};
     std::uint64_t builds = 0;
     ~ThreadBuildProfile() { merge(); }
     void merge() {
         auto& profile = Builds();
         std::lock_guard lock(profile.mutex);
-        for (std::size_t i = 0; i < BuildPhaseCount; ++i) profile.ms[i] += ms[i];
+        for (std::size_t i = 0; i < BuildPhaseExtendedCount; ++i) profile.ms[i] += ms[i];
         profile.builds += builds;
         ms = {};
         if (builds == 0) return;
         builds = 0;
         std::string report;
-        for (std::size_t i = 0; i < BuildPhaseCount; ++i) report += " " + std::string(BuildPhaseNames[i]) + "=" + std::to_string(static_cast<long long>(profile.ms[i])) + "ms";
+        for (std::size_t i = 0; i < BuildPhaseExtendedCount; ++i) report += " " + std::string(ExtendedBuildPhaseNames[i]) + "=" + std::to_string(static_cast<long long>(profile.ms[i])) + "ms";
         AgcDriver::ProfilePrint_nid_no_patch("[resources] %llu builds, phase totals:%s\n", static_cast<unsigned long long>(profile.builds), report.c_str());
     }
 };
@@ -1322,6 +1327,10 @@ ThreadBuildProfile& ThreadBuilds() {
     thread_local ThreadBuildProfile* profileSlot = nullptr;
     auto& profile = ShaderRecompiler::ThreadOwned(profileSlot);
     return profile;
+}
+
+void addBuildPhase(std::size_t which, double ms) {
+    ThreadBuilds().ms[which] += ms;
 }
 
 void addBuildPhase(ShaderResources::BuildPhase which, double ms) {
@@ -1896,6 +1905,7 @@ void ShaderResources::buildComplete() {
         imageRecords.shrink_to_fit();
         nextImageRecord = 0;
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
+        const auto tablesStart = BuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resolveImageTables();
         timing.bindingsMs += phase(BuildPhase::Images);
         guestMemory.UploadFinish(usesBda);
@@ -1903,6 +1913,7 @@ void ShaderResources::buildComplete() {
         if (usesBda) bda = std::make_unique<BdaResources>(context, guestMemory);
         else if (usesFaultBuffer) bda = std::make_unique<BdaResources>(context);
         finishImageTables();
+        if (BuildProfiled()) addBuildPhase(BuildPhaseImageTables, std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - tablesStart).count());
         phase(BuildPhase::Bda);
         if (_set != VK_NULL_HANDLE || fragment.set != VK_NULL_HANDLE) {
             // One update call for the whole set: the info arrays are sized up front so every write's

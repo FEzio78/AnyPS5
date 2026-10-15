@@ -245,8 +245,10 @@ void retireImport(VkDevice device, HostImports& state, std::map<std::uint64_t, H
     RetireShadow(device, it->second, [&lease, joined = it->second.joined](std::uint64_t begin, std::uint64_t end) { return runCovers(lease, begin, end) || (joined && joinedCovers(lease, begin, end)); });
     ++state.epoch;
     state.liveBytes -= it->second.bytes;
-    auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
+    static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     auto* recorder = Recorder::Active();
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx retired, device 0x%llx (%s)\n", static_cast<unsigned long long>(it->second.base), static_cast<unsigned long long>(it->second.bytes), static_cast<unsigned long long>(it->second.address), recorder == nullptr ? "no recorder: destroyed now" : hold ? "kept through the hold" : recorder->Idle() ? "recorder idle: destroyed now" : "kept by the open batch");
+    auto holder = std::make_shared<RetiredImport>(state.device, state.destroyBuffer, state.freeMemory, state.imports.extract(it));
     if (recorder == nullptr) return;
     if (hold) recorder->KeepThroughHold(std::move(holder));
     else if (!recorder->Idle()) recorder->Keep(std::move(holder));
@@ -1203,7 +1205,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     importedBytes += bytes;
     static const bool trace = std::getenv("APS5_TRACE_HOST_IMPORT") != nullptr;
     state.liveBytes += bytes;
-    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
+    if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok, device 0x%llx (%zu live, %.1f MiB live, %.1f MiB ever)%s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), static_cast<unsigned long long>(entry.address), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "");
     entry.joined = joined;
     entry.lastUse = ++state.useCounter;
     return &state.imports.emplace(base, entry).first->second;
@@ -4080,6 +4082,13 @@ ShaderRecompiler::BdaAbi::Range GuestBufferMemory::addressRange(const Region& re
     const auto address = region.direct != nullptr ? region.direct->address + (region.begin - region.direct->base) : region.mirror != nullptr ? region.mirror->buffer->DeviceAddress() + (region.begin - region.mirror->base) : region.buffer->DeviceAddress();
     Require(region.end - region.begin <= std::numeric_limits<std::uint64_t>::max() - address, "GPU address range overflow");
     const auto permissions = ShaderRecompiler::BdaAbi::Read | (region.direct != nullptr && region.writable ? ShaderRecompiler::BdaAbi::Write : 0u);
+    // Fork-only diagnostic: a direct region whose table range runs past its import maps guest
+    // addresses beyond the imported memory, where a GPU access faults.
+    if (region.direct != nullptr && inPlaceEnd(region) > region.direct->base + region.direct->bytes) {
+        static std::atomic<std::uint64_t> overruns{0};
+        const auto count = overruns.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (count <= 20 || count % 1000 == 0) std::fprintf(stderr, "[bda-overrun] #%llu: region 0x%llx-0x%llx (%s, runCut %d) maps past its import 0x%llx+0x%llx (device 0x%llx) by 0x%llx\n", static_cast<unsigned long long>(count), static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.writable ? "writable" : "read-only", region.runCut ? 1 : 0, static_cast<unsigned long long>(region.direct->base), static_cast<unsigned long long>(region.direct->bytes), static_cast<unsigned long long>(region.direct->address), static_cast<unsigned long long>(inPlaceEnd(region) - (region.direct->base + region.direct->bytes)));
+    }
     return {region.begin, region.direct != nullptr ? inPlaceEnd(region) : servedEnd(region), address, permissions, 0};
 }
 

@@ -190,6 +190,9 @@ VkDeviceSize BufferPool::DeviceBudget(const VkPhysicalDeviceMemoryProperties& me
 }
 
 VkDeviceSize BufferPool::destroy(const BufferAllocation& allocation) noexcept {
+    // Fork-only APS5_TRACE_DEVICE_ADDRESSES: the end of an addressable buffer's device range.
+    static const bool trace = std::getenv("APS5_TRACE_DEVICE_ADDRESSES") != nullptr;
+    if (trace && allocation.address != 0) std::fprintf(stderr, "[bda] buffer device 0x%llx+0x%llx destroyed\n", static_cast<unsigned long long>(allocation.address), static_cast<unsigned long long>(allocation.bytes));
     if (allocation.slab) {
         destroyBuffer(device, allocation.buffer, nullptr);
         return PutSlot(allocation.memory, allocation.offset);

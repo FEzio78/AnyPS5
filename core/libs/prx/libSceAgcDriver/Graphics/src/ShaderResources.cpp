@@ -358,6 +358,18 @@ struct TextureCounters {
     std::atomic<std::uint64_t> snapshotWatchChanged{0};
     std::atomic<std::uint64_t> snapshotUntrackedAbsent{0};
     std::atomic<std::uint64_t> snapshotUntrackedDiffers{0};
+    // Fork-only: why the stage-A fast path declined, so a fix can target the real reason. The
+    // conditions are mutually exclusive in evaluation order.
+    std::atomic<std::uint64_t> fastNoRecord{0};
+    std::atomic<std::uint64_t> fastRefreshedPerUse{0};
+    std::atomic<std::uint64_t> fastDepthCopy{0};
+    std::atomic<std::uint64_t> fastDepthSurface{0};
+    std::atomic<std::uint64_t> fastUnwatched{0};
+    std::atomic<std::uint64_t> fastPendingStorage{0};
+    std::atomic<std::uint64_t> fastKeysChanged{0};
+    std::atomic<std::uint64_t> fastViewNotCurrent{0};
+    std::atomic<std::uint64_t> fastSnapshotChanged{0};
+    std::atomic<std::uint64_t> fastEntryGone{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -388,6 +400,20 @@ void reportTextureCounters() {
     const auto untrackedDiffers = counters.snapshotUntrackedDiffers.exchange(0, std::memory_order_relaxed);
     if (keysForced + unchangedHit + keptHit + committedDiffers + writeOverlaps + watchChanged + untrackedAbsent + untrackedDiffers != 0) {
         AgcDriver::ProfilePrint_nid_no_patch("[textures] snapshot hits: DCC keys forced %llu, write-watch kept %llu, untracked hint kept %llu; compared because: committed ranges differ %llu, write overlaps %llu, write-watch changed %llu, untracked absent %llu, untracked differs %llu\n", static_cast<unsigned long long>(keysForced), static_cast<unsigned long long>(unchangedHit), static_cast<unsigned long long>(keptHit), static_cast<unsigned long long>(committedDiffers), static_cast<unsigned long long>(writeOverlaps), static_cast<unsigned long long>(watchChanged), static_cast<unsigned long long>(untrackedAbsent), static_cast<unsigned long long>(untrackedDiffers));
+    }
+    // Fork-only: why the stage-A fast path declined instead of reusing the lookup's own object.
+    const auto fastNoRecord = counters.fastNoRecord.exchange(0, std::memory_order_relaxed);
+    const auto fastRefreshed = counters.fastRefreshedPerUse.exchange(0, std::memory_order_relaxed);
+    const auto fastDepthCopy = counters.fastDepthCopy.exchange(0, std::memory_order_relaxed);
+    const auto fastDepth = counters.fastDepthSurface.exchange(0, std::memory_order_relaxed);
+    const auto fastUnwatched = counters.fastUnwatched.exchange(0, std::memory_order_relaxed);
+    const auto fastPending = counters.fastPendingStorage.exchange(0, std::memory_order_relaxed);
+    const auto fastKeys = counters.fastKeysChanged.exchange(0, std::memory_order_relaxed);
+    const auto fastView = counters.fastViewNotCurrent.exchange(0, std::memory_order_relaxed);
+    const auto fastSnapshot = counters.fastSnapshotChanged.exchange(0, std::memory_order_relaxed);
+    const auto fastEntry = counters.fastEntryGone.exchange(0, std::memory_order_relaxed);
+    if (fastNoRecord + fastRefreshed + fastDepthCopy + fastDepth + fastUnwatched + fastPending + fastKeys + fastView + fastSnapshot + fastEntry != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[textures] stage-A fast path declined: no record %llu, refreshed per use %llu, depth copy %llu, depth surface %llu, memory unwatched %llu, pending storage %llu, DCC keys changed %llu, view not current %llu, snapshot changed %llu, entry evicted %llu\n", static_cast<unsigned long long>(fastNoRecord), static_cast<unsigned long long>(fastRefreshed), static_cast<unsigned long long>(fastDepthCopy), static_cast<unsigned long long>(fastDepth), static_cast<unsigned long long>(fastUnwatched), static_cast<unsigned long long>(fastPending), static_cast<unsigned long long>(fastKeys), static_cast<unsigned long long>(fastView), static_cast<unsigned long long>(fastSnapshot), static_cast<unsigned long long>(fastEntry));
     }
 }
 
@@ -3892,7 +3918,10 @@ bool ShaderResources::precollectImages() {
 }
 
 std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record) {
-    if (record.texture == nullptr || record.texture->RefreshedPerUse() || record.texture->IsDepthCopy()) return nullptr;
+    auto& counters = TextureCounts();
+    if (record.texture == nullptr) { counters.fastNoRecord.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    if (record.texture->RefreshedPerUse()) { counters.fastRefreshedPerUse.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    if (record.texture->IsDepthCopy()) { counters.fastDepthCopy.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     struct Outcome {
         bool profile;
         std::chrono::steady_clock::time_point start;
@@ -3911,9 +3940,9 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     // between the stages marks them uncompressed).
     const auto address = record.resource.baseAddress;
     const auto bytes = static_cast<std::size_t>(record.guestBytes);
-    if (DepthSurfaceAt(address)) return nullptr;
-    if (GuestMemory::CollectWrites(address, bytes) == 0) return nullptr;
-    if (PendingStorageOverlaps(address, bytes, record.source.get())) return nullptr;
+    if (DepthSurfaceAt(address)) { counters.fastDepthSurface.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    if (GuestMemory::CollectWrites(address, bytes) == 0) { counters.fastUnwatched.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+    if (PendingStorageOverlaps(address, bytes, record.source.get())) { counters.fastPendingStorage.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     auto keys = record.keys;
     if (record.resource.dccAddress != 0) {
         const auto scanStart = outcome.profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
@@ -3924,14 +3953,15 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     }
     // The keys the entry was made under (a view of a pending render target was made under its clear
     // keys and stays valid while they are unchanged); a change is the full lookup's to judge.
-    if (keys != record.entryKeys) return nullptr;
+    if (keys != record.entryKeys) { counters.fastKeysChanged.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     if (record.source != nullptr) {
-        if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) return nullptr;
-        if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) return nullptr;
+        if (!StorageImageCached(context, record.source.get()) || !GuestMemory::UnchangedSince(address, bytes, record.source->Generation())) { counters.fastViewNotCurrent.fetch_add(1, std::memory_order_relaxed); return nullptr; }
+        if (record.resource.dccAddress != 0 && IsDccClear(record.source->FilledKeys())) { counters.fastViewNotCurrent.fetch_add(1, std::memory_order_relaxed); return nullptr; }
         // Under fast-clear keys the view holds only while its image's results are still pending over
         // the surface; flushed, the clear the image cannot see makes the lookup take a snapshot.
-        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) return nullptr;
+        if (keys != DccKeys::Uncompressed && StorageTexture::FindPending(address, record.guestBytes) != record.source) { counters.fastPendingStorage.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     } else if ((keys == DccKeys::Uncompressed || keys == DccKeys::ClearSingle) && !GuestMemory::UnchangedSince(address, bytes, record.entryGeneration)) {
+        counters.fastSnapshotChanged.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
     // The entry must still be the cache's, holding this object (an evicted object is not reused: the
@@ -3939,7 +3969,7 @@ std::shared_ptr<Texture> ShaderResources::fastTexture(const ImageRecord& record)
     auto& cache = Textures();
     std::lock_guard lock(cache.mutex);
     const auto it = findSampledEntry(cache, context.device, record.words, record.components);
-    if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) return nullptr;
+    if (it == cache.entries.end() || it->texture != record.texture || it->committed.has_value()) { counters.fastEntryGone.fetch_add(1, std::memory_order_relaxed); return nullptr; }
     if (it->source == nullptr) it->generation = record.generation;
     touchTexture(cache, it);
     logLookup({record.texture.get(), record.resource, record.guestBytes, keys, record.source != nullptr ? 0 : record.generation, record.source.get()});

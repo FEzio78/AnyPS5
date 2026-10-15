@@ -205,8 +205,20 @@ void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawP
             }
             if (verifyHit && matched[i] != nullptr && (matched[i]->runs != variant->runs || matched[i]->words != variant->words)) {
                 ++mismatches;
-                static std::atomic<std::uint64_t> reports{0};
-                if (reports.fetch_add(1) < 20) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size());
+                static std::atomic<std::uint64_t> reports{0}, dataOnly{0}, other{0};
+                // Fork-only: whether the differing words are the variant's data positions (a stage data
+                // hit refreshes those on use) or anything else.
+                std::size_t differing = 0, inData = 0, firstOther = SIZE_MAX;
+                if (matched[i]->runs == variant->runs && matched[i]->words.size() == variant->words.size()) {
+                    for (std::size_t w = 0; w < variant->words.size(); ++w) {
+                        if (matched[i]->words[w] == variant->words[w]) continue;
+                        ++differing;
+                        if (std::find(matched[i]->dataPositions.begin(), matched[i]->dataPositions.end(), static_cast<std::uint32_t>(w)) != matched[i]->dataPositions.end()) ++inData;
+                        else if (firstOther == SIZE_MAX) firstOther = w;
+                    }
+                }
+                ((differing != 0 && differing == inData) ? dataOnly : other).fetch_add(1);
+                if (reports.fetch_add(1) % 2000 < 6) std::fprintf(stderr, "[draw-cache] verify: stage %zu (program 0x%llx) of a hit captured differently: %zu runs / %zu words matched, %zu / %zu fresh; %zu words differ, %zu of them data positions, first other word %lld; so far %llu data-only, %llu other\n", i, static_cast<unsigned long long>(programs[i].binary.codeAddress), matched[i]->runs.size(), matched[i]->words.size(), variant->runs.size(), variant->words.size(), differing, inData, firstOther == SIZE_MAX ? -1ll : static_cast<long long>(firstOther), static_cast<unsigned long long>(dataOnly.load()), static_cast<unsigned long long>(other.load()));
             }
             if (insertCompare()) {
                 const GuestMemory::ReadSiteScope site(GuestMemory::ReadSite::DrawCache);

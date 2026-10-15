@@ -1869,6 +1869,14 @@ std::shared_ptr<ImageMirror> acquireMirror(const Context& context, const std::sh
         constexpr std::uint64_t block = 65536;
         mirror->generations.assign(static_cast<std::size_t>(((mirror->base + mirror->bytes + block - 1) / block) - mirror->base / block), generation);
         if (generation == 0) {
+            // Fork-only: name why the heap cannot be mirrored. An excluded block (the arena
+            // committed the range as a host region) needs the exclusion lifted; a host overlap
+            // needs the range avoided; an unwatched tracker has no write watch at all.
+            if (std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+                const bool watched = GuestMemory::WriteWatched();
+                const bool covered = GuestMemory::Watched(mirror->base, mirror->bytes);
+                std::fprintf(stderr, "[buffers] heap 0x%llx+0x%llx cannot be mirrored: write watch %s, range %s (excluded block or host region)\n", static_cast<unsigned long long>(mirror->base), static_cast<unsigned long long>(mirror->bytes), watched ? "available" : "unavailable", covered ? "covered" : "not covered");
+            }
             std::lock_guard lock(state.mutex);
             ++state.heapUnwatched;
             return nullptr;

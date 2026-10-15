@@ -347,6 +347,17 @@ struct TextureCounters {
     // by a byte compare.
     std::atomic<std::uint64_t> untrackedKept{0};
     std::atomic<std::uint64_t> untrackedCompared{0};
+    // Fork-only: why a snapshot cache hit reached the byte compare, so the next fix targets the
+    // right cause. The compare is only reached when the DCC keys forced it, or the write-watch and
+    // untracked-hint shortcuts failed.
+    std::atomic<std::uint64_t> snapshotKeysForced{0};
+    std::atomic<std::uint64_t> snapshotUnchangedHit{0};
+    std::atomic<std::uint64_t> snapshotKeptHit{0};
+    std::atomic<std::uint64_t> snapshotCommittedDiffers{0};
+    std::atomic<std::uint64_t> snapshotWriteOverlaps{0};
+    std::atomic<std::uint64_t> snapshotWatchChanged{0};
+    std::atomic<std::uint64_t> snapshotUntrackedAbsent{0};
+    std::atomic<std::uint64_t> snapshotUntrackedDiffers{0};
     std::atomic<std::int64_t> lastReport{0};
 };
 
@@ -364,6 +375,20 @@ void reportTextureCounters() {
     if (nowMs - last < 10000 || !counters.lastReport.compare_exchange_strong(last, nowMs)) return;
     const auto count = [](const std::atomic<std::uint64_t>& value) { return static_cast<unsigned long long>(value.load(std::memory_order_relaxed)); };
     AgcDriver::ProfilePrint_nid_no_patch("[textures] sampled created: %llu from storage images, %llu snapshots (%llu snapshot reads over recorded writes inside cachedTexture, %llu storage-path fallbacks); stage-A records %llu: %llu fast hits, %llu full lookups; storage images %llu hits, %llu created, %llu own-object refreshes; image tables %llu reused, %llu resolved; untracked snapshots %llu kept by the write-watch hint, %llu compared\n", count(counters.fromStorage), count(counters.snapshots), count(counters.pendingReads), count(counters.storageFallbacks), count(counters.records), count(counters.fastHits), count(counters.fastMisses), count(counters.storageHits), count(counters.storageCreated), count(counters.ownRefreshes), count(counters.tablesReused), count(counters.tablesResolved), count(counters.untrackedKept), count(counters.untrackedCompared));
+    // Fork-only: why snapshot cache hits reached the byte compare, so the next fix targets the
+    // right cause. Every hit is a shortcut hit or a compare, so the failed-shortcut counts name
+    // the reason the shortcut that would have avoided the compare did not apply.
+    const auto keysForced = counters.snapshotKeysForced.exchange(0, std::memory_order_relaxed);
+    const auto unchangedHit = counters.snapshotUnchangedHit.exchange(0, std::memory_order_relaxed);
+    const auto keptHit = counters.snapshotKeptHit.exchange(0, std::memory_order_relaxed);
+    const auto committedDiffers = counters.snapshotCommittedDiffers.exchange(0, std::memory_order_relaxed);
+    const auto writeOverlaps = counters.snapshotWriteOverlaps.exchange(0, std::memory_order_relaxed);
+    const auto watchChanged = counters.snapshotWatchChanged.exchange(0, std::memory_order_relaxed);
+    const auto untrackedAbsent = counters.snapshotUntrackedAbsent.exchange(0, std::memory_order_relaxed);
+    const auto untrackedDiffers = counters.snapshotUntrackedDiffers.exchange(0, std::memory_order_relaxed);
+    if (keysForced + unchangedHit + keptHit + committedDiffers + writeOverlaps + watchChanged + untrackedAbsent + untrackedDiffers != 0) {
+        AgcDriver::ProfilePrint_nid_no_patch("[textures] snapshot hits: DCC keys forced %llu, write-watch kept %llu, untracked hint kept %llu; compared because: committed ranges differ %llu, write overlaps %llu, write-watch changed %llu, untracked absent %llu, untracked differs %llu\n", static_cast<unsigned long long>(keysForced), static_cast<unsigned long long>(unchangedHit), static_cast<unsigned long long>(keptHit), static_cast<unsigned long long>(committedDiffers), static_cast<unsigned long long>(writeOverlaps), static_cast<unsigned long long>(watchChanged), static_cast<unsigned long long>(untrackedAbsent), static_cast<unsigned long long>(untrackedDiffers));
+    }
 }
 
 // What the sampled-texture lookups on this thread proved their returned objects current against,
@@ -725,16 +750,28 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 return GuestMemory::EqualsCommitted(address, it->bytes);
             };
             const auto unchanged = [&] {
-                if (it->committed != committed) return false;
-                return committed.has_value() ? !Recorder::SnapshotWriteOverlaps(address, it->bytes.size()) && GuestMemory::UnchangedCommittedSince(*committed, it->generation) : GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation);
+                if (it->committed != committed) { counters.snapshotCommittedDiffers.fetch_add(1, std::memory_order_relaxed); return false; }
+                if (committed.has_value()) {
+                    if (Recorder::SnapshotWriteOverlaps(address, it->bytes.size())) { counters.snapshotWriteOverlaps.fetch_add(1, std::memory_order_relaxed); return false; }
+                    if (GuestMemory::UnchangedCommittedSince(*committed, it->generation)) { counters.snapshotUnchangedHit.fetch_add(1, std::memory_order_relaxed); return true; }
+                } else if (GuestMemory::UnchangedSince(address, it->bytes.size(), it->generation)) {
+                    counters.snapshotUnchangedHit.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+                counters.snapshotWatchChanged.fetch_add(1, std::memory_order_relaxed);
+                return false;
             };
             const auto kept = [&] {
-                if (untracked[0] == 0) return false;
+                if (untracked[0] == 0) { counters.snapshotUntrackedAbsent.fetch_add(1, std::memory_order_relaxed); return false; }
                 const bool same = it->untracked == untracked && !Recorder::SnapshotWriteOverlaps(address, bytes);
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
+                if (same) counters.snapshotKeptHit.fetch_add(1, std::memory_order_relaxed);
+                else counters.snapshotUntrackedDiffers.fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
+            const bool keysForced = *keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle;
+            if (keysForced) counters.snapshotKeysForced.fetch_add(1, std::memory_order_relaxed);
+            if (keysForced || unchanged() || kept() || equalsCommitted()) {
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;

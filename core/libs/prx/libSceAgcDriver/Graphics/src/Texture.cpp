@@ -1693,7 +1693,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh: cpu writes", "refresh: alias", "refresh: compare"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -1720,12 +1720,22 @@ bool StorageTexture::Refresh() {
     auto start = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     CompletePendingCpuWrites(context, descriptor.baseAddress, static_cast<std::size_t>(guestBytes));
     if (descriptor.dccAddress != 0) CompletePendingCpuWrites(context, descriptor.dccAddress, DccKeyBytes(guestBytes));
+    // Fork-only: the steps of a refresh, charged separately so the [images] rows say which one a
+    // run actually spends its time in. Demon's Souls (PPSA01341) takes RefreshUnchanged 2905 times
+    // per 10 s at 115 us each, the single largest item in a 629 us/dispatch image binding.
+    LookupOutcomes::Kind phase = LookupOutcomes::RefreshCpuWrites;
+    const auto next = [&](LookupOutcomes::Kind kind) {
+        if (profile) start = LookupOutcomes::Add(phase, start);
+        phase = kind;
+    };
     if (refreshProved()) {
+        next(LookupOutcomes::RefreshProved);
         NoteProved();
         refreshesProved.fetch_add(1, std::memory_order_relaxed);
         if (profile) LookupOutcomes::Add(LookupOutcomes::RefreshProved, start);
         return true;
     }
+    next(LookupOutcomes::RefreshAlias);
     refreshProof = {};
     struct Exempt {
         const StorageTexture* previous;
@@ -1758,6 +1768,7 @@ bool StorageTexture::Refresh() {
     // No publish: the upload below reads the stored units from the unit shadow itself.
     const bool flushed = FlushPending(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), alias.get(), "storage refresh", PublishScope::None);
     if (profile && flushed) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
+    next(LookupOutcomes::RefreshCollect);
     // `original` holds the guest bytes the image was last uploaded from or written back as; while the
     // guest memory and the DCC keys still match, the image content is current. Pages nobody wrote
     // since `generation` need no comparison.
@@ -1883,6 +1894,7 @@ bool StorageTexture::Refresh() {
         }
     }
     if (unchanged) {
+        next(LookupOutcomes::RefreshCompared);
         ++Profile().storageReused;
         layerGeneration.assign(trackedLayers, current);
         refreshGeneration();

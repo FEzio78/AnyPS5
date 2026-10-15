@@ -1691,7 +1691,7 @@ VkImageView StorageTexture::Atomic64View(std::uint32_t mip, bool firstLayer) {
 }
 
 const char* LookupOutcomes::Name(Kind kind) {
-    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh: cpu writes", "refresh: alias", "refresh: compare"};
+    static constexpr const char* names[Count] = {"sampled fast hit", "sampled fast miss", "sampled hit view", "sampled hit cleared view", "sampled hit snapshot", "sampled made view", "sampled made snapshot", "storage hit", "storage made", "refresh unchanged", "refresh compared", "refresh proved", "upload direct", "upload cpu", "upload clear", "dcc scan", "pending flush", "refresh: cpu writes", "refresh: alias", "refresh: compare", "refresh: compare keys", "refresh: scan blocks"};
     return kind < Count ? names[kind] : "?";
 }
 
@@ -1812,6 +1812,14 @@ bool StorageTexture::Refresh() {
         const auto keysStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         keys = ProvedKeys();
         if (profile && descriptor.dccAddress != 0) LookupOutcomes::Add(LookupOutcomes::DccScan, keysStart);
+        // Fork-only: the two halves of the compare, charged separately. The refresh's compare step
+        // is 362 ms of a 383 ms refresh (4458 calls, 81 us each); UnchangedSince is one stamp read
+        // and scanBlocks walks every unit of the surface, so they are not comparable costs.
+        LookupOutcomes::Kind comparePhase = LookupOutcomes::RefreshCompareKeys;
+        const auto compareNext = [&](LookupOutcomes::Kind kind) {
+            if (profile) start = LookupOutcomes::Add(comparePhase, start);
+            comparePhase = kind;
+        };
         if (keys != uploadedKeys) {
             changed.assign(trackedLayers, true);
             unchanged = false;
@@ -1819,6 +1827,7 @@ bool StorageTexture::Refresh() {
             // Which units the CPU stamped still decides what the drop rule below may drop.
             if (blockUnits) scanBlocks();
         } else if (blockUnits) {
+            compareNext(LookupOutcomes::RefreshScanBlocks);
             if (!GuestMemory::UnchangedSince(descriptor.baseAddress, static_cast<std::size_t>(guestBytes), generation)) {
                 // One stamp scan for every unit (each is one stamp block); the unchanged units move
                 // to the current generation, so the whole-surface check answers next time.

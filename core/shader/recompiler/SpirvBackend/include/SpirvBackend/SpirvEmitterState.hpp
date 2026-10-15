@@ -196,6 +196,7 @@ struct SpirvEmitterState {
     std::uint32_t sampleMaskVariable = 0;
     std::uint32_t stencilRefVariable = 0;
     bool stencilReplay = false;
+    bool stencilRefDropped = false;
     std::vector<SpirvInputBinding> inputs;
     std::vector<SpirvOutputBinding> outputs;
     std::vector<std::uint32_t> interfaceVariables;

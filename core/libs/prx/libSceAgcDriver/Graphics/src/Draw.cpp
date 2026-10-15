@@ -1934,10 +1934,13 @@ void Draw(const Context& context, const State& state, const Pm4::DrawParameters&
     }
     if (!stencilReferences.empty()) {
         Require(!draw.indirect && !state.primitiveRestart && !state.rectList && !state.stages.mesh && !state.stages.tessellation && state.topology == VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, "stencil replay supports direct triangle lists without restart, mesh or tessellation");
-        Require(!state.depthBiasPerFace && !ShadersWriteMemory(shaders), "stencil replay refuses face splits and shader memory writes");
-        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && shader.program->stencilReplaySafe && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
+        // TODO(debt): fork-only. APS5_STENCIL_EXPORT_FALLBACK=1 replays draws whose stages have side
+        // effects, clocks or subgroup dependencies too: each replay pass reruns them with the same inputs.
+        static const bool relaxedReplay = std::getenv("APS5_STENCIL_EXPORT_FALLBACK") != nullptr;
+        Require(!state.depthBiasPerFace && (relaxedReplay || !ShadersWriteMemory(shaders)), "stencil replay refuses face splits and shader memory writes");
+        Require(std::ranges::all_of(shaders, [](const CompiledShader& shader) { return shader.program != nullptr && (relaxedReplay || shader.program->stencilReplaySafe) && (shader.stage == ShaderRecompiler::ShaderStage::Vertex || shader.stage == ShaderRecompiler::ShaderStage::Fragment); }), "stencil replay refuses stages with side effects, clocks, subgroup dependencies or primitive ID inputs");
         for (const auto& shader : shaders) {
-            if (shader.stage != ShaderRecompiler::ShaderStage::Vertex) continue;
+            if (shader.stage != ShaderRecompiler::ShaderStage::Vertex || relaxedReplay) continue;
             Require((shader.program->hostSubgroupSize == 1u || shader.program->hostSubgroupSize == context.subgroup.subgroupSize) && shader.program->spirv.size() >= 5u && shader.program->spirv[1] >= 0x00010000u && shader.program->spirv[1] < 0x00010600u, "stencil replay vertex subgroup contract differs from the physical device");
         }
         Require(static_cast<std::uint64_t>(draw.firstInstance) + draw.instanceCount <= 0x100000000ull && (draw.indexed || static_cast<std::uint64_t>(draw.firstVertex) + draw.indexCount <= 0x100000000ull), "stencil replay draw indices overflow");

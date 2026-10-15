@@ -379,6 +379,13 @@ void DefineOutputs(SpirvEmitterState& state) {
             break;
         case StageOutputKind::StencilRef:
             if (std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == state.supportedCapabilities.end()) {
+                if (StencilExportFallbackEnabled() && !StencilReplayProvable(state.program, PixelInfo(state).psEarlyZ, PixelInfo(state).psOrderedPixelShader)) {
+                    state.stencilRefDropped = true;
+                    state.stencilRefVariable = state.module.DefineGlobalVariable(TypePointer(state, spv::StorageClassPrivate, TypeI32(state)), spv::StorageClassPrivate);
+                    if (state.spirvVersion >= 0x00010400u) state.interfaceVariables.push_back(state.stencilRefVariable);
+                    binding.variableId = state.stencilRefVariable;
+                    break;
+                }
                 const auto values = StencilReferenceValues(state.program);
                 if (values.empty()) throw std::runtime_error("stencil reference export emulation requires a proven set of at most 16 values");
                 if (!StencilReferenceDefinedForKeptInvocations(state.program)) throw std::runtime_error("stencil reference export emulation requires a stencil export on every kept path");

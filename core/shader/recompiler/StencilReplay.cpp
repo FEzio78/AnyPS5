@@ -2,6 +2,7 @@
 #include "Optimization/MaskedSelectEliminator.hpp"
 #include "Optimization/SrtWalker/SrtInstructionPredicates.hpp"
 #include <algorithm>
+#include <cstdlib>
 #include <functional>
 #include <iterator>
 #include <map>
@@ -739,6 +740,15 @@ bool StencilReplaySafe(const IrProgram& program) {
         }
     }
     return !masks || MaskReplaySafety(program).Check();
+}
+
+bool StencilReplayProvable(const IrProgram& program, bool earlyTests, bool orderedPixels) {
+    return !earlyTests && !orderedPixels && !StencilReferenceValues(program).empty() && StencilReferenceDefinedForKeptInvocations(program) && StencilReplaySafe(program);
+}
+
+bool StencilExportFallbackEnabled() {
+    static const bool enabled = std::getenv("APS5_STENCIL_EXPORT_FALLBACK") != nullptr;
+    return enabled;
 }
 
 }

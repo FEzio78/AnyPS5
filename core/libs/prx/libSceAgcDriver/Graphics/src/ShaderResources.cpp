@@ -4270,8 +4270,34 @@ void ShaderResources::addSamplerTable(const ShaderRecompiler::DescriptorBinding&
     bindings.push_back(std::move(item));
 }
 
+namespace {
+
+// Fork-only APS5_PROFILE_DRAW: why image tables are resolved element by element instead of reused.
+struct TableReuseBlockCounts {
+    std::atomic<std::uint64_t> found{0}, notCurrent{0}, texturesGone{0}, missing{0};
+    std::atomic<std::uint64_t> noEpoch{0}, capacity{0}, notLogged{0}, storageView{0}, noGeneration{0}, keys{0}, dcc{0}, stateMoved{0}, pendingOverlap{0}, remembered{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+TableReuseBlockCounts& TableReuseBlocks() {
+    static TableReuseBlockCounts counts;
+    return counts;
+}
+
+void ReportTableReuseBlocks() {
+    auto& c = TableReuseBlocks();
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = c.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !c.lastReport.compare_exchange_strong(last, now)) return;
+    const auto n = [](const std::atomic<std::uint64_t>& v) { return static_cast<unsigned long long>(v.load(std::memory_order_relaxed)); };
+    std::fprintf(stderr, "[image-table-reuse] lifetime: lookups found %llu (not current %llu, textures gone %llu), missing %llu; not remembered because: no epoch %llu, capacity %llu, element not logged %llu, storage view %llu, no write generation %llu, DCC keys %llu, DCC address %llu, state moved %llu, pending overlap %llu; remembered %llu\n", n(c.found), n(c.notCurrent), n(c.texturesGone), n(c.missing), n(c.noEpoch), n(c.capacity), n(c.notLogged), n(c.storageView), n(c.noGeneration), n(c.keys), n(c.dcc), n(c.stateMoved), n(c.pendingOverlap), n(c.remembered));
+}
+
+}
+
 void ShaderResources::resolveImageTables() {
     if (tableBindings[0] == std::numeric_limits<std::size_t>::max() && tableBindings[1] == std::numeric_limits<std::size_t>::max()) return;
+    if (BuildProfiled()) ReportTableReuseBlocks();
     auto& counters = TextureCounts();
     for (std::size_t set = 0; set < tableBindings.size(); ++set) {
         if (tableBindings[set] != std::numeric_limits<std::size_t>::max()) bindings[tableBindings[set]].imageAllocations.assign(std::min(tableElements[set], context.imageTableCapacity), std::numeric_limits<std::size_t>::max());
@@ -4311,7 +4337,19 @@ void ShaderResources::resolveImageTables() {
         };
         const auto state = CurrentTableState();
         std::vector<std::shared_ptr<Texture>> cached;
-        if (auto* reused = FindReusedTable(context.device, binding, state); reused != nullptr && TableCurrent(*reused) && CachedTableTextures(*reused, cached)) {
+        auto* reused = FindReusedTable(context.device, binding, state);
+        if (BuildProfiled()) {
+            auto& why = TableReuseBlocks();
+            if (reused == nullptr) ++why.missing;
+            else {
+                ++why.found;
+                if (!TableCurrent(*reused)) ++why.notCurrent;
+            }
+        }
+        const bool current = reused != nullptr && TableCurrent(*reused);
+        const bool texturesKept = current && CachedTableTextures(*reused, cached);
+        if (BuildProfiled() && current && !texturesKept) ++TableReuseBlocks().texturesGone;
+        if (texturesKept) {
             auto next = cached.begin();
             for (std::uint32_t element = 0; element < binding.count; ++element) {
                 const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
@@ -4331,11 +4369,13 @@ void ShaderResources::resolveImageTables() {
         }
         ReusedTable fresh;
         bool reusable = state.epoch != 0;
+        if (!reusable && BuildProfiled()) ++TableReuseBlocks().noEpoch;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
             const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
             const auto absolute = static_cast<std::uint64_t>(table.elementBase) + element;
             if (absolute >= context.imageTableCapacity) {
                 table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
+                if (reusable && BuildProfiled()) ++TableReuseBlocks().capacity;
                 reusable = false;
                 continue;
             }
@@ -4371,6 +4411,15 @@ void ShaderResources::resolveImageTables() {
                 const auto& log = lookupLog();
                 const auto* looked = log.empty() ? nullptr : &log.back();
                 reusable = looked != nullptr && looked->object == texture.get() && looked->source == nullptr && looked->generation != 0 && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
+                // Fork-only APS5_PROFILE_DRAW: the first reason a table could not be remembered.
+                if (!reusable && BuildProfiled()) {
+                    auto& why = TableReuseBlocks();
+                    if (looked == nullptr || looked->object != texture.get()) ++why.notLogged;
+                    else if (looked->source != nullptr) ++why.storageView;
+                    else if (looked->generation == 0) ++why.noGeneration;
+                    else if (looked->keys != DccKeys::Uncompressed) ++why.keys;
+                    else ++why.dcc;
+                }
                 if (reusable) {
                     fresh.elements.push_back({MakeTextureKey(context.device, words, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
                     fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), looked->generation});
@@ -4387,7 +4436,12 @@ void ShaderResources::resolveImageTables() {
                 fresh.state = state;
                 fresh.pendingSerial = serial;
                 RememberTable(std::move(fresh), binding);
+                if (BuildProfiled()) ++TableReuseBlocks().remembered;
+            } else if (BuildProfiled()) {
+                ++TableReuseBlocks().pendingOverlap;
             }
+        } else if (reusable && BuildProfiled()) {
+            ++TableReuseBlocks().stateMoved;
         }
     }
     reportTextureCounters();

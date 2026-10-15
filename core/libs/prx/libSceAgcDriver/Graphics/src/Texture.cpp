@@ -1187,9 +1187,37 @@ struct PendingWrites {
     std::vector<StorageTexture*> flushing;
 };
 
+// The unwatch pair GuestMemory::ImportWatched calls when a host import takes a range out of the
+// write watch while storage results are pending over it: the pending check runs under the tracker
+// lock (it takes only the pending mutex, never the tracker or GPU lock this interface holds) and
+// the store runs after the lock is released, like every other flush site.
+bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end);
+void UnwatchStoreHook(std::uint64_t address, std::uint64_t end);
+void EnsureUnwatchHooks();
+
 PendingWrites& Pending() {
     static PendingWrites pending;
+    EnsureUnwatchHooks();
     return pending;
+}
+
+// Registered on the first pending-registry use, before any import can take a range out of the
+// write watch with results pending over it.
+void EnsureUnwatchHooks() {
+    static const bool registered = [] {
+        GuestMemory::SetUnwatchHooks(&UnwatchPendingHook, &UnwatchStoreHook);
+        return true;
+    }();
+    static_cast<void>(registered);
+}
+
+bool UnwatchPendingHook(std::uint64_t address, std::uint64_t end) {
+    const std::array<std::pair<std::uint64_t, std::uint64_t>, 1> range{{{address, end}}};
+    return StorageTexture::AnyPendingOverlaps(range);
+}
+
+void UnwatchStoreHook(std::uint64_t address, std::uint64_t end) {
+    StorageTexture::FlushPending(address, static_cast<std::size_t>(end - address), nullptr, "range left the write watch");
 }
 
 // See StorageTexture::PendingSerial: bumped after every mutation of the registry above.
@@ -4313,18 +4341,16 @@ void StorageTexture::writeBackLayers(const std::vector<bool>& layers) {
         for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
             if (layers[layer]) layerPending[layer] = false;
         }
-        const bool allKept = std::none_of(skippedLayer.begin(), skippedLayer.end(), [](bool kept) { return kept; });
-        if (allKept || !adjacent.empty()) {
-            const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
-            for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
-                if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
-            }
-            refreshGeneration();
-            advanceAdjacent(adjacent, now, firstBlock, lastBlock);
-            if (!shadowed.empty()) MarkShadowed(*shadowImport, shadowed, now);
-        } else if (!shadowed.empty()) {
-            MarkShadowed(*shadowImport, shadowed, GuestMemory::TrackerGeneration());
+        bool advances = false;
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) advances = advances || (layers[layer] && !skippedLayer[layer]);
+        if (!advances && adjacent.empty() && shadowed.empty()) return;
+        const auto now = memoizedCollect ? GuestMemory::CollectWrites(firstStored, static_cast<std::size_t>(lastStored - firstStored)) : GuestMemory::CollectWritesUncached(firstStored, static_cast<std::size_t>(lastStored - firstStored));
+        for (std::uint32_t layer = 0; layer < trackedLayers; ++layer) {
+            if (layers[layer] && !skippedLayer[layer]) layerGeneration[layer] = now;
         }
+        refreshGeneration();
+        advanceAdjacent(adjacent, now, firstBlock, lastBlock);
+        if (!shadowed.empty()) MarkShadowed(*shadowImport, shadowed, now);
     };
     if (keep.empty()) {
         // Every selected block was written by the CPU since the layer's generation: nothing to

@@ -165,7 +165,11 @@ void Driver::run(std::uint32_t id) noexcept {
                         changed.wait(lock, [&] { return ready() || (id == 0 && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait); });
                         if (id == 0) queue0Dormant.store(false, std::memory_order_relaxed);
                         if (id == 0 && !ready() && idleEpoch.load(std::memory_order_acquire) != idleEpochAtWait) continue;
-                        break;
+                        // A submission can arrive between this wakeup and the pending re-check below;
+                        // only the worker's own shutdown paths may end the run, never a lost race.
+                        if (failure || stopping.load(std::memory_order_acquire) || shutdownToken.stop_requested()) break;
+                        if (!pending.empty()) break;
+                        continue;
                     }
                     if (poll(ready)) break;
                     lock.unlock();

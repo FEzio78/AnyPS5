@@ -5,6 +5,9 @@
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <atomic>
+#include <chrono>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <sstream>
@@ -136,7 +139,33 @@ void Driver::recordStageDataPositions(DispatchVariant& variant, const ShaderReco
 }
 
 void Driver::cacheDrawStages(bool useDrawEntries, bool drawHit, const Pm4::DrawParameters& drawParameters, const std::optional<Graphics::IndirectDrawPath>& indirectCpu, const std::vector<DrawProgram>& programs, const std::vector<StageCapture>& stageCaptures, const std::vector<std::optional<ShaderRecompiler::ShaderVertexStageInfo>>& vertexInfos, const std::vector<std::vector<Graphics::DecodeRead>>& decodeReads, bool verifyHit, const std::vector<std::shared_ptr<DispatchVariant>>& matched, std::vector<std::shared_ptr<DispatchVariant>>& fresh, std::uint64_t drawKey, bool registerKey, const std::shared_ptr<const DrawDecode>& decode, DrawPhaseTiming& phaseTiming, const std::vector<bool>& reused, const std::shared_ptr<DrawEntry>& entry, std::uint64_t shapeKey) {
-    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0))) {
+    // Fork-only APS5_PROFILE_DRAW: why a draw's stages were not offered to the draw cache.
+    static const bool profileSkips = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    bool admittedAlready = false;
+    if (profileSkips) {
+        static std::atomic<std::uint64_t> calls{0}, noEntries{0}, hits{0}, cpuIndirect{0}, notAdmitted{0}, offered{0}, uncacheable{0};
+        static std::atomic<std::int64_t> lastReport{0};
+        ++calls;
+        if (!useDrawEntries) ++noEntries;
+        else if (drawHit) ++hits;
+        else if (drawParameters.indirect && indirectCpu) ++cpuIndirect;
+        else ++offered;
+        if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu)) {
+            for (std::size_t i = 0; i < programs.size(); ++i) {
+                if (!reused[i] && (stageCaptures[i].compiled == nullptr || !CacheableResult(*stageCaptures[i].compiled))) { ++uncacheable; break; }
+            }
+        }
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load();
+        if (now - last >= 10 && lastReport.compare_exchange_strong(last, now)) {
+            std::fprintf(stderr, "[draw-insert] lifetime: %llu draws: %llu without draw entries, %llu hits, %llu CPU-path indirect, %llu offered to admission (%llu with an uncacheable stage); admission refusals counted as not admitted %llu\n", static_cast<unsigned long long>(calls.load()), static_cast<unsigned long long>(noEntries.load()), static_cast<unsigned long long>(hits.load()), static_cast<unsigned long long>(cpuIndirect.load()), static_cast<unsigned long long>(offered.load()), static_cast<unsigned long long>(uncacheable.load()), static_cast<unsigned long long>(notAdmitted.load()));
+        }
+        if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && !verifyHit) {
+            if (!admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0)) { ++notAdmitted; return; }
+            admittedAlready = true;
+        }
+    }
+    if (useDrawEntries && !drawHit && !(drawParameters.indirect && indirectCpu) && (verifyHit || admittedAlready || admitDrawKey(drawKey, registerKey && drawDataHits() ? shapeKey : 0))) {
         phaseTiming.Phase(DrawRowVectors);
         std::uint64_t unstable = 0, mismatches = 0, differingSameRuns = 0, differingWords = 0, differingRunsChanged = 0;
         for (std::size_t i = 0; i < programs.size(); ++i) {

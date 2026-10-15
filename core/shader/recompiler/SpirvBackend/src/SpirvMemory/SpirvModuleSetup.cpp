@@ -188,7 +188,7 @@ void DefineModule(SpirvEmitterState& state) {
                 state.module.AddExecutionMode(state.mainFunc, spv::ExecutionModeDepthGreater);
             }
         }
-        if (state.stencilRefVariable != 0 && !state.stencilReplay) {
+        if (state.stencilRefVariable != 0 && !state.stencilReplay && !state.stencilRefDropped) {
             if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityStencilExportEXT)) == state.supportedCapabilities.end()) {
                 throw std::runtime_error("a pixel shader that exports the stencil reference needs VK_EXT_shader_stencil_export, which the device lacks");
             }

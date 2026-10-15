@@ -624,7 +624,6 @@ const char* createImport(const Context& context, HostImport& entry, VkResult& fa
     return step;
 }
 
-#ifndef _WIN32
 enum class ImportWatchRequest : std::uint8_t { Probe, Watch, Unwatch };
 
 ImportWatchRequest importWatchRequest() {
@@ -637,7 +636,6 @@ ImportWatchRequest importWatchRequest() {
     }();
     return request;
 }
-#endif
 
 void decideImportWatch(const Context& context, HostImports& state) {
     if (state.watchDevice == context.device) return;
@@ -645,6 +643,13 @@ void decideImportWatch(const Context& context, HostImports& state) {
     state.watchDevice = context.device;
     state.unwatchImports = true;
     state.unwatchDmaBufImports = false;
+    // Fork-only: APS5_WRITE_WATCH_IMPORTS=watch keeps direct host imports write-watched, as on
+    // Linux. A title whose GPU heap is private memory otherwise byte-compares it on every lookup.
+    if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched() && importWatchRequest() == ImportWatchRequest::Watch) {
+        state.unwatchImports = false;
+        std::fprintf(stderr, "[write-watch] Windows direct host imports stay watched (APS5_WRITE_WATCH_IMPORTS=watch)\n");
+        return;
+    }
     if (context.hostImportAlignment != 0 && GuestMemory::WriteWatched()) std::fprintf(stderr, "[write-watch] Windows direct host imports use comparisons; separate shared aliases retain guest write tracking\n");
 #else
     const auto request = importWatchRequest();

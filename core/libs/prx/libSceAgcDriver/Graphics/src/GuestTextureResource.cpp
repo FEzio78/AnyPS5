@@ -63,7 +63,11 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
 
     const auto base40 = (static_cast<std::uint64_t>(words[0]) | (static_cast<std::uint64_t>(words[1]) << 32u)) & 0xffffffffffull;
     auto baseAddress = base40 << 8u;
-    Require(baseAddress != 0, "guest texture descriptor has a null base address");
+    if (baseAddress == 0) {
+        char hex[96];
+        std::snprintf(hex, sizeof(hex), " (words %08x %08x %08x %08x %08x %08x %08x %08x)", words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+        throw std::runtime_error(std::string("AGC graphics: guest texture descriptor has a null base address") + hex);
+    }
 
     const auto minLod = (words[1] >> 8u) & 0xfffu;
     const auto format = (words[1] >> 20u) & 0x1ffu;

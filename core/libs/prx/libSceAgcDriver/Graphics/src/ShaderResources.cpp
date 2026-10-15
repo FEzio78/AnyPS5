@@ -611,6 +611,10 @@ std::array<std::uint64_t, 4> untrackedKey(std::uint64_t address, std::size_t byt
 }
 
 // `guestBytes` is the surface size when the caller described the surface already (0: described here).
+// Fork-only: ms spent in cachedTexture before its outcome timer starts, split by step; drained by
+// resolveImageBinding into the build phase totals.
+thread_local std::array<double, 3> cachedTextureHeadMs{};
+
 std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const std::uint32_t> words, const GuestTextureResource& resource, VkComponentMapping components, std::uint64_t guestBytes = 0, bool depthCompare = false) {
     if (resource.dimension == TextureDimension::k2DMsaa) {
         Require(!depthCompare, "native multisampled depth comparison sampling is not implemented");
@@ -623,9 +627,19 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         return target;
     }
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
+    auto headStart = std::chrono::steady_clock::now();
+    const auto headLap = [&](std::size_t which) {
+        const auto now = std::chrono::steady_clock::now();
+        cachedTextureHeadMs[which] += std::chrono::duration<double, std::milli>(now - headStart).count();
+        headStart = now;
+    };
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
+    headLap(0);
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
-    if (auto depth = DepthSurfaceTexture(context, words, resource, components)) {
+    headLap(1);
+    auto depthSurface = DepthSurfaceTexture(context, words, resource, components);
+    headLap(2);
+    if (auto depth = std::move(depthSurface)) {
         logLookup({depth.get(), resource, 0, DccKeys::Uncompressed, 0, nullptr, true});
         return depth;
     }
@@ -1364,8 +1378,26 @@ constexpr std::array<const char*, BuildPhaseCount> BuildPhaseNames{"bindings", "
 // Fork-only: the resolveImageTables and finishImageTables part of the images phase, to find the
 // per-dispatch cost that the [indirect] line's image lookups do not cover.
 constexpr std::size_t BuildPhaseImageTables = BuildPhaseCount;
-constexpr std::size_t BuildPhaseExtendedCount = BuildPhaseCount + 1u;
-constexpr std::array<const char*, BuildPhaseExtendedCount> ExtendedBuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B", "image tables"};
+// Fork-only: the rest of the images phase, split the same way.
+constexpr std::size_t BuildPhaseDeferredImages = BuildPhaseCount + 1u;
+constexpr std::size_t BuildPhaseAniso = BuildPhaseCount + 2u;
+constexpr std::size_t BuildPhaseRecordRelease = BuildPhaseCount + 3u;
+// Fork-only: the steps of resolveImageBinding, per element.
+constexpr std::size_t BuildPhaseLookupNull = BuildPhaseCount + 4u;
+constexpr std::size_t BuildPhaseLookupDecode = BuildPhaseCount + 5u;
+constexpr std::size_t BuildPhaseLookupPending = BuildPhaseCount + 6u;
+constexpr std::size_t BuildPhaseLookupTexture = BuildPhaseCount + 7u;
+constexpr std::size_t BuildPhaseLookupTail = BuildPhaseCount + 8u;
+constexpr std::size_t BuildPhaseLookupStorage = BuildPhaseCount + 9u;
+constexpr std::size_t BuildPhaseLookupReport = BuildPhaseCount + 10u;
+constexpr std::size_t BuildPhaseTexturePrevious = BuildPhaseCount + 11u;
+constexpr std::size_t BuildPhaseTextureFast = BuildPhaseCount + 12u;
+constexpr std::size_t BuildPhaseTextureCached = BuildPhaseCount + 13u;
+constexpr std::size_t BuildPhaseHeadMultisample = BuildPhaseCount + 14u;
+constexpr std::size_t BuildPhaseHeadKeptBytes = BuildPhaseCount + 15u;
+constexpr std::size_t BuildPhaseHeadDepthSurface = BuildPhaseCount + 16u;
+constexpr std::size_t BuildPhaseExtendedCount = BuildPhaseCount + 17u;
+constexpr std::array<const char*, BuildPhaseExtendedCount> ExtendedBuildPhaseNames{"bindings", "precollect", "guest memory upload", "descriptors", "stage A", "images", "bda", "stage B", "image tables", "images: deferred lookups", "images: aniso", "images: record release", "lookup: null", "lookup: decode", "lookup: pending cpu writes", "lookup: texture", "lookup: tail", "lookup: storage", "lookup: report", "texture: previous", "texture: fast", "texture: cached (incl head)", "head: multisample check", "head: bound kept bytes", "head: depth surface"};
 
 struct BuildProfile {
     std::mutex mutex;
@@ -1972,16 +2004,27 @@ void ShaderResources::buildComplete() {
         // storage elements of one mip chain share the previous element's image.
         previousSampled = {};
         for (auto& source : samplerSources) source.singleLevelImage = source.mipmappedImage = false;
+        const bool split = BuildProfiled();
+        auto splitStart = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const auto lap = [&](std::size_t which) {
+            if (!split) return;
+            const auto now = std::chrono::steady_clock::now();
+            addBuildPhase(which, std::chrono::duration<double, std::milli>(now - splitStart).count());
+            splitStart = now;
+        };
         for (const auto& deferred : deferredImages) resolveImageBinding(*deferred.binding, bindings[deferred.index], std::span<const std::shared_ptr<Sampler>>(samplers).subspan(deferred.firstSampler, deferred.samplerCount));
         previousSampled = {};
         deferredImages.clear();
+        lap(BuildPhaseDeferredImages);
         applyAnisoOverride();
+        lap(BuildPhaseAniso);
         // The records served their purpose: each holds the cache entry's objects as of stage A,
         // which would otherwise keep a replaced texture or an evicted storage image (and its device
         // memory) alive, outside the caches' budgets, for as long as this object is cached.
         imageRecords.clear();
         imageRecords.shrink_to_fit();
         nextImageRecord = 0;
+        lap(BuildPhaseRecordRelease);
         Require(textures.size() == plannedSampledImages && storageTextures.size() == plannedStorageImages, "image lookups disagree with the descriptor plan");
         const auto tablesStart = BuildProfiled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         resolveImageTables();
@@ -4040,6 +4083,14 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
     auto& counters = TextureCounts();
     // The element's stage-A record, when the pass ran (records follow the plan order exactly).
     const auto nextRecord = [&]() -> const ImageRecord* { return nextImageRecord < imageRecords.size() ? &imageRecords[nextImageRecord++] : nullptr; };
+    const bool split = BuildProfiled();
+    auto splitStart = split ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto lap = [&](std::size_t which) {
+        if (!split) return;
+        const auto now = std::chrono::steady_clock::now();
+        addBuildPhase(which, std::chrono::duration<double, std::milli>(now - splitStart).count());
+        splitStart = now;
+    };
     if (binding.kind == ShaderRecompiler::DescriptorKind::SampledImage) {
         Require(binding.imageSamplers.size() == binding.count, "guest sampled image binding is missing its image-sampler pairs");
         const auto elementWords = binding.guestDescriptor.size() / binding.count;
@@ -4049,8 +4100,10 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (IsNullTextureResource(words)) {
                 item.imageAllocations.push_back(std::numeric_limits<std::size_t>::max());
                 --plannedSampledImages;
+                lap(BuildPhaseLookupNull);
                 continue;
             }
+            lap(BuildPhaseLookupNull);
             const auto resource = record != nullptr && record->decoded ? record->resource : DecodeTextureResource(words);
             const bool forcedSrgb = ForcesDegammaOn(resource.format, binding.imageSamplers[element], shaderSamplers);
             RequireNonSeamlessCube(resource.dimension == TextureDimension::kCube, binding.imageSamplers[element], shaderSamplers);
@@ -4058,16 +4111,27 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             if (!firstLayer && !MatchesGuestDimension(*binding.imageShape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the shader's declared image shape (shape " + std::to_string(static_cast<int>(*binding.imageShape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
             const VkComponentMapping components = ViewComponents(resource);
             const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+            lap(BuildPhaseLookupDecode);
             CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
             if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+            lap(BuildPhaseLookupPending);
             std::shared_ptr<Texture> texture;
             const bool depthCompare = !binding.imageDepthCompare.empty() && binding.imageDepthCompare.at(element);
             if (previousSampled.texture != nullptr && previousSampled.depthCompare == depthCompare && words.size() == 8 && std::equal(words.begin(), words.end(), previousSampled.words.begin())) texture = previousSampled.texture;
+            lap(BuildPhaseTexturePrevious);
             if (texture == nullptr && record != nullptr && record->texture != nullptr) {
                 texture = fastTexture(*record);
                 (texture != nullptr ? counters.fastHits : counters.fastMisses).fetch_add(1, std::memory_order_relaxed);
             }
+            lap(BuildPhaseTextureFast);
             if (texture == nullptr) texture = cachedTexture(context, words, resource, components, guestBytes, depthCompare);
+            lap(BuildPhaseTextureCached);
+            if (split) {
+                addBuildPhase(BuildPhaseHeadMultisample, cachedTextureHeadMs[0]);
+                addBuildPhase(BuildPhaseHeadKeptBytes, cachedTextureHeadMs[1]);
+                addBuildPhase(BuildPhaseHeadDepthSurface, cachedTextureHeadMs[2]);
+            }
+            cachedTextureHeadMs = {};
             if (resource.dimension == TextureDimension::k2DMsaa) multisampleSources.push_back(resource.baseAddress);
             bool baseLevel = false;
             if (element < binding.imageUnnormalized.size() && binding.imageUnnormalized[element]) {
@@ -4101,9 +4165,11 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
             textureSrgb.push_back(forcedSrgb);
             describedRanges.push_back({"texture", resource.baseAddress, guestBytes, resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), resource.dccAddress});
             item.imageAllocations.push_back(textures.size() - 1);
+            lap(BuildPhaseLookupTail);
         }
         // The line is due even when every element took the fast path (cachedTexture reports too).
         reportTextureCounters();
+        lap(BuildPhaseLookupReport);
         return;
     }
     previousSampled = {};
@@ -4127,13 +4193,16 @@ void ShaderResources::resolveImageBinding(const ShaderRecompiler::DescriptorBind
         const auto mip = std::min(resource.baseLevel + mipOffset, resource.mipCount - 1u);
         Require(resource.minLod <= mip * 256u, "guest storage texture descriptor clamps its minimum LOD above the level it addresses, which is not implemented");
         const auto guestBytes = record != nullptr && record->decoded ? record->guestBytes : DescribeSurface(resource).guestBytes;
+        lap(BuildPhaseLookupDecode);
         CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
         if (resource.dccAddress != 0) CompletePendingCpuWrites(context, resource.dccAddress, DccKeyBytes(guestBytes));
+        lap(BuildPhaseLookupPending);
         // Images the shader only reads have nothing to store back.
         const bool written = element >= binding.imageWritten.size() || binding.imageWritten[element];
         // The same surface as the previous element: its image was just looked up and refreshed.
         if (sameAsPrevious && StorageDedupeEnabled()) storageTextures.push_back(storageTextures.back());
         else storageTextures.push_back(cachedStorageTexture(context, words, resource, mip, guestBytes, written));
+        lap(BuildPhaseLookupStorage);
         storageMips.push_back(mip);
         storageKeys.push_back(resource.dccAddress);
         storageFirstLayer.push_back(firstLayer);

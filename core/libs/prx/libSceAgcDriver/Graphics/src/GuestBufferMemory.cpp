@@ -653,7 +653,19 @@ ImportWatchRequest importWatchRequest() {
 #endif
 
 #ifdef _WIN32
-constexpr std::uint64_t settleFloorBytes = 0x100000;
+// Fork-only: 64 KiB rather than upstream's 1 MiB. Demon's Souls imports ~3300 writable ranges under
+// 1 MiB (~590 MiB); unsettled, they leave the write watch and every texture over them takes the
+// full revalidation walk. APS5_SETTLE_FLOOR_KIB overrides the floor (1024: upstream's).
+constexpr std::uint64_t defaultSettleFloorBytes = 0x10000;
+
+// The smallest direct import that is settled and stays watched.
+std::uint64_t settleFloorBytes() {
+    static const std::uint64_t floor = [] {
+        const char* text = std::getenv("APS5_SETTLE_FLOOR_KIB");
+        return text != nullptr ? std::strtoull(text, nullptr, 10) * 1024ull : defaultSettleFloorBytes;
+    }();
+    return floor;
+}
 
 const char* settleImport(const Context& context, HostImports& state, const HostImport& entry, VkResult& result) {
     std::unique_lock queueLock(*context.settleQueueMutex);
@@ -1144,7 +1156,7 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     VkResult result = VK_SUCCESS;
     const char* step = nullptr;
 #ifdef _WIN32
-    const bool settled = entry.alias == nullptr && state.watchPrivateImports && writable && bytes >= settleFloorBytes;
+    const bool settled = entry.alias == nullptr && state.watchPrivateImports && writable && bytes >= settleFloorBytes();
     const bool watchedHostPointer = entry.alias != nullptr || !state.unwatchImports || settled;
     const bool watchedDmaBuf = watchedHostPointer;
 #else
@@ -1171,6 +1183,19 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
+#ifdef _WIN32
+    // Fork-only APS5_PROFILE_DRAW: why direct imports leave the write watch, every 10 s.
+    if (entry.unwatched && std::getenv("APS5_PROFILE_DRAW") != nullptr) {
+        static std::atomic<std::uint64_t> small{0}, readOnly{0}, other{0}, smallBytes{0}, readOnlyBytes{0};
+        static std::atomic<std::int64_t> lastReport{0};
+        if (!writable) { ++readOnly; readOnlyBytes += bytes; }
+        else if (bytes < settleFloorBytes()) { ++small; smallBytes += bytes; }
+        else ++other;
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load();
+        if (now - last >= 10 && lastReport.compare_exchange_strong(last, now)) std::fprintf(stderr, "[import-unwatch] lifetime: read-only %llu (%.1f MiB), writable under 1 MiB %llu (%.1f MiB), other %llu; last 0x%llx+0x%llx writable %d\n", static_cast<unsigned long long>(readOnly.load()), static_cast<double>(readOnlyBytes.load()) / 1048576.0, static_cast<unsigned long long>(small.load()), static_cast<double>(smallBytes.load()) / 1048576.0, static_cast<unsigned long long>(other.load()), static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), writable ? 1 : 0);
+    }
+#endif
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(entry.alias);

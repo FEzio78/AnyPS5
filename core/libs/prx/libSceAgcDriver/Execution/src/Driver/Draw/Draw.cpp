@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
+#include <spirv/unified1/spirv.hpp>
 #include <algorithm>
 #include <atomic>
 #include <chrono>
@@ -34,6 +35,56 @@ struct CpuIndirectPrograms {
 CpuIndirectPrograms& CpuIndirect() {
     static auto* programs = new CpuIndirectPrograms;
     return *programs;
+}
+
+// Fork-only: front programs (with their packet's patch locations) whose indirect draws take the
+// GPU path once the patched start instance SGPR is read as gl_BaseInstance. Learned from a CPU-path
+// draw that classifies GPU-side with the variant. APS5_NO_BASE_INSTANCE=1 turns this off.
+struct BaseInstancePrograms {
+    std::mutex mutex;
+    std::unordered_set<std::uint64_t> keys;
+    std::atomic<std::uint64_t> variantDraws{0}, gpuDraws{0}, cpuDraws{0}, learned{0};
+};
+
+BaseInstancePrograms& BaseInstance() {
+    static auto* programs = new BaseInstancePrograms;
+    return *programs;
+}
+
+bool BaseInstanceEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_BASE_INSTANCE") == nullptr;
+    return enabled;
+}
+
+bool BaseInstanceKnown(std::uint64_t key) {
+    auto& programs = BaseInstance();
+    std::lock_guard lock(programs.mutex);
+    return programs.keys.contains(key);
+}
+
+void NoteBaseInstance(std::uint64_t key) {
+    auto& programs = BaseInstance();
+    std::lock_guard lock(programs.mutex);
+    if (programs.keys.size() >= 65536) programs.keys.clear();
+    if (programs.keys.insert(key).second) ++programs.learned;
+}
+
+// The variant serves a CPU-path indirect draw whose packet patches nothing but the start instance,
+// which the program does not fold into a vertex fetch, and that has no instance-rate vertex inputs
+// (Vulkan would add the start instance to them; the guest fetch does not).
+bool BaseInstanceServes(const ShaderRecompiler::RecompileResult& result, const Pm4::DrawParameters::IndirectDraw& indirect) {
+    if (result.instanceOffsetSgpr >= 0 || indirect.startInstanceSgpr < 0 || indirect.baseVertexLocation != 0x280u) return false;
+    if (indirect.drawIndexEnabled && indirect.drawIndexLocation != 0x280u) return false;
+    return std::none_of(result.vertexAttributes.begin(), result.vertexAttributes.end(), [](const auto& attribute) { return attribute.fetchIndex != 0; });
+}
+
+void ReportBaseInstance() {
+    static std::atomic<std::int64_t> lastReport{0};
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now)) return;
+    auto& programs = BaseInstance();
+    std::fprintf(stderr, "[base-instance] lifetime: %llu draws with the variant (%llu GPU-side, %llu CPU-side), %llu programs learned\n", static_cast<unsigned long long>(programs.variantDraws.load()), static_cast<unsigned long long>(programs.gpuDraws.load()), static_cast<unsigned long long>(programs.cpuDraws.load()), static_cast<unsigned long long>(programs.learned.load()));
 }
 
 bool IndirectPrepatchEnabled() {
@@ -136,6 +187,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     if (registerKey) {
         const auto keyStart = profile ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         drawKey = drawRegisterKey(queue, *submission.shaders, localDevice->Serial(), &shapeKey, traceDrawCache() ? &drawKeyComponents : nullptr);
+        // An indirect draw's front program may be the gl_BaseInstance variant (see BaseInstancePrograms),
+        // which a draw with other patch locations, or a direct draw, must not reuse.
+        if (drawParameters.indirect) {
+            const auto& indirect = *drawParameters.indirect;
+            for (const std::uint64_t value : {0x494e444952ull, static_cast<std::uint64_t>(indirect.opcode), static_cast<std::uint64_t>(indirect.baseVertexLocation), static_cast<std::uint64_t>(indirect.startInstanceLocation)}) drawKey = (drawKey ^ value) * 0x100000001b3ull;
+        }
         std::lock_guard cacheLock(drawCacheMutex);
         ++drawEntryCounters.lookups;
         ++drawEntryCounters.registerKeyLookups;
@@ -243,6 +300,21 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         indirect.startInstanceSgpr = sgprOf(indirect.startInstanceLocation);
         indirect.drawIndexSgpr = sgprOf(indirect.drawIndexLocation);
     }
+    std::int32_t baseInstanceSgpr = -1;
+    std::uint64_t baseInstanceKey = 0xcbf29ce484222325ull;
+    const bool baseInstanceEligible = BaseInstanceEnabled() && drawParameters.indirect && drawParameters.indirect->startInstanceSgpr >= 0 && graphics.stages.path == Graphics::ShaderPath::Vertex && !graphics.stages.tessellation && !graphics.stages.mesh && !graphics.rectList && !programs.empty() && programs.front().binary.stage == Stage::Vertex && std::ranges::find(localDevice->Target().supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityDrawParameters)) != localDevice->Target().supportedCapabilities.end();
+    if (baseInstanceEligible) {
+        const auto& indirect = *drawParameters.indirect;
+        const auto mix = [&](std::uint64_t value) { baseInstanceKey = (baseInstanceKey ^ value) * 0x100000001b3ull; };
+        mix(reinterpret_cast<std::uintptr_t>(programs.front().snapshot.get()));
+        mix(programs.front().codeOffset);
+        mix(indirect.opcode);
+        mix(indirect.recordBytes);
+        mix(indirect.baseVertexLocation);
+        mix(indirect.startInstanceLocation);
+        mix(indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u);
+        if (BaseInstanceKnown(baseInstanceKey)) baseInstanceSgpr = indirect.startInstanceSgpr;
+    }
     std::optional<Pm4::DrawArguments> prepatched;
     std::uint64_t prepatchKey = 0;
     const bool prepatchEligible = IndirectPrepatchEnabled() && drawParameters.indirect && !drawParameters.indirect->countIndirect && drawParameters.indirect->count == 1 && !graphics.stages.tessellation && !graphics.stages.mesh && !graphics.rectList && !programs.empty();
@@ -257,7 +329,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         mix(indirect.baseVertexLocation);
         mix(indirect.startInstanceLocation);
         mix(indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u);
-        if (CpuIndirectKnown(prepatchKey)) {
+        if (baseInstanceSgpr < 0 && CpuIndirectKnown(prepatchKey)) {
             recordQueuedLabelsBeforeRead(submission.queue);
             prepatched = Pm4::ReadDrawArguments(indirect, 0);
             const auto patch = [&](std::uint32_t location, std::uint32_t value) {
@@ -290,6 +362,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         decodeReads[i].clear();
         vertexInfos[i] = Graphics::DecodeVertexStageInfo(program.binary.header, program.binary.headerAddress, program.userData, &decodeReads[i], false, 8u - program.firstUserSgpr);
         if (vertexInfos[i]) vertexInfos[i]->paClVsOutCntl = PositionExportLayout(program.snapshot.get(), program.codeOffset, program.binary.code, readRegister(queue.context, 0x207), program.tailContinuation.get()) | graphics.layerExports;
+        if (i == 0 && baseInstanceSgpr >= 0 && vertexInfos[i]) vertexInfos[i]->baseInstanceSgpr = baseInstanceSgpr;
     };
     if (!registerKey) {
         for (std::size_t i = 0; i < programs.size(); ++i) decodeVertexInfo(i);
@@ -430,6 +503,14 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
             indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
+            const std::int32_t variant = vertexInfos[0] ? vertexInfos[0]->baseInstanceSgpr : -1;
+            if (variant >= 0) {
+                ++BaseInstance().variantDraws;
+                ++(indirectCpu ? BaseInstance().cpuDraws : BaseInstance().gpuDraws);
+            } else if (baseInstanceEligible && indirectCpu == Graphics::IndirectDrawPath::NotFolded && BaseInstanceServes(result, *drawParameters.indirect)) {
+                NoteBaseInstance(baseInstanceKey);
+            }
+            if (profile) ReportBaseInstance();
             // A prepatched draw's user words hold its arguments, which only the CPU path expects.
             if (prepatched && !indirectCpu) {
                 indirectCpu = Graphics::IndirectDrawPath::NotFolded;
@@ -455,7 +536,10 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         drawEntryCounters.dataStagesCompiled += dataStagesCompiled;
         drawEntryCounters.dataVerified += dataVerified;
     }
-    cacheDrawStages(stageEntries, drawHit, drawParameters, indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
+    // A CPU-path draw of the gl_BaseInstance variant patches no user word: its stages serve every
+    // record, so they may be kept like a GPU-side draw's.
+    const bool variantStages = indirectCpu && vertexInfos[0] && vertexInfos[0]->baseInstanceSgpr >= 0 && BaseInstanceServes(*programResults[0], *drawParameters.indirect);
+    cacheDrawStages(stageEntries, drawHit, drawParameters, variantStages ? std::nullopt : indirectCpu, programs, stageCaptures, vertexInfos, decodeReads, verifyHit, matched, fresh, drawKey, registerKey, decode, phaseTiming, reused, entry, shapeKey);
     timing.Mark("shader_compile_and_link");
 
     for (const auto& reads : decodeReads) {
@@ -548,7 +632,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 patched.insert(word->first);
             };
             patch(baseVertexWord, indirect.recordBytes == 20 ? arguments.vertexOffset : arguments.firstVertexOrIndex);
-            patch(startInstanceWord, arguments.firstInstance);
+            if (!variantStages) patch(startInstanceWord, arguments.firstInstance);
             patch(drawIndexWord, record);
             if (graphics.stages.tessellation) {
                 for (std::size_t i = 0; i < programs.size(); ++i) {
@@ -556,6 +640,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 }
             }
             Pm4::DrawParameters direct{0, arguments.count, 0, arguments.instances, drawParameters.flags, drawParameters.indexed, 0, 0};
+            // The gl_BaseInstance variant takes the start instance from the draw, not the user word.
+            if (vertexInfos[0] && vertexInfos[0]->baseInstanceSgpr >= 0) direct.firstInstance = arguments.firstInstance;
             if (drawParameters.indexed) {
 
                 if (arguments.firstVertexOrIndex >= drawParameters.indexCount) continue;

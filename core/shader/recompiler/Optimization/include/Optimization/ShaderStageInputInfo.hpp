@@ -140,6 +140,7 @@ struct ShaderVertexInputInfo {
     ShaderTessellationInputInfo tess;
     bool fetchExternal = false;
     bool fetchEmbedded = false;
+    int baseInstanceSgpr = -1;
 };
 
 struct ShaderComputeInputInfo: ShaderWorkgroupInputInfo {

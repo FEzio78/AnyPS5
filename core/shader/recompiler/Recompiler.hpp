@@ -194,6 +194,9 @@ struct ShaderVertexStageInfo {
     std::uint32_t fetchBufferReg;
     bool fetchEmbedded;
     std::uint32_t paClVsOutCntl = 0;
+    // The user SGPR an indirect draw's packet patches with its start instance, read as
+    // gl_BaseInstance (and the instance ID VGPR as gl_InstanceIndex - gl_BaseInstance); -1: none.
+    std::int32_t baseInstanceSgpr = -1;
 };
 
 struct ShaderFloatMode {

@@ -445,6 +445,9 @@ private:
         const StorageTexture* source = nullptr;
         bool depth = false;
         bool valid = false;
+        // A partially resident snapshot: its committed ranges at `generation` (CollectWrites fails
+        // over the uncommitted pages, so the fast path proves these ranges instead).
+        std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
     };
     void captureValidation();
     // A surface of this object the fast proof found a foreign image pending over: the element

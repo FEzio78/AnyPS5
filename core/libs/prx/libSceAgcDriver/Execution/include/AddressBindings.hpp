@@ -181,6 +181,45 @@ inline void ReportVkMemoryLocked(MemoryTrace& trace) {
         const double arenaMiB = static_cast<double>(GuestMemory::ArenaCommittedBytes()) / 1048576.0;
         std::fprintf(stderr, "[vk-memory] process private %.0f MiB: guest arena committed %.0f MiB, the rest %.0f MiB (driver heap, Vulkan system memory, loader)\n", privateMiB, arenaMiB, privateMiB - arenaMiB);
     }
+    // Where "the rest" lives: committed bytes of each Win32 heap (the CRT's malloc is the process
+    // heap; drivers create their own), and private committed memory outside every heap
+    // (VirtualAlloc'd regions, the guest arena among them).
+    struct HeapSummaryInfo {
+        DWORD cb;
+        SIZE_T cbAllocated;
+        SIZE_T cbCommitted;
+        SIZE_T cbReserved;
+        SIZE_T cbMaxReserve;
+    };
+    using HeapSummaryFn = BOOL(WINAPI*)(HANDLE, DWORD, HeapSummaryInfo*);
+    static const auto heapSummary = reinterpret_cast<HeapSummaryFn>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("kernel32.dll"), "HeapSummary")));
+    std::vector<HANDLE> heaps(GetProcessHeaps(0, nullptr) + 16);
+    heaps.resize(GetProcessHeaps(static_cast<DWORD>(heaps.size()), heaps.data()));
+    std::vector<std::pair<SIZE_T, std::string>> heapLines;
+    SIZE_T heapCommitted = 0;
+    const HANDLE processHeap = GetProcessHeap();
+    for (const auto heap : heaps) {
+        HeapSummaryInfo summary{sizeof(HeapSummaryInfo), 0, 0, 0, 0};
+        if (heapSummary == nullptr || !heapSummary(heap, 0, &summary)) continue;
+        heapCommitted += summary.cbCommitted;
+        char text[160];
+        std::snprintf(text, sizeof(text), " %p%s %.0f/%.0f MiB", heap, heap == processHeap ? " (process heap, malloc)" : "", static_cast<double>(summary.cbAllocated) / 1048576.0, static_cast<double>(summary.cbCommitted) / 1048576.0);
+        heapLines.emplace_back(summary.cbCommitted, text);
+    }
+    std::sort(heapLines.begin(), heapLines.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+    std::string heapText;
+    for (std::size_t i = 0; i < heapLines.size() && i < 5; ++i) heapText += heapLines[i].second;
+    SIZE_T privateCommitted = 0;
+    std::uint64_t regions = 0;
+    MEMORY_BASIC_INFORMATION region{};
+    for (auto* at = static_cast<char*>(nullptr); VirtualQuery(at, &region, sizeof(region)) == sizeof(region); at = static_cast<char*>(region.BaseAddress) + region.RegionSize) {
+        if (region.State == MEM_COMMIT && region.Type == MEM_PRIVATE) {
+            privateCommitted += region.RegionSize;
+            ++regions;
+        }
+        if (region.RegionSize == 0) break;
+    }
+    std::fprintf(stderr, "[vk-memory] %zu heaps %.0f MiB committed (allocated/committed, largest:%s); private committed outside heaps and the guest arena %.0f MiB in %llu regions\n", heapLines.size(), static_cast<double>(heapCommitted) / 1048576.0, heapText.c_str(), (static_cast<double>(privateCommitted) - static_cast<double>(heapCommitted)) / 1048576.0 - static_cast<double>(GuestMemory::ArenaCommittedBytes()) / 1048576.0, static_cast<unsigned long long>(regions));
 #endif
     std::vector<const MemorySite*> ranked;
     for (const auto& [key, site] : trace.sites) if (site.liveBytes != 0) ranked.push_back(&site);

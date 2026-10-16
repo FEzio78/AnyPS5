@@ -21,6 +21,7 @@
 #include <new>
 #include <shared_mutex>
 #include <unordered_map>
+#include <unordered_set>
 #include "ControlFlow/include/ControlFlow/GraphBuilder.hpp"
 #include "ControlFlow/include/ControlFlow/Structurizer.hpp"
 #include "RdnaDecoder/include/RdnaDecoder/RdnaInstructionDecoder.hpp"
@@ -412,6 +413,36 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         }
         return nullptr;
     };
+    // Fork-only APS5_TRACE_VK_MEMORY: what the source entries hold, every 30 s.
+    static const bool traceMemory = std::getenv("APS5_TRACE_VK_MEMORY") != nullptr;
+    if (traceMemory) {
+        static std::atomic<std::int64_t> lastReport{0};
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastReport.load();
+        if (now - last >= 30 && lastReport.compare_exchange_strong(last, now)) {
+            std::size_t entries = 0, programs = 0, variants = 0, memo = 0;
+            std::uint64_t codeWords = 0, variantWords = 0, memoWords = 0;
+            std::unordered_set<const void*> seen;
+            const auto words = [&](const SharedSpirv& spirv) -> std::uint64_t {
+                const auto* data = spirv.Words().data();
+                return data != nullptr && seen.insert(data).second ? spirv.Words().size() : 0u;
+            };
+            std::shared_lock lock(mutex);
+            for (const auto& [bucketKey, bucket] : sources) {
+                for (const auto& entry : bucket) {
+                    std::lock_guard entryLock(entry->mutex);
+                    ++entries;
+                    codeWords += entry->code.size();
+                    programs += entry->program != nullptr ? 1u : 0u;
+                    variants += entry->variants.size();
+                    for (const auto& variant : entry->variants) if (variant != nullptr) variantWords += words(variant->artifact.spirv);
+                    memo += entry->memo.size();
+                    for (const auto& kept : entry->memo) if (kept.result != nullptr) memoWords += words(kept.result->spirv);
+                }
+            }
+            std::fprintf(stderr, "[recompile-memory] %zu source entries (%.0f MiB of guest code), %zu holding an IR program, %zu variants (%.0f MiB of SPIR-V), %zu memoized results (%.0f MiB of further SPIR-V)\n", entries, static_cast<double>(codeWords) * 4.0 / 1048576.0, programs, variants, static_cast<double>(variantWords) * 4.0 / 1048576.0, memo, static_cast<double>(memoWords) * 4.0 / 1048576.0);
+        }
+    }
     std::shared_ptr<SourceEntry> source;
     {
         std::shared_lock lock(mutex);

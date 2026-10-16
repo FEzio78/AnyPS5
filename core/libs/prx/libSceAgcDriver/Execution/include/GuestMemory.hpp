@@ -69,6 +69,8 @@ void Unwatch(std::uint64_t address, std::size_t bytes);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true);
 void SetUnwatchHook(void (*hook)(std::uint64_t address, std::size_t bytes));
 bool Watched(std::uint64_t address, std::size_t bytes);
+// Fork-only diagnostic: committed bytes of the guest arena's reservation (0 off Windows).
+std::uint64_t ArenaCommittedBytes();
 // Fork-only diagnostic: why Watched is false for a range (arena bounds, host region, tracker state).
 const char* WatchCoverageReason(std::uint64_t address, std::size_t bytes, std::uint64_t* arenaBase, std::uint64_t* arenaSize);
 std::uint64_t CollectWrites(std::uint64_t address, std::size_t bytes);

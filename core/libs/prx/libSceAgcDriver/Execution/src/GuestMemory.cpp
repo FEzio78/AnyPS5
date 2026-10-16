@@ -1391,6 +1391,26 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+std::uint64_t ArenaCommittedBytes() {
+#ifdef _WIN32
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    std::uint64_t committed = 0;
+    for (auto cursor = base; cursor < base + size;) {
+        MEMORY_BASIC_INFORMATION info{};
+        if (VirtualQuery(reinterpret_cast<const void*>(cursor), &info, sizeof(info)) == 0) break;
+        const auto regionEnd = reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize;
+        if (info.State == MEM_COMMIT) committed += std::min<std::uintptr_t>(regionEnd, base + size) - std::max<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(info.BaseAddress), cursor);
+        if (regionEnd <= cursor) break;
+        cursor = regionEnd;
+    }
+    return committed;
+#else
+    return 0;
+#endif
+}
+
 const char* WatchCoverageReason(std::uint64_t address, std::size_t bytes, std::uint64_t* arenaBase, std::uint64_t* arenaSize) {
     auto& tracker = Tracker();
     const auto lock = lockTracker(tracker);

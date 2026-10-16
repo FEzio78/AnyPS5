@@ -5,6 +5,7 @@
 #define VK_NO_PROTOTYPES
 #endif
 #include <vulkan/vulkan.h>
+#include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
@@ -13,6 +14,7 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <psapi.h>
 #endif
 #include <algorithm>
 #include <array>
@@ -171,6 +173,15 @@ inline void ReportVkMemoryLocked(MemoryTrace& trace) {
         types += part;
     }
     std::fprintf(stderr, "[vk-memory] %zu live allocations:%s; host-pointer imports %.0f MiB (not counted above)\n", trace.live.size(), types.c_str(), static_cast<double>(trace.importedBytes) / 1048576.0);
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX counters{};
+    counters.cb = sizeof(counters);
+    if (GetProcessMemoryInfo(GetCurrentProcess(), reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&counters), sizeof(counters))) {
+        const double privateMiB = static_cast<double>(counters.PrivateUsage) / 1048576.0;
+        const double arenaMiB = static_cast<double>(GuestMemory::ArenaCommittedBytes()) / 1048576.0;
+        std::fprintf(stderr, "[vk-memory] process private %.0f MiB: guest arena committed %.0f MiB, the rest %.0f MiB (driver heap, Vulkan system memory, loader)\n", privateMiB, arenaMiB, privateMiB - arenaMiB);
+    }
+#endif
     std::vector<const MemorySite*> ranked;
     for (const auto& [key, site] : trace.sites) if (site.liveBytes != 0) ranked.push_back(&site);
     std::sort(ranked.begin(), ranked.end(), [](const MemorySite* a, const MemorySite* b) { return a->liveBytes > b->liveBytes; });

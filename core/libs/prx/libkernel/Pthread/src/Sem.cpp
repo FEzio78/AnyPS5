@@ -60,12 +60,10 @@ int APS5_VABI scePthreadSemDestroy(PthreadSem* sem) {
 
 int APS5_VABI scePthreadSemPost(PthreadSem* sem) {
     auto* current = resolveSem(sem);
-    {
-        std::lock_guard lock(current->_mutex);
-        if (current->_count == sceSemValueMax)
-            return SCE_KERNEL_ERROR_EOVERFLOW;
-        ++current->_count;
-    }
+    std::lock_guard lock(current->_mutex);
+    if (current->_count == sceSemValueMax)
+        return SCE_KERNEL_ERROR_EOVERFLOW;
+    ++current->_count;
     current->_cv.NotifyOne();
     return 0;
 }

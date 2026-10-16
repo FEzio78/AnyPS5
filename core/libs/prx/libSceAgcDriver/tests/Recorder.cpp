@@ -2646,6 +2646,11 @@ void drawSnapshotTableSetTests(const Device& device, Recorder& recorder) {
     constexpr std::uint32_t height = 4;
     alignas(256) static std::array<float, width * height> texels{};
     texels.fill(1.0f);
+    GuestAllocations::Mutation().Add(texels.data(), sizeof(texels), true, true, false);
+    struct Unregister {
+        void* data;
+        ~Unregister() { GuestAllocations::Mutation().Remove(data); }
+    } unregister{texels.data()};
     const auto address = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(texels.data()));
     const std::array<std::uint32_t, 8> texture{static_cast<std::uint32_t>(address >> 8u), static_cast<std::uint32_t>((address >> 40u) & 0xffu) | (22u << 20u) | (((width - 1u) & 3u) << 30u), ((width - 1u) >> 2u) | ((height - 1u) << 14u), 0xfacu | (9u << 28u), 0u, 0u, 0u, 0u};
     constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);

@@ -2,6 +2,8 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_GRAPHICS_INCLUDE_GUESTTEXTURERESOURCE_HPP
 
 #include "Recompiler.hpp"
+#include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <span>
 
@@ -92,6 +94,25 @@ struct GuestTextureResource {
 };
 
 float EffectiveMinLod(const GuestTextureResource& resource);
+
+// Mip levels a host image of the surface's extent can hold. A guest descriptor may count more
+// levels than the extent halves to (the rest are 1x1, and the guest layout keeps them); a Vulkan
+// image cannot, and writes to the levels past this count land past the image's memory.
+inline std::uint32_t HostMipLevels(const GuestTextureResource& resource) {
+    auto extent = std::max(resource.width, resource.height);
+    if (resource.dimension == TextureDimension::k3D) extent = std::max(extent, resource.depthOrLastArray + 1u);
+    return std::min(resource.mipCount, static_cast<std::uint32_t>(std::bit_width(std::max(extent, 1u))));
+}
+
+// The guest level a view starts at, as a level of the host image.
+inline std::uint32_t HostBaseLevel(const GuestTextureResource& resource) {
+    return std::min(resource.baseLevel, HostMipLevels(resource) - 1u);
+}
+
+// The levels a view exposes, counted from HostBaseLevel.
+inline std::uint32_t HostViewLevelCount(const GuestTextureResource& resource) {
+    return std::min(resource.lastLevel, HostMipLevels(resource) - 1u) - HostBaseLevel(resource) + 1u;
+}
 
 bool IsNullTextureResource(std::span<const std::uint32_t> words);
 GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words);

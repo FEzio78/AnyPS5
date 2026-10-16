@@ -216,6 +216,7 @@ private:
             if (value.fetchEmbedded) destination.fetchIndex = 0;
             append(key, destination);
         }
+        if (value.baseInstanceSgpr >= 0) append(key, 0x4241534549000000ull | static_cast<std::uint32_t>(value.baseInstanceSgpr));
     }
 
     static void append(std::vector<std::uint64_t>& key, const MeshTargetLimits& value) {

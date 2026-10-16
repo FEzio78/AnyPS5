@@ -2151,6 +2151,81 @@ void ReadCommittedUnsynced(std::uint64_t address, std::span<std::byte> destinati
     copyCommitted(address, destination);
 }
 
+namespace {
+
+// Two multiply-mix lanes over 8-byte words (each range's offset and size mixed in first).
+struct RangeHash {
+    std::uint64_t a = 0x9e3779b97f4a7c15ull;
+    std::uint64_t b = 0xc2b2ae3d27d4eb4full;
+
+    static std::uint64_t mix(std::uint64_t x, std::uint64_t y) {
+        const auto product = static_cast<unsigned __int128>(x) * y;
+        return static_cast<std::uint64_t>(product) ^ static_cast<std::uint64_t>(product >> 64u);
+    }
+
+    void word(std::uint64_t value) {
+        a = mix(a ^ value, 0xa0761d6478bd642full);
+        b = mix(b ^ value ^ 0x8ebc6af09c88c6e3ull, 0xe7037ed1a0b428dbull) + value;
+    }
+
+    void bytes(const std::byte* data, std::size_t size) {
+        std::size_t i = 0;
+        for (; i + 8u <= size; i += 8u) {
+            std::uint64_t value;
+            std::memcpy(&value, data + i, 8u);
+            word(value);
+        }
+        if (i < size) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, data + i, size - i);
+            word(value ^ (static_cast<std::uint64_t>(size - i) << 56u));
+        }
+    }
+
+    std::array<std::uint64_t, 2> finish() const { return {mix(a, 0x589965cc75374cc3ull) ^ b, mix(b, 0x1d8e4e27c47d124full) ^ a}; }
+};
+
+}
+
+// The surface [address, address + size) as one stream: committed ranges from `source`, every other
+// byte as zero (what EqualsCommitted compares an uncommitted page as).
+template<typename Source>
+std::array<std::uint64_t, 2> hashSurface(std::uint64_t address, std::size_t size, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges, Source source) {
+    RangeHash hash;
+    const auto stop = address + size;
+    auto cursor = address;
+    static constexpr std::array<std::byte, 4096> zeros{};
+    const auto zero = [&](std::uint64_t end) {
+        while (cursor < end) {
+            const auto take = static_cast<std::size_t>(std::min<std::uint64_t>(end - cursor, zeros.size()));
+            hash.bytes(zeros.data(), take);
+            cursor += take;
+        }
+    };
+    for (const auto& [rangeBegin, rangeEnd] : ranges) {
+        const auto begin = std::max(rangeBegin, cursor);
+        const auto end = std::min(rangeEnd, stop);
+        if (end <= begin) continue;
+        zero(begin);
+        hash.bytes(source(begin), static_cast<std::size_t>(end - begin));
+        cursor = end;
+    }
+    zero(stop);
+    return hash.finish();
+}
+
+std::array<std::uint64_t, 2> HashCommittedCopy(std::uint64_t address, std::span<const std::byte> copy, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges) {
+    return hashSurface(address, copy.size(), ranges, [&](std::uint64_t at) { return copy.data() + (at - address); });
+}
+
+std::array<std::uint64_t, 2> HashCommitted(std::uint64_t address, std::size_t bytes) {
+    if (bytes == 0) return RangeHash{}.finish();
+    FlushGpuWrites(address, bytes);
+    const TimedAccess timed(CounterCompare, bytes);
+    const auto ranges = CommittedRanges(address, bytes);
+    return hashSurface(address, bytes, ranges, [](std::uint64_t at) { return reinterpret_cast<const std::byte*>(at); });
+}
+
 bool EqualsCommitted(std::uint64_t address, std::span<const std::byte> bytes) {
     if (bytes.empty()) return true;
     FlushGpuWrites(address, bytes.size());

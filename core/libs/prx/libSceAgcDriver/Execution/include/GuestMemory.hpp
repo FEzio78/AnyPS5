@@ -3,6 +3,7 @@
 
 #include <atomic>
 #include <cstddef>
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -18,6 +19,11 @@ bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
 // the guest commits their pages on demand, so a binding can cover reserved but uncommitted pages.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable = false);
+// Fork-only: a 128-bit hash of a surface as EqualsCommitted sees it (committed bytes, every other
+// byte zero): of `copy` (the bytes of [address, address + copy.size())) with `ranges` committed, and
+// of guest memory now, after the GPU writes over it landed. Equal hashes stand for EqualsCommitted.
+std::array<std::uint64_t, 2> HashCommittedCopy(std::uint64_t address, std::span<const std::byte> copy, std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
+std::array<std::uint64_t, 2> HashCommitted(std::uint64_t address, std::size_t bytes);
 // Both facts from one walk of the page tables: the accessible parts of a range and whether they cover
 // all of it (`whole`, what Accessible answers). Reserved pages are queried each time, so asking twice
 // costs two VirtualQuery per run.

@@ -546,6 +546,8 @@ public:
     void resize(std::size_t count) { Mutable().resize(count); }
     std::vector<std::uint32_t>::iterator insert(std::vector<std::uint32_t>::const_iterator where, std::initializer_list<std::uint32_t> values) { return Mutable().insert(where, values); }
     friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
+    // Fork-only diagnostic: how many SharedSpirv objects share these words (0: none held).
+    [[nodiscard]] long Holders() const { return words ? words.use_count() : owner ? owner.use_count() : 0; }
 
 private:
     struct Holder {

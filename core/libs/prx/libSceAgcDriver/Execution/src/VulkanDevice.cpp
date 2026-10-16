@@ -407,6 +407,8 @@ struct VulkanDevice::State {
     VkFormat surfaceFormat = VK_FORMAT_B8G8R8A8_UNORM;
     VkColorSpaceKHR surfaceColorSpace = VK_COLOR_SPACE_SRGB_NONLINEAR_KHR;
     bool swapchainColorSpaces = false;
+    bool debugUtils = false;
+    VkDebugUtilsMessengerEXT bindingMessenger = VK_NULL_HANDLE;
     bool hdrMetadata = false;
     std::vector<VkSurfaceFormatKHR> surfaceFormats;
     std::uint64_t surfaceDisplayGeneration = 0;
@@ -795,6 +797,7 @@ struct VulkanDevice::State {
         }
         if (instance != VK_NULL_HANDLE) {
             if (surface) reinterpret_cast<PFN_vkDestroySurfaceKHR>(instanceProc(instance, "vkDestroySurfaceKHR"))(instance, surface, nullptr);
+            if (bindingMessenger != VK_NULL_HANDLE) reinterpret_cast<PFN_vkDestroyDebugUtilsMessengerEXT>(instanceProc(instance, "vkDestroyDebugUtilsMessengerEXT"))(instance, bindingMessenger, nullptr);
             reinterpret_cast<PFN_vkDestroyInstance>(instanceProc(instance, "vkDestroyInstance"))(instance, nullptr);
         }
         if (library != nullptr) {
@@ -1006,18 +1009,31 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
             instanceExtensions.push_back(VK_EXT_SWAPCHAIN_COLOR_SPACE_EXTENSION_NAME);
             state->swapchainColorSpaces = true;
         }
+        if (AddressBindingsEnabled() && std::any_of(available.begin(), available.end(), [](const auto& item) { return std::strcmp(item.extensionName, VK_EXT_DEBUG_UTILS_EXTENSION_NAME) == 0; })) {
+            instanceExtensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+            state->debugUtils = true;
+        }
         create.enabledExtensionCount = static_cast<std::uint32_t>(instanceExtensions.size());
         create.ppEnabledExtensionNames = instanceExtensions.data();
     }
     check(state->InstanceFunction<PFN_vkCreateInstance>("vkCreateInstance")(&create, nullptr, &state->instance), "vkCreateInstance");
     APS5_LOG_OUT("Vulkan instance created instance=%p", reinterpret_cast<void*>(state->instance));
+    if (state->debugUtils) {
+        VkDebugUtilsMessengerCreateInfoEXT messenger{VK_STRUCTURE_TYPE_DEBUG_UTILS_MESSENGER_CREATE_INFO_EXT};
+        messenger.messageSeverity = VK_DEBUG_UTILS_MESSAGE_SEVERITY_INFO_BIT_EXT;
+        messenger.messageType = VK_DEBUG_UTILS_MESSAGE_TYPE_DEVICE_ADDRESS_BINDING_BIT_EXT;
+        messenger.pfnUserCallback = AddressBindingCallback;
+        const auto createMessenger = reinterpret_cast<PFN_vkCreateDebugUtilsMessengerEXT>(state->instanceProc(state->instance, "vkCreateDebugUtilsMessengerEXT"));
+        if (createMessenger == nullptr || createMessenger(state->instance, &messenger, nullptr, &state->bindingMessenger) != VK_SUCCESS) state->bindingMessenger = VK_NULL_HANDLE;
+        std::fprintf(stderr, "[address-bindings] debug messenger %s\n", state->bindingMessenger != VK_NULL_HANDLE ? "registered" : "could not be registered");
+    }
     if (window != nullptr) {
         state->surface = window->createSurface(window->context, state->instance);
         require(state->surface != VK_NULL_HANDLE, "window returned a null surface");
         state->window = window->context;
         APS5_LOG_OUT("Vulkan surface created surface=%p window=%p", reinterpret_cast<void*>(state->surface), state->window);
     }
-    state->deviceProc = state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr");
+    state->deviceProc = TraceImageCreation(state->InstanceFunction<PFN_vkGetDeviceProcAddr>("vkGetDeviceProcAddr"));
     const auto enumerate = state->InstanceFunction<PFN_vkEnumeratePhysicalDevices>("vkEnumeratePhysicalDevices");
     std::uint32_t count = 0;
     check(enumerate(state->instance, &count, nullptr), "vkEnumeratePhysicalDevices");
@@ -1820,6 +1836,21 @@ VulkanDevice::VulkanDevice(const PresentationWindow* window, bool compileOnly) :
         deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
         faultFeatures.pNext = byteFeatures.pNext;
         byteFeatures.pNext = &faultFeatures;
+    }
+    VkPhysicalDeviceAddressBindingReportFeaturesEXT bindingReport{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+    if (state->bindingMessenger != VK_NULL_HANDLE && hasExtension(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME)) {
+        VkPhysicalDeviceFeatures2 features{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2, &bindingReport};
+        state->InstanceFunction<PFN_vkGetPhysicalDeviceFeatures2>("vkGetPhysicalDeviceFeatures2")(selected, &features);
+    }
+    if (AddressBindingsEnabled()) std::fprintf(stderr, "[address-bindings] device report %s\n", bindingReport.reportAddressBinding == VK_TRUE ? "enabled" : state->bindingMessenger != VK_NULL_HANDLE ? "unsupported" : "off");
+    if (bindingReport.reportAddressBinding == VK_TRUE) {
+        bindingReport = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ADDRESS_BINDING_REPORT_FEATURES_EXT};
+        bindingReport.reportAddressBinding = VK_TRUE;
+        deviceExtensions.push_back(VK_EXT_DEVICE_ADDRESS_BINDING_REPORT_EXTENSION_NAME);
+        deviceInfo.enabledExtensionCount = static_cast<std::uint32_t>(deviceExtensions.size());
+        deviceInfo.ppEnabledExtensionNames = deviceExtensions.data();
+        bindingReport.pNext = byteFeatures.pNext;
+        byteFeatures.pNext = &bindingReport;
     }
     const bool checkpoints = std::getenv("APS5_GPU_CHECKPOINTS") != nullptr && hasExtension(VK_NV_DEVICE_DIAGNOSTIC_CHECKPOINTS_EXTENSION_NAME);
     if (checkpoints) {

@@ -390,7 +390,17 @@ void emitEntryPrologue(IrProgram& program, IrBlock& entryBlock, const TranslateO
             entryIr.SetScalarReg(static_cast<ScalarReg>(3), entryIr.Constant(lanes | (lanes << 8u)));
         }
         setVector(static_cast<VectorReg>(5), drawIndex(StageInputKind::VertexIndex));
-        setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+        // An indirect draw's packet writes its start instance into this user SGPR, and the instance
+        // ID VGPR excludes it; Vulkan supplies the same start instance as gl_BaseInstance and adds
+        // it to gl_InstanceIndex.
+        const std::int32_t baseInstance = options.inputInfo.vertex != nullptr ? options.inputInfo.vertex->baseInstanceSgpr : -1;
+        const bool folded = options.embeddedFetch != nullptr && options.embeddedFetch->instanceOffsetSgpr >= 0;
+        if (baseInstance >= 0 && !folded && static_cast<std::uint32_t>(baseInstance) >= options.userDataBaseRegister && static_cast<std::uint32_t>(baseInstance) < options.userDataBaseRegister + options.userDataCount) {
+            entryIr.SetScalarReg(static_cast<ScalarReg>(baseInstance), builtin(StageInputKind::BaseInstance));
+            setVector(static_cast<VectorReg>(8), entryIr.ISub(builtin(StageInputKind::InstanceIndex), builtin(StageInputKind::BaseInstance)));
+        } else {
+            setVector(static_cast<VectorReg>(8), drawIndex(StageInputKind::InstanceIndex));
+        }
     }
 }
 

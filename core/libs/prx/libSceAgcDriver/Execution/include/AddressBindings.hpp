@@ -98,9 +98,154 @@ inline VKAPI_ATTR VkResult VKAPI_CALL TracedCreateImage(VkDevice device, const V
     return result;
 }
 
+// Fork-only APS5_TRACE_VK_MEMORY=1: live vkAllocateMemory bytes by memory type and by allocating
+// call site (host-pointer imports counted apart: they map guest memory instead of adding to it),
+// printed every 30 s as [vk-memory].
+inline bool VkMemoryTraceEnabled() {
+    static const bool enabled = std::getenv("APS5_TRACE_VK_MEMORY") != nullptr;
+    return enabled;
+}
+
+struct TracedMemory {
+    VkDeviceSize bytes = 0;
+    std::uint32_t type = 0;
+    bool imported = false;
+    std::uint64_t site = 0;
+};
+
+struct MemorySite {
+    std::array<void*, 6> stack{};
+    std::uint16_t frames = 0;
+    VkDeviceSize liveBytes = 0;
+    std::uint64_t liveCount = 0;
+    std::uint64_t totalCount = 0;
+};
+
+struct MemoryTrace {
+    std::mutex mutex;
+    std::map<std::uint64_t, TracedMemory> live;
+    std::map<std::uint64_t, MemorySite> sites;
+    std::array<VkDeviceSize, VK_MAX_MEMORY_TYPES> typeBytes{};
+    VkDeviceSize importedBytes = 0;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+    std::chrono::steady_clock::time_point lastReport = std::chrono::steady_clock::now();
+};
+
+inline MemoryTrace& VkMemory() {
+    static auto* trace = new MemoryTrace;
+    return *trace;
+}
+
+inline std::string StackText(const void* const* stack, std::uint16_t frames) {
+    std::string text;
+    char part[160];
+    for (std::uint16_t i = 0; i < frames; ++i) {
+        const auto address = reinterpret_cast<std::uintptr_t>(stack[i]);
+#ifdef _WIN32
+        HMODULE module = nullptr;
+        char name[MAX_PATH] = "?";
+        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, reinterpret_cast<LPCSTR>(address), &module) && module != nullptr) {
+            GetModuleFileNameA(module, name, sizeof(name));
+            const char* base = std::strrchr(name, '\\');
+            std::snprintf(part, sizeof(part), " %s+0x%llx", base != nullptr ? base + 1 : name, static_cast<unsigned long long>(address - reinterpret_cast<std::uintptr_t>(module)));
+            text += part;
+            continue;
+        }
+#endif
+        std::snprintf(part, sizeof(part), " 0x%llx", static_cast<unsigned long long>(address));
+        text += part;
+    }
+    return text;
+}
+
+inline void ReportVkMemoryLocked(MemoryTrace& trace) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now - trace.lastReport < std::chrono::seconds(30)) return;
+    trace.lastReport = now;
+    std::string types;
+    char part[96];
+    for (std::uint32_t i = 0; i < VK_MAX_MEMORY_TYPES; ++i) {
+        if (trace.typeBytes[i] == 0) continue;
+        std::snprintf(part, sizeof(part), " type%u %.0f MiB", i, static_cast<double>(trace.typeBytes[i]) / 1048576.0);
+        types += part;
+    }
+    std::fprintf(stderr, "[vk-memory] %zu live allocations:%s; host-pointer imports %.0f MiB (not counted above)\n", trace.live.size(), types.c_str(), static_cast<double>(trace.importedBytes) / 1048576.0);
+    std::vector<const MemorySite*> ranked;
+    for (const auto& [key, site] : trace.sites) if (site.liveBytes != 0) ranked.push_back(&site);
+    std::sort(ranked.begin(), ranked.end(), [](const MemorySite* a, const MemorySite* b) { return a->liveBytes > b->liveBytes; });
+    for (std::size_t i = 0; i < ranked.size() && i < 10; ++i) {
+        std::fprintf(stderr, "[vk-memory]   %.0f MiB in %llu live (%llu made):%s\n", static_cast<double>(ranked[i]->liveBytes) / 1048576.0, static_cast<unsigned long long>(ranked[i]->liveCount), static_cast<unsigned long long>(ranked[i]->totalCount), StackText(ranked[i]->stack.data(), ranked[i]->frames).c_str());
+    }
+}
+
+inline VKAPI_ATTR VkResult VKAPI_CALL TracedAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+    auto& trace = VkMemory();
+    const auto result = trace.allocate(device, info, allocator, memory);
+    if (result != VK_SUCCESS || info == nullptr || memory == nullptr) return result;
+    TracedMemory entry{info->allocationSize, info->memoryTypeIndex, false, 0};
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) entry.imported = true;
+    }
+    MemorySite site;
+#ifdef _WIN32
+    site.frames = RtlCaptureStackBackTrace(1, static_cast<DWORD>(site.stack.size()), site.stack.data(), nullptr);
+#endif
+    std::uint64_t key = 0xcbf29ce484222325ull ^ (entry.imported ? 1u : 0u);
+    for (std::uint16_t i = 0; i < site.frames; ++i) key = (key ^ reinterpret_cast<std::uintptr_t>(site.stack[i])) * 0x100000001b3ull;
+    entry.site = key;
+    std::lock_guard lock(trace.mutex);
+    auto& kept = trace.sites[key];
+    if (kept.totalCount == 0) {
+        kept.stack = site.stack;
+        kept.frames = site.frames;
+    }
+    ++kept.totalCount;
+    if (!entry.imported) {
+        kept.liveBytes += entry.bytes;
+        ++kept.liveCount;
+        if (entry.type < VK_MAX_MEMORY_TYPES) trace.typeBytes[entry.type] += entry.bytes;
+    } else {
+        trace.importedBytes += entry.bytes;
+    }
+    trace.live[reinterpret_cast<std::uint64_t>(*memory)] = entry;
+    ReportVkMemoryLocked(trace);
+    return result;
+}
+
+inline VKAPI_ATTR void VKAPI_CALL TracedFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
+    auto& trace = VkMemory();
+    {
+        std::lock_guard lock(trace.mutex);
+        if (const auto found = trace.live.find(reinterpret_cast<std::uint64_t>(memory)); found != trace.live.end()) {
+            const auto& entry = found->second;
+            if (entry.imported) trace.importedBytes -= entry.bytes;
+            else {
+                if (entry.type < VK_MAX_MEMORY_TYPES) trace.typeBytes[entry.type] -= entry.bytes;
+                auto& site = trace.sites[entry.site];
+                site.liveBytes -= entry.bytes;
+                --site.liveCount;
+            }
+            trace.live.erase(found);
+        }
+    }
+    trace.free(device, memory, allocator);
+}
+
 inline VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TracedDeviceProc(VkDevice device, const char* name) {
     auto& trace = ImageTrace();
-    if (name != nullptr && std::strcmp(name, "vkCreateImage") == 0) {
+    if (name != nullptr && VkMemoryTraceEnabled()) {
+        auto& memory = VkMemory();
+        if (std::strcmp(name, "vkAllocateMemory") == 0) {
+            if (memory.allocate == nullptr) memory.allocate = reinterpret_cast<PFN_vkAllocateMemory>(trace.deviceProc(device, name));
+            if (memory.allocate != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(TracedAllocateMemory);
+        }
+        if (std::strcmp(name, "vkFreeMemory") == 0) {
+            if (memory.free == nullptr) memory.free = reinterpret_cast<PFN_vkFreeMemory>(trace.deviceProc(device, name));
+            if (memory.free != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(TracedFreeMemory);
+        }
+    }
+    if (name != nullptr && AddressBindingsEnabled() && std::strcmp(name, "vkCreateImage") == 0) {
         if (trace.createImage == nullptr) trace.createImage = reinterpret_cast<PFN_vkCreateImage>(trace.deviceProc(device, name));
         if (trace.createImage != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(TracedCreateImage);
     }
@@ -109,7 +254,7 @@ inline VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TracedDeviceProc(VkDevice device
 
 // Wraps the device function resolver so vkCreateImage is traced; returns the resolver to use.
 inline PFN_vkGetDeviceProcAddr TraceImageCreation(PFN_vkGetDeviceProcAddr deviceProc) {
-    if (!AddressBindingsEnabled() || deviceProc == nullptr) return deviceProc;
+    if ((!AddressBindingsEnabled() && !VkMemoryTraceEnabled()) || deviceProc == nullptr) return deviceProc;
     ImageTrace().deviceProc = deviceProc;
     return TracedDeviceProc;
 }

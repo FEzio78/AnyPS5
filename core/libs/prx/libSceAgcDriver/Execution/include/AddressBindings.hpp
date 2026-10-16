@@ -243,8 +243,146 @@ inline VKAPI_ATTR void VKAPI_CALL TracedFreeMemory(VkDevice device, VkDeviceMemo
     trace.free(device, memory, allocator);
 }
 
+// With APS5_TRACE_ADDRESS_BINDINGS: the creating and destroying call stacks of every buffer and
+// device memory, and a memory's imported host pointer (the guest address of a host import), kept
+// after destruction so a fault in an unbound range names the code that made and freed its owner.
+// Handles are reused, so an entry created after the binding it is asked about is reported as such.
+struct ObjectLife {
+    VkDeviceSize size = 0;
+    std::uint32_t usage = 0;
+    std::uint32_t memoryType = 0;
+    std::uint64_t hostPointer = 0;
+    bool imported = false;
+    double createdMs = 0;
+    double destroyedMs = -1;
+    std::array<void*, 8> created{};
+    std::array<void*, 8> destroyed{};
+    std::uint16_t createdFrames = 0;
+    std::uint16_t destroyedFrames = 0;
+};
+
+struct LifeTrace {
+    std::mutex mutex;
+    std::map<std::uint64_t, ObjectLife> objects;
+    PFN_vkCreateBuffer createBuffer = nullptr;
+    PFN_vkDestroyBuffer destroyBuffer = nullptr;
+    PFN_vkAllocateMemory allocate = nullptr;
+    PFN_vkFreeMemory free = nullptr;
+};
+
+inline LifeTrace& ObjectLives() {
+    static auto* trace = new LifeTrace;
+    return *trace;
+}
+
+inline double AddressBindingNowMs() {
+    return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - AddressBindings().start).count();
+}
+
+inline void RecordCreated(std::uint64_t handle, ObjectLife life) {
+    life.createdMs = AddressBindingNowMs();
+#ifdef _WIN32
+    life.createdFrames = RtlCaptureStackBackTrace(1, static_cast<DWORD>(life.created.size()), life.created.data(), nullptr);
+#endif
+    auto& trace = ObjectLives();
+    std::lock_guard lock(trace.mutex);
+    trace.objects[handle] = life;
+}
+
+inline void RecordDestroyed(std::uint64_t handle) {
+    std::array<void*, 8> stack{};
+    std::uint16_t frames = 0;
+#ifdef _WIN32
+    frames = RtlCaptureStackBackTrace(1, static_cast<DWORD>(stack.size()), stack.data(), nullptr);
+#endif
+    const double now = AddressBindingNowMs();
+    auto& trace = ObjectLives();
+    std::lock_guard lock(trace.mutex);
+    const auto found = trace.objects.find(handle);
+    if (found == trace.objects.end()) return;
+    found->second.destroyedMs = now;
+    found->second.destroyed = stack;
+    found->second.destroyedFrames = frames;
+}
+
+inline VKAPI_ATTR VkResult VKAPI_CALL LifeCreateBuffer(VkDevice device, const VkBufferCreateInfo* info, const VkAllocationCallbacks* allocator, VkBuffer* buffer) {
+    const auto result = ObjectLives().createBuffer(device, info, allocator, buffer);
+    if (result != VK_SUCCESS || info == nullptr || buffer == nullptr) return result;
+    ObjectLife life;
+    life.size = info->size;
+    life.usage = static_cast<std::uint32_t>(info->usage);
+    RecordCreated(reinterpret_cast<std::uint64_t>(*buffer), life);
+    return result;
+}
+
+inline VKAPI_ATTR void VKAPI_CALL LifeDestroyBuffer(VkDevice device, VkBuffer buffer, const VkAllocationCallbacks* allocator) {
+    if (buffer != VK_NULL_HANDLE) RecordDestroyed(reinterpret_cast<std::uint64_t>(buffer));
+    ObjectLives().destroyBuffer(device, buffer, allocator);
+}
+
+inline VKAPI_ATTR VkResult VKAPI_CALL LifeAllocateMemory(VkDevice device, const VkMemoryAllocateInfo* info, const VkAllocationCallbacks* allocator, VkDeviceMemory* memory) {
+    const auto result = VkMemoryTraceEnabled() ? TracedAllocateMemory(device, info, allocator, memory) : ObjectLives().allocate(device, info, allocator, memory);
+    if (result != VK_SUCCESS || info == nullptr || memory == nullptr) return result;
+    ObjectLife life;
+    life.size = info->allocationSize;
+    life.memoryType = info->memoryTypeIndex;
+    for (auto* next = static_cast<const VkBaseInStructure*>(info->pNext); next != nullptr; next = next->pNext) {
+        if (next->sType != VK_STRUCTURE_TYPE_IMPORT_MEMORY_HOST_POINTER_INFO_EXT) continue;
+        life.imported = true;
+        life.hostPointer = reinterpret_cast<std::uint64_t>(reinterpret_cast<const VkImportMemoryHostPointerInfoEXT*>(next)->pHostPointer);
+    }
+    RecordCreated(reinterpret_cast<std::uint64_t>(*memory), life);
+    return result;
+}
+
+inline VKAPI_ATTR void VKAPI_CALL LifeFreeMemory(VkDevice device, VkDeviceMemory memory, const VkAllocationCallbacks* allocator) {
+    if (memory != VK_NULL_HANDLE) RecordDestroyed(reinterpret_cast<std::uint64_t>(memory));
+    if (VkMemoryTraceEnabled()) TracedFreeMemory(device, memory, allocator);
+    else ObjectLives().free(device, memory, allocator);
+}
+
+// The traced life of `handle` as asked about for a binding made at `boundMs`.
+inline std::string ObjectLifeText(std::uint64_t handle, double boundMs) {
+    auto& trace = ObjectLives();
+    std::lock_guard lock(trace.mutex);
+    const auto found = trace.objects.find(handle);
+    if (found == trace.objects.end()) return "  (creation not traced)";
+    const auto& life = found->second;
+    char line[256];
+    std::snprintf(line, sizeof(line), "  size 0x%llx usage 0x%x memory type %u%s host 0x%llx; created %.0f ms%s; destroyed %s", static_cast<unsigned long long>(life.size), life.usage, life.memoryType, life.imported ? " IMPORTED" : "", static_cast<unsigned long long>(life.hostPointer), life.createdMs, boundMs >= 0 && life.createdMs > boundMs + 1 ? " (AFTER the binding: handle reused, this is a later object)" : "", life.destroyedMs < 0 ? "no" : "at");
+    std::string text = line;
+    if (life.destroyedMs >= 0) {
+        std::snprintf(line, sizeof(line), " %.0f ms", life.destroyedMs);
+        text += line;
+    }
+    text += "\n[address-bindings]    created by:" + StackText(life.created.data(), life.createdFrames);
+    if (life.destroyedMs >= 0) text += "\n[address-bindings]    destroyed by:" + StackText(life.destroyed.data(), life.destroyedFrames);
+    return text;
+}
+
 inline VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL TracedDeviceProc(VkDevice device, const char* name) {
     auto& trace = ImageTrace();
+    if (name != nullptr && AddressBindingsEnabled()) {
+        auto& lives = ObjectLives();
+        if (std::strcmp(name, "vkCreateBuffer") == 0) {
+            if (lives.createBuffer == nullptr) lives.createBuffer = reinterpret_cast<PFN_vkCreateBuffer>(trace.deviceProc(device, name));
+            if (lives.createBuffer != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(LifeCreateBuffer);
+        }
+        if (std::strcmp(name, "vkDestroyBuffer") == 0) {
+            if (lives.destroyBuffer == nullptr) lives.destroyBuffer = reinterpret_cast<PFN_vkDestroyBuffer>(trace.deviceProc(device, name));
+            if (lives.destroyBuffer != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(LifeDestroyBuffer);
+        }
+        if (std::strcmp(name, "vkAllocateMemory") == 0) {
+            if (lives.allocate == nullptr) lives.allocate = reinterpret_cast<PFN_vkAllocateMemory>(trace.deviceProc(device, name));
+            if (VkMemoryTraceEnabled() && VkMemory().allocate == nullptr) VkMemory().allocate = lives.allocate;
+            if (lives.allocate != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(LifeAllocateMemory);
+        }
+        if (std::strcmp(name, "vkFreeMemory") == 0) {
+            if (lives.free == nullptr) lives.free = reinterpret_cast<PFN_vkFreeMemory>(trace.deviceProc(device, name));
+            if (VkMemoryTraceEnabled() && VkMemory().free == nullptr) VkMemory().free = lives.free;
+            if (lives.free != nullptr) return reinterpret_cast<PFN_vkVoidFunction>(LifeFreeMemory);
+        }
+    }
     if (name != nullptr && VkMemoryTraceEnabled()) {
         auto& memory = VkMemory();
         if (std::strcmp(name, "vkAllocateMemory") == 0) {
@@ -380,6 +518,7 @@ inline std::vector<std::string> AddressBindingReport(VkDeviceAddress address, Vk
         if (overlaps(entry)) {
             lines.emplace_back("[address-bindings] live:    " + AddressBindingText(entry, address, now));
             if (entry.type == VK_OBJECT_TYPE_IMAGE) lines.emplace_back("[address-bindings]" + TracedImageText(entry.handle));
+            else if (entry.type == VK_OBJECT_TYPE_BUFFER || entry.type == VK_OBJECT_TYPE_DEVICE_MEMORY) lines.emplace_back("[address-bindings]" + ObjectLifeText(entry.handle, entry.boundMs));
             ++liveHits;
         }
     }
@@ -389,6 +528,7 @@ inline std::vector<std::string> AddressBindingReport(VkDeviceAddress address, Vk
         const auto& entry = log.unbound[(log.unboundNext - 1 - i) % AddressBindingLog::UnboundCapacity];
         if (overlaps(entry)) {
             lines.emplace_back("[address-bindings] unbound: " + AddressBindingText(entry, address, now));
+            if (entry.type == VK_OBJECT_TYPE_BUFFER || entry.type == VK_OBJECT_TYPE_DEVICE_MEMORY) lines.emplace_back("[address-bindings]" + ObjectLifeText(entry.handle, entry.boundMs));
             ++unboundHits;
         }
     }

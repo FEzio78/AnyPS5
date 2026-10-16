@@ -1478,10 +1478,32 @@ bool UnchangedCommittedSince(std::span<const std::pair<std::uint64_t, std::uint6
     return true;
 }
 
+// Fork-only APS5_TRACE_GUEST_WRITES=1: every driver store into guest memory (the changed range),
+// with milliseconds since the first one and the storing thread, appended to guest-writes.txt in
+// the working directory, to match against the addresses a crash report names.
+void traceGuestWrite(std::uint64_t first, std::uint64_t end) {
+    static const bool enabled = std::getenv("APS5_TRACE_GUEST_WRITES") != nullptr;
+    if (!enabled) return;
+    static std::mutex mutex;
+    static std::FILE* file = std::fopen("guest-writes.txt", "w");
+    static const auto start = std::chrono::steady_clock::now();
+    if (file == nullptr) return;
+    const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+    std::lock_guard lock(mutex);
+#ifdef _WIN32
+    const auto thread = static_cast<unsigned long>(GetCurrentThreadId());
+#else
+    const auto thread = 0ul;
+#endif
+    std::fprintf(file, "%.1f %llx %llx %lu\n", ms, static_cast<unsigned long long>(first), static_cast<unsigned long long>(end - first), thread);
+    std::fflush(file);
+}
+
 std::uint64_t storeOwn(std::uint64_t address, std::size_t bytes, const std::function<std::pair<std::uint64_t, std::uint64_t>()>& store) {
     if (bytes == 0) return 0;
     const auto stampStored = [](WriteTracker& tracker, std::pair<std::uint64_t, std::uint64_t> stored) -> std::uint64_t {
         if (stored.second <= stored.first) return 0;
+        traceGuestWrite(stored.first, stored.second);
         ++tracker.generation;
         if (!tracker.watched || !tracker.covers(stored.first, static_cast<std::size_t>(stored.second - stored.first))) {
             tracker.noteUnstampedStore(stored.first, stored.second);

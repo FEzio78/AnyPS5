@@ -337,6 +337,8 @@ struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     // The result memo, most recently used first, at most ResultMemoEntries (under mutex).
     std::list<ResultMemoEntry> memo;
     std::unordered_map<std::uint64_t, std::list<ResultMemoEntry>::iterator> memoIndex;
+    // Fork-only: the source cache's use clock at the entry's last request (see getSource's budget).
+    std::atomic<std::uint64_t> lastUse{0};
 };
 
 namespace {
@@ -397,6 +399,18 @@ bool diskPlans() {
     return enabled && ShaderDiskCache::Enabled() && !DebugProbeActive();
 }
 
+// Hashes of source keys the budget evicted, and how many of those were built again (under the
+// source cache's lock).
+std::unordered_set<std::size_t>& EvictedSourceKeys() {
+    static auto* keys = new std::unordered_set<std::size_t>;
+    return *keys;
+}
+
+std::uint64_t& SourcesRebuilt() {
+    static std::uint64_t rebuilt = 0;
+    return rebuilt;
+}
+
 std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPreparationContext* preparation = nullptr, bool reclaim = true) {
     static PrimedSharedMutex mutex;
     // Entries whose code hashes alike share a bucket; the code comparison picks the right one.
@@ -421,7 +435,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         auto last = lastReport.load();
         if (now - last >= 30 && lastReport.compare_exchange_strong(last, now)) {
             std::size_t entries = 0, programs = 0, variants = 0, memo = 0;
-            std::uint64_t codeWords = 0, variantWords = 0, memoWords = 0;
+            std::uint64_t codeWords = 0, variantWords = 0, memoWords = 0, onlyCachedWords = 0;
             std::unordered_set<const void*> seen;
             const auto words = [&](const SharedSpirv& spirv) -> std::uint64_t {
                 const auto* data = spirv.Words().data();
@@ -435,12 +449,19 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                     codeWords += entry->code.size();
                     programs += entry->program != nullptr ? 1u : 0u;
                     variants += entry->variants.size();
-                    for (const auto& variant : entry->variants) if (variant != nullptr) variantWords += words(variant->artifact.spirv);
+                    for (const auto& variant : entry->variants) {
+                        if (variant == nullptr) continue;
+                        const auto counted = words(variant->artifact.spirv);
+                        variantWords += counted;
+                        long internal = 1;
+                        for (const auto& kept : entry->memo) if (kept.result != nullptr && kept.result->spirv.Words().data() == variant->artifact.spirv.Words().data()) ++internal;
+                        if (variant->artifact.spirv.Holders() <= internal) onlyCachedWords += counted;
+                    }
                     memo += entry->memo.size();
                     for (const auto& kept : entry->memo) if (kept.result != nullptr) memoWords += words(kept.result->spirv);
                 }
             }
-            std::fprintf(stderr, "[recompile-memory] %zu source entries (%.0f MiB of guest code), %zu holding an IR program, %zu variants (%.0f MiB of SPIR-V), %zu memoized results (%.0f MiB of further SPIR-V)\n", entries, static_cast<double>(codeWords) * 4.0 / 1048576.0, programs, variants, static_cast<double>(variantWords) * 4.0 / 1048576.0, memo, static_cast<double>(memoWords) * 4.0 / 1048576.0);
+            std::fprintf(stderr, "[recompile-memory] %zu source entries (%.0f MiB of guest code), %zu holding an IR program, %zu variants (%.0f MiB of SPIR-V, %.0f MiB held by nothing but this cache), %zu memoized results (%.0f MiB of further SPIR-V)\n", entries, static_cast<double>(codeWords) * 4.0 / 1048576.0, programs, variants, static_cast<double>(variantWords) * 4.0 / 1048576.0, static_cast<double>(onlyCachedWords) * 4.0 / 1048576.0, memo, static_cast<double>(memoWords) * 4.0 / 1048576.0);
         }
     }
     std::shared_ptr<SourceEntry> source;
@@ -453,6 +474,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         source = find();
         if (source == nullptr) {
             source = std::make_shared<SourceEntry>();
+            if (EvictedSourceKeys().contains(SourceKeyHash{}(key))) ++SourcesRebuilt();
             source->code.assign(request.shader.code.begin(), request.shader.code.end());
             source->linkedCallFallbacks.assign(request.context.linkedCallFallbacks.begin(), request.context.linkedCallFallbacks.end());
             auto& bucket = sources[key];
@@ -465,6 +487,65 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                 if (profile) std::fprintf(stderr, "[recompile] source key collision %llu: %zu entries share a key (%zu code words)\n", static_cast<unsigned long long>(collisions), bucket.size() + 1, request.shader.code.size());
             }
             bucket.push_back(source);
+        }
+    }
+    // Fork-only: the source cache keeps every compiled variant's SPIR-V (over 10 GB in Demon's Souls).
+    // Every 30 s, while their total exceeds APS5_SOURCE_CACHE_MIB (default 0: no limit), the
+    // least recently used entries leave the cache down to 80% of it. Holders keep theirs alive; a
+    // later request builds the entry again (its plan and artifacts from the shader disk cache).
+    // OFF by default: with 3072 Demon's Souls crashed in game code right after the first eviction
+    // twice (runs 82, 107): a rebuilt entry is not equivalent to the evicted one. Under investigation.
+    static std::atomic<std::uint64_t> useClock{0};
+    source->lastUse.store(useClock.fetch_add(1, std::memory_order_relaxed) + 1, std::memory_order_relaxed);
+    static const std::uint64_t sourceBudget = [] {
+        const char* text = std::getenv("APS5_SOURCE_CACHE_MIB");
+        return (text != nullptr ? std::strtoull(text, nullptr, 10) : 0ull) << 20u;
+    }();
+    static std::atomic<std::int64_t> lastTrim{0};
+    if (sourceBudget != 0) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        auto last = lastTrim.load(std::memory_order_relaxed);
+        if (now - last >= 30 && lastTrim.compare_exchange_strong(last, now)) {
+            struct Candidate {
+                std::uint64_t lastUse;
+                std::uint64_t bytes;
+                std::vector<std::uint64_t> key;
+                const SourceEntry* entry;
+            };
+            std::vector<Candidate> candidates;
+            std::uint64_t total = 0;
+            std::unique_lock lock(mutex);
+            for (const auto& [bucketKey, bucket] : sources) {
+                for (const auto& entry : bucket) {
+                    std::unique_lock entryLock(entry->mutex, std::try_to_lock);
+                    if (!entryLock.owns_lock()) continue;
+                    std::uint64_t bytes = 0;
+                    for (const auto& variant : entry->variants) if (variant != nullptr) bytes += variant->artifact.spirv.size() * sizeof(std::uint32_t);
+                    total += bytes;
+                    if (entry != source) candidates.push_back({entry->lastUse.load(std::memory_order_relaxed), bytes, bucketKey, entry.get()});
+                }
+            }
+            std::uint64_t evicted = 0, evictedBytes = 0;
+            if (total > sourceBudget) {
+                std::sort(candidates.begin(), candidates.end(), [](const Candidate& a, const Candidate& b) { return a.lastUse < b.lastUse; });
+                const auto target = sourceBudget / 5u * 4u;
+                for (const auto& candidate : candidates) {
+                    if (total <= target) break;
+                    const auto found = sources.find(candidate.key);
+                    if (found == sources.end()) continue;
+                    auto& bucket = found->second;
+                    const auto it = std::find_if(bucket.begin(), bucket.end(), [&](const std::shared_ptr<SourceEntry>& entry) { return entry.get() == candidate.entry; });
+                    if (it == bucket.end()) continue;
+                    bucket.erase(it);
+                    if (bucket.empty()) sources.erase(found);
+                    total -= candidate.bytes;
+                    ++evicted;
+                    evictedBytes += candidate.bytes;
+                    EvictedSourceKeys().insert(SourceKeyHash{}(candidate.key));
+                }
+            }
+            static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+            if (profile) std::fprintf(stderr, "[source-cache] %.0f MiB of variant SPIR-V kept (budget %.0f MiB); %llu entries evicted now (%.0f MiB), %llu built again after an eviction so far\n", static_cast<double>(total) / 1048576.0, static_cast<double>(sourceBudget) / 1048576.0, static_cast<unsigned long long>(evicted), static_cast<double>(evictedBytes) / 1048576.0, static_cast<unsigned long long>(SourcesRebuilt()));
         }
     }
     {

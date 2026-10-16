@@ -1391,6 +1391,24 @@ bool Watched(std::uint64_t address, std::size_t bytes) {
     return tracker.watched && bytes != 0 && bytes <= std::numeric_limits<std::uint64_t>::max() - address && tracker.covers(address, bytes);
 }
 
+const char* WatchCoverageReason(std::uint64_t address, std::size_t bytes, std::uint64_t* arenaBase, std::uint64_t* arenaSize) {
+    auto& tracker = Tracker();
+    const auto lock = lockTracker(tracker);
+    tracker.initialize();
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    *arenaBase = base;
+    *arenaSize = size;
+    if (!tracker.watched) return "tracker not write-watched";
+    if (address < base || address + bytes > base + size) return "outside the guest arena";
+#ifdef _WIN32
+    if (GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(address), bytes)) return "overlaps an arena host region";
+#endif
+    if (!tracker.covers(address, bytes)) return "inside the arena, not in the tracker's coverage";
+    return "covered";
+}
+
 bool UnchangedSince(std::uint64_t address, std::size_t bytes, std::uint64_t generation) {
     if (bytes == 0 || bytes > std::numeric_limits<std::uint64_t>::max() - address) return false;
     auto& tracker = Tracker();

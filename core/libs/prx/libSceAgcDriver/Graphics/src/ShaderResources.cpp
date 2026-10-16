@@ -430,6 +430,8 @@ struct LookupRecord {
     std::uint64_t generation;
     const StorageTexture* source;
     bool depth = false;
+    // A partially resident snapshot: its committed ranges, `generation` their collect.
+    std::optional<std::vector<std::pair<std::uint64_t, std::uint64_t>>> committed;
 };
 
 thread_local std::vector<LookupRecord>* lookupLogSlot = nullptr;
@@ -830,7 +832,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->committed = std::move(committed);
                 it->untracked = untracked;
                 touchTexture(cache, it);
-                logLookup({it->texture.get(), resource, guestBytes, *keys, generation, nullptr});
+                logLookup({it->texture.get(), resource, guestBytes, *keys, it->generation, nullptr, false, it->committed});
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(LookupOutcomes::SampledHitSnapshot, start);
                 return it->texture;
@@ -840,7 +842,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         ++cache.counts.stale;
     }
     CachedTexture entry{key, address, std::vector<std::byte>(source != nullptr ? 0u : bytes), nullptr, *keys, snapshotGeneration};
-    entry.committed = std::move(committed);
+    entry.committed = committed;
     if (source != nullptr) {
         entry.source = source;
         entry.sourceVersion = source->Version();
@@ -874,7 +876,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     if (!admitTexture(cache, key, entry.accounted, budget)) {
-        logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+        logLookup({texture.get(), resource, guestBytes, *keys, source != nullptr ? generation : snapshotGeneration, source.get(), false, source != nullptr ? std::nullopt : committed});
         reportCacheCounts(cache, budget);
         reportTextureCounters();
         if (profile) LookupOutcomes::Add(source != nullptr ? LookupOutcomes::SampledMadeView : LookupOutcomes::SampledMadeSnapshot, start);
@@ -883,7 +885,7 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
     cache.bytes += entry.accounted;
     entry.present = Recorder::Presents();
     ++cache.counts.inserted;
-    logLookup({texture.get(), resource, guestBytes, *keys, generation, source.get()});
+    logLookup({texture.get(), resource, guestBytes, *keys, source != nullptr ? generation : snapshotGeneration, source.get(), false, source != nullptr ? std::nullopt : committed});
     cache.entries.push_front(std::move(entry));
     cache.index[key] = cache.entries.begin();
     if (source != nullptr) cache.views.emplace(source.get(), cache.entries.begin());
@@ -2575,7 +2577,7 @@ void ShaderResources::captureValidation() {
     };
     validatedTextures.assign(textures.size(), {});
     for (std::size_t i = 0; i < textures.size(); ++i) {
-        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true};
+        if (const auto* found = record(textures[i].get())) validatedTextures[i] = {found->resource, found->bytes, found->keys, found->generation, 0, found->source, found->depth, true, found->committed};
     }
     lookupLog().clear();
 }
@@ -2595,6 +2597,37 @@ void ShaderResources::captureValidation() {
 // registry mutex), so the pending-image checks are skipped; otherwise one scan answers them for
 // every surface at once. The stamp checks go through one tracker lock, the cache checks through
 // the images' cached flags and one touch of the cache.
+// Fork-only: APS5_NO_COMMITTED_REVALIDATE=1 keeps partially resident snapshots off the fast path.
+bool CommittedRevalidateEnabled() {
+    static const bool enabled = std::getenv("APS5_NO_COMMITTED_REVALIDATE") == nullptr;
+    return enabled;
+}
+
+// Fork-only APS5_PROFILE_DRAW: why fastRevalidate's CollectWrites returned 0, every 10 s.
+void NoteRevalidateCollect(std::uint64_t address, std::size_t bytes, bool storage) {
+    if (!BuildProfiled()) return;
+    static std::atomic<std::uint64_t> partial{0}, unwatched{0}, other{0}, storageCount{0}, bytesSeen{0};
+    static std::atomic<std::int64_t> lastReport{0};
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    if (!GuestMemory::Watched(address, bytes)) {
+        if (GuestMemory::CollectCommittedWrites(address, bytes, ranges) != 0) partial.fetch_add(1, std::memory_order_relaxed);
+        else unwatched.fetch_add(1, std::memory_order_relaxed);
+    } else if (GuestMemory::CollectCommittedWrites(address, bytes, ranges) != 0) {
+        partial.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        other.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (storage) storageCount.fetch_add(1, std::memory_order_relaxed);
+    bytesSeen.fetch_add(bytes, std::memory_order_relaxed);
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = lastReport.load();
+    if (now - last < 10 || !lastReport.compare_exchange_strong(last, now)) return;
+    std::uint64_t arenaBase = 0, arenaSize = 0;
+    const char* why = GuestMemory::WatchCoverageReason(address, bytes, &arenaBase, &arenaSize);
+    std::fprintf(stderr, "[revalidate-collect] last 0x%llx+0x%llx: %s (arena 0x%llx+0x%llx)\n", static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes), why, static_cast<unsigned long long>(arenaBase), static_cast<unsigned long long>(arenaSize));
+    std::fprintf(stderr, "[revalidate-collect] lifetime: partially committed %llu, not watched %llu, watched but no generation %llu (storage %llu); avg %.1f KiB; last 0x%llx+0x%llx\n", static_cast<unsigned long long>(partial.load()), static_cast<unsigned long long>(unwatched.load()), static_cast<unsigned long long>(other.load()), static_cast<unsigned long long>(storageCount.load()), static_cast<double>(bytesSeen.load()) / 1024.0 / static_cast<double>(std::max<std::uint64_t>(1, partial.load() + unwatched.load() + other.load())), static_cast<unsigned long long>(address), static_cast<unsigned long long>(bytes));
+}
+
 bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const PendingOverlap> refreshed, FastFail& reason, std::vector<PendingOverlap>& overlapping, bool& accepted) {
     reason = FastFail::Count;
     overlapping.clear();
@@ -2638,7 +2671,23 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto address = surface.resource.baseAddress;
         const auto bytes = static_cast<std::size_t>(surface.bytes);
         surface.collected = GuestMemory::CollectWrites(address, bytes);
-        if (surface.collected == 0) return fail(FastFail::Collect);
+        // A partially resident snapshot fails the collect over its uncommitted pages; cachedTexture's
+        // hit rule proves its committed ranges instead (the same ranges, no recorded write over the
+        // surface, unchanged since the record's generation).
+        bool committedProved = false;
+        if (surface.collected == 0 && surface.source == nullptr && surface.committed.has_value() && surface.generation != 0 && CommittedRevalidateEnabled()) {
+            thread_local std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+            ranges.clear();
+            const auto partial = GuestMemory::CollectCommittedWrites(address, bytes, ranges);
+            if (partial != 0 && ranges == *surface.committed && !Recorder::SnapshotWriteOverlaps(address, bytes) && GuestMemory::UnchangedCommittedSince(ranges, surface.generation)) {
+                surface.collected = partial;
+                committedProved = true;
+            }
+        }
+        if (surface.collected == 0) {
+            NoteRevalidateCollect(address, bytes, false);
+            return fail(FastFail::Collect);
+        }
         const auto* source = surface.source;
         if (!keyProofs) {
             // Without proofs the keys are compared with the record's (a cleared view's identity
@@ -2678,7 +2727,7 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
             if (!source->Cached()) return fail(FastFail::Evicted);
             queries.push_back({address, bytes, source->Generation()});
             images.push_back(source);
-        } else {
+        } else if (!committedProved) {
             queries.push_back({address, bytes, surface.generation});
         }
     }
@@ -2690,7 +2739,10 @@ bool ShaderResources::fastRevalidate(std::uint64_t serialBefore, std::span<const
         const auto& own = image->Descriptor();
         const auto address = own.baseAddress;
         const auto bytes = static_cast<std::size_t>(image->GuestBytes());
-        if (GuestMemory::CollectWrites(address, bytes) == 0) return fail(FastFail::Collect);
+        if (GuestMemory::CollectWrites(address, bytes) == 0) {
+            NoteRevalidateCollect(address, bytes, true);
+            return fail(FastFail::Collect);
+        }
         if (own.dccAddress != 0) {
             // Refresh's unchanged branch (its key compare against the keys the content was
             // uploaded under, through the image's proof; the memory query below), minus its

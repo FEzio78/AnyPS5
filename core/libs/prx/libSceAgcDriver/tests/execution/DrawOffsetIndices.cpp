@@ -434,6 +434,20 @@ std::string Run(Fixture& fixture) {
         failures += fixture.Check(what + ", on the CPU path", bufferIndices, arguments.vertexOffset, arguments.firstInstance, true);
     }
     {
+        const ShaderRecompiler::RecompileResult unfolded{};
+        AgcDriver::Pm4::DrawParameters::IndirectDraw indirect{reinterpret_cast<std::uintptr_t>(fixture.Records()), 0x25u, 20u, 20u, 1u, false, 0u, NoLocation, 0x11u, NoLocation, false, 0u};
+        indirect.startInstanceSgpr = static_cast<std::int32_t>(StartInstanceSgpr);
+        AgcDriver::Pm4::DrawParameters packet{indexAddress, static_cast<std::uint32_t>(Indices.size()), 2, 0, 0, true, 0, 0};
+        packet.indirect = indirect;
+        const auto plain = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(unfolded, fixture.State(false), Program(staleUserData), fixture.device, packet, false);
+        std::cout << "indexed indirect record patching only an unfolded start instance: classified to " << PathName(plain) << '\n';
+        if (plain != Path::NotFolded) failures += "indexed indirect record patching only an unfolded start instance: classified to " + PathName(plain) + ", expected the CPU path (patched SGPR not folded)\n";
+        packet.indirect = indirect;
+        const auto variant = AgcDriver::DriverDetail::Driver::ClassifyIndirectDraw(unfolded, fixture.State(false), Program(staleUserData), fixture.device, packet, false, static_cast<std::int32_t>(StartInstanceSgpr));
+        std::cout << "the same record for the gl_BaseInstance variant: classified to " << PathName(variant) << '\n';
+        if (variant || packet.indirect->instanceRule != Rule::InPlace) failures += "the same record for the gl_BaseInstance variant: classified to " + PathName(variant) + ", expected the GPU with the start instance in place\n";
+    }
+    {
         const std::string what = "auto indirect record whose program copies v5/v8 before its fetch adds, start vertex 300, start instance 7";
         const std::array<std::uint32_t, 4> record{Vertices, Instances, 300, 7};
         std::copy(record.begin(), record.end(), fixture.Records() + 16);

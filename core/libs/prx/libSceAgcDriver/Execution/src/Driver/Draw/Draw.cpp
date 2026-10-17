@@ -142,7 +142,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
     const bool pipelined = DrawPipeline::Active();
-    if (pipelined && drawParameters.indirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    // Fork-only: an indirect draw waits for the queued commits only when they write its records or
+    // count (the CPU path reads them); recording it synchronously waits for all of them (lockForDraw).
+    // APS5_INDIRECT_DRAIN_ALL=1 waits for all of them here as before.
+    static const bool indirectDrainAll = std::getenv("APS5_INDIRECT_DRAIN_ALL") != nullptr;
+    if (pipelined && drawParameters.indirect && DrawPipeline::Queue0().Busy()) {
+        const auto& indirect = *drawParameters.indirect;
+        auto& pipeline = DrawPipeline::Queue0();
+        if (indirectDrainAll || pipeline.Overlaps(indirect.arguments, static_cast<std::size_t>(indirect.RangeBytes())) || (indirect.countIndirect && pipeline.Overlaps(indirect.countAddress, 4))) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+    }
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);
@@ -557,8 +565,12 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         }
         const auto& result = *programResults[i];
         if (i == 0 && drawParameters.indirect) {
-            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect);
             const std::int32_t variant = vertexInfos[0] ? vertexInfos[0]->baseInstanceSgpr : -1;
+            // Fork-only APS5_BASE_INSTANCE_GPU=1: the variant's draws take the GPU path. Off by default:
+            // a GPU-side record's vertex and index ranges are unknown, so the whole buffers are copied
+            // and scanned per draw (Demon's Souls: 0.10 fps against 1.4 on the CPU path).
+            static const bool baseInstanceGpu = std::getenv("APS5_BASE_INSTANCE_GPU") != nullptr;
+            indirectCpu = ClassifyIndirectDraw(result, graphics, programs.front(), localDevice, drawParameters, traceIndirect, baseInstanceGpu ? variant : -1);
             if (variant >= 0) {
                 ++BaseInstance().variantDraws;
                 ++(indirectCpu ? BaseInstance().cpuDraws : BaseInstance().gpuDraws);
@@ -640,6 +652,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        if (pipelined && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
@@ -655,9 +668,15 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         recordLabelsForPacket(localDevice.get(), submission.queue);
         phaseTiming.Phase(DrawRowLabels);
     };
+    // Fork-only: a single-record CPU-path indirect draw becomes the direct draw its record describes
+    // and is committed through the draw pipeline like one, instead of recorded here synchronously.
+    // APS5_NO_INDIRECT_PIPELINE=1 records it here.
+    static const bool indirectPipeline = std::getenv("APS5_NO_INDIRECT_PIPELINE") == nullptr;
+    bool convertedIndirect = false;
     if (drawParameters.indirect && indirectCpu) {
 
         const auto indirect = *drawParameters.indirect;
+        const bool pipelineRecord = indirectPipeline && pipelined && !indirect.countIndirect && indirect.count == 1 && deferredLabels().labels.empty();
         for (std::size_t i = 0; i < programs.size(); ++i) {
             if (programResults[i] == nullptr) continue;
             resultIndex[i] = results.size();
@@ -734,18 +753,25 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
                 rejected = std::move(*known);
                 return DrawVerdict::Rejected;
             }
+            if (pipelineRecord) {
+                drawParameters = direct;
+                convertedIndirect = true;
+                break;
+            }
             lockForDraw();
             noteDrawWriters(stages, submission.queue);
             phaseTiming.Phase(DrawRowVectors);
             localDevice->Draw(graphics, direct, stages, snapshots);
             phaseTiming.Phase(DrawRowGraphics);
         }
-        timing.Mark("draw_and_resource_release");
-        return drawn();
+        if (!convertedIndirect) {
+            timing.Mark("draw_and_resource_release");
+            return drawn();
+        }
     }
 
     std::vector<std::shared_ptr<DispatchVariant>> recipeStages;
-    if (registerKey && !drawParameters.indirect && !patchedStages && Graphics::DrawRecipes()) {
+    if (registerKey && !drawParameters.indirect && !convertedIndirect && !patchedStages && Graphics::DrawRecipes()) {
         recipeStages.reserve(programs.size());
         for (std::size_t i = 0; i < programs.size(); ++i) recipeStages.push_back(drawHit ? matched[i] : fresh[i]);
         if (std::all_of(recipeStages.begin(), recipeStages.end(), [](const std::shared_ptr<DispatchVariant>& variant) { return variant == nullptr; })) recipeStages.clear();

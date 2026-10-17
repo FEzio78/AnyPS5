@@ -1,3 +1,4 @@
+#include <atomic>
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -189,6 +190,10 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             break;
         case TextureDimension::k2DArray:
             Require(baseArray <= depth, "guest 2D array texture descriptor has a base array past its last array slice");
+            if (depth >= 1024u) {
+                static std::atomic<int> reported{0};
+                if (reported.fetch_add(1) < 40) std::fprintf(stderr, "[texture-desc] 2D array 0x%llx %ux%u with %u slices (base %u): words %08x %08x %08x %08x %08x %08x %08x %08x\n", static_cast<unsigned long long>(baseAddress), width, height, depth + 1u, baseArray, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+            }
             break;
         case TextureDimension::k1DArray:
             Require(height == 1, "guest 1D array texture descriptor has a nonzero height");

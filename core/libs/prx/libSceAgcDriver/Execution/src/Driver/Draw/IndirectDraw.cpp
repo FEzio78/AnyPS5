@@ -21,7 +21,7 @@ void Driver::FoldDrawOffsets(const ShaderRecompiler::RecompileResult& result, co
     if (result.instanceOffsetSgpr >= 0) parameters.firstInstance = drawUserWord(program, result.instanceOffsetSgpr);
 }
 
-std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect) {
+std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const ShaderRecompiler::RecompileResult& result, const Graphics::State& graphics, const DrawProgram& frontProgram, const std::shared_ptr<VulkanDevice>& localDevice, Pm4::DrawParameters& drawParameters, bool traceIndirect, std::int32_t baseInstanceSgpr) {
     std::optional<Graphics::IndirectDrawPath> indirectCpu;
     auto& indirect = *drawParameters.indirect;
     using Rule = Pm4::DrawParameters::IndirectDraw::Rule;
@@ -49,7 +49,12 @@ std::optional<Graphics::IndirectDrawPath> Driver::ClassifyIndirectDraw(const Sha
         else rule = Rule::InPlace;
     };
     dimension(result.vertexOffsetSgpr, indirect.baseVertexSgpr, result.vertexOffsetShared, result.vertexOffsetConflict, drawParameters.indexed ? 0u : indirect.indxOffset, indirect.vertexRule, indirect.vertexConstant);
-    dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
+    // Fork-only: the gl_BaseInstance variant (baseInstanceSgpr, see BaseInstancePrograms) reads the
+    // start instance from the draw, so the record's start instance serves it in place on the GPU.
+    // APS5_NO_BASE_INSTANCE_GPU=1 keeps such draws on the CPU path.
+    static const bool baseInstanceGpu = std::getenv("APS5_NO_BASE_INSTANCE_GPU") == nullptr;
+    if (baseInstanceGpu && baseInstanceSgpr >= 0 && baseInstanceSgpr == indirect.startInstanceSgpr && result.instanceOffsetSgpr < 0) indirect.instanceRule = Rule::InPlace;
+    else dimension(result.instanceOffsetSgpr, indirect.startInstanceSgpr, result.instanceOffsetShared, result.instanceOffsetConflict, 0u, indirect.instanceRule, indirect.instanceConstant);
     if (!support.firstInstance && (indirect.instanceRule == Rule::InPlace || indirect.instanceConstant != 0)) fail(Path::FeatureGap);
     if ((indirect.vertexRule == Rule::Constant || indirect.instanceRule == Rule::Constant) && indirect.count > 256) fail(Path::FeatureGap);
 

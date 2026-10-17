@@ -1172,20 +1172,36 @@ static ResolvedImageTables resolveImageTablesFresh(const ShaderInfo& info, const
         const auto mapStart = static_cast<std::uint32_t>(out.map.size());
         out.map[header + Abi::TableMapStart] = mapStart;
         out.map.resize(out.map.size() + column.keys, 0u);
-        std::unordered_map<std::uint32_t, std::uint32_t> records;
+        constexpr std::uint32_t Unresolved = 0xffffffffu;
+        std::vector<std::uint32_t> records(tables.words.size(), Unresolved);
+        std::array<std::uint32_t, PoisonReasonCount> poisoned{};
+        poisoned.fill(Unresolved);
+        const bool tableFault = out.map[header + Abi::TableFault] != 0u;
         for (std::uint32_t key = 0; key < column.keys; key++) {
             const auto code = column.codes[key];
             std::uint32_t mapped = Abi::NullCode;
             if ((code & Abi::PoisonFlag) != 0u) {
                 const auto reason = static_cast<PoisonReason>(code & ~Abi::PoisonFlag);
-                mapped = reason == PoisonReason::OutsideDomain ? Abi::PoisonCode(Abi::OutsideDomainPoison) : poison(resource, reason, nullptr);
-            } else if (out.map[header + Abi::TableFault] == 0u) {
-                const auto& words = tables.words.at(code);
-                if (sampler || (words.availableDwordMask & (1u << 3u)) == 0u || !nullImageDescriptor(info.images[resource], words)) {
-                    const auto [found, inserted] = records.try_emplace(code, 0u);
-                    if (inserted) found->second = sampler ? samplerRecord(resource, words) : imageRecord(resource, words);
-                    mapped = found->second;
+                if (reason == PoisonReason::OutsideDomain) {
+                    mapped = Abi::PoisonCode(Abi::OutsideDomainPoison);
+                } else {
+                    const auto slot = static_cast<std::size_t>(reason);
+                    if (slot < poisoned.size()) {
+                        if (poisoned[slot] == Unresolved) poisoned[slot] = poison(resource, reason, nullptr);
+                        mapped = poisoned[slot];
+                    } else {
+                        mapped = poison(resource, reason, nullptr);
+                    }
                 }
+            } else if (!tableFault) {
+                if (code >= records.size()) throw std::out_of_range("image table snapshot code is outside its descriptor words");
+                auto& record = records[code];
+                if (record == Unresolved) {
+                    const auto& words = tables.words[code];
+                    record = Abi::NullCode;
+                    if (sampler || (words.availableDwordMask & (1u << 3u)) == 0u || !nullImageDescriptor(info.images[resource], words)) record = sampler ? samplerRecord(resource, words) : imageRecord(resource, words);
+                }
+                mapped = record;
             }
             out.map[mapStart + key] = mapped;
         }

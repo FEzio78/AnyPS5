@@ -318,6 +318,7 @@ struct TableCounters {
     std::atomic<std::uint64_t> snapshots{0};
     std::atomic<std::uint64_t> tables{0};
     std::atomic<std::uint64_t> keys{0};
+    std::atomic<std::uint64_t> distinct{0};
     std::array<std::atomic<std::uint64_t>, PoisonReasonCount> poison{};
     std::atomic<std::uint64_t> narrowed{0};
     std::atomic<std::uint64_t> narrowSkipped{0};
@@ -348,8 +349,8 @@ void reportTables() {
         if (count == 0) continue;
         poison += " " + std::string(ImageTableAbi::PoisonReasonName(static_cast<PoisonReason>(reason))) + "=" + std::to_string(count);
     }
-    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, structural poison:%s, narrowing %llu applied / %llu skipped, %.1f ms\n",
-        static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
+    std::fprintf(stderr, "[image-table] (10 s): %llu snapshots, %llu tables, %llu keys, %llu distinct records, structural poison:%s, narrowing %llu applied / %llu skipped, %.1f ms\n",
+        static_cast<unsigned long long>(snapshots), static_cast<unsigned long long>(counters.tables.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.keys.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.distinct.exchange(0, std::memory_order_relaxed)), poison.empty() ? " none" : poison.c_str(),
         static_cast<unsigned long long>(counters.narrowed.exchange(0, std::memory_order_relaxed)), static_cast<unsigned long long>(counters.narrowSkipped.exchange(0, std::memory_order_relaxed)), static_cast<double>(counters.nanoseconds.exchange(0, std::memory_order_relaxed)) / 1e6);
 }
 
@@ -419,6 +420,7 @@ public:
         }
         auto& counters = tableCounters();
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
+        counters.distinct.fetch_add(tables.words.size(), std::memory_order_relaxed);
         counters.tables.fetch_add(count, std::memory_order_relaxed);
         counters.nanoseconds.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - started).count()), std::memory_order_relaxed);
         if (TableStrict()) {

@@ -50,6 +50,10 @@ extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetMarker(CommandBuffer* buf, const
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbPopMarker(CommandBuffer* buf);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarker(CommandBuffer* buf, const char* str, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbPushMarkerSpan(CommandBuffer* buf, const char* str, std::uint32_t length, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetMarkerSpan(CommandBuffer* buf, const char* str, std::uint32_t length, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbPushMarkerSpan(CommandBuffer* buf, const char* str, std::uint32_t length, std::uint32_t color);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbSetMarkerSpan(CommandBuffer* buf, const char* str, std::uint32_t length, std::uint32_t color);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexBuffer(CommandBuffer* buf, std::uint64_t indexAddress);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetBaseIndirectArgs(CommandBuffer* buf, std::uint32_t shaderType, const volatile void* indirectBaseAddr);
 extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexCount(CommandBuffer* buf, std::uint32_t indexCount);
@@ -226,6 +230,48 @@ void testMarkers() {
     expectFailure([] { sceAgcAcbPushMarker(nullptr, "frame", 0); });
     expectFailure([] { sceAgcAcbPopMarker(nullptr); });
     expectFailure([] { sceAgcAcbSetMarker(nullptr, "frame", 0); });
+}
+
+void testMarkerSpans() {
+    Storage dcb;
+    Storage acb;
+    dcb.words.fill(0xdeadbeefu);
+    acb.words.fill(0xdeadbeefu);
+    const char text[] = "framex";
+    const auto* dcbPush = sceAgcDcbPushMarkerSpan(&dcb.buffer, text, 5, 0xff0000u);
+    const auto* acbPush = sceAgcAcbPushMarkerSpan(&acb.buffer, text, 5, 0x00ff00u);
+    check(dcbPush == dcb.words.data() && acbPush == acb.words.data(), "push marker span did not start at the cursor");
+    check(acbPush[0] == Agc::Command::Header(0x10, 3, 0x0bu << 2u), "push marker span header mismatch");
+    check(std::memcmp(acbPush + 1, "frame\0\0\0", 8) == 0, "push marker span text is not the first length bytes padded with zeros");
+    const auto* full = sceAgcAcbPushMarkerSpan(&acb.buffer, "abcdefgh", 8, 0);
+    sceAgcDcbPushMarkerSpan(&dcb.buffer, "abcdefgh", 8, 0);
+    check(full == acb.words.data() + 3 && full[0] == Agc::Command::Header(0x10, 4, 0x0bu << 2u), "a dword-multiple span is not followed by a terminating dword");
+    check(std::memcmp(full + 1, "abcdefgh", 8) == 0 && full[3] == 0, "dword-multiple marker span text mismatch");
+    const auto* empty = sceAgcAcbPushMarkerSpan(&acb.buffer, nullptr, 0, 0);
+    sceAgcDcbPushMarkerSpan(&dcb.buffer, nullptr, 0, 0);
+    check(empty == acb.words.data() + 7 && empty[0] == Agc::Command::Header(0x10, 2, 0x0bu << 2u) && empty[1] == 0, "empty marker span mismatch");
+    const auto* acbSet = sceAgcAcbSetMarkerSpan(&acb.buffer, "ab", 2, 0);
+    const auto* dcbSet = sceAgcDcbSetMarkerSpan(&dcb.buffer, "ab", 2, 0);
+    check(acbSet == acb.words.data() + 9 && dcbSet == dcb.words.data() + 9, "set marker span did not return its push packet");
+    check(acbSet[0] == Agc::Command::Header(0x10, 2, 0x0bu << 2u) && std::memcmp(acbSet + 1, "ab\0\0", 4) == 0 && acbSet[2] == Agc::Command::Header(0x10, 2, 0x0cu << 2u) && acbSet[3] == 0, "set marker span is not a push and pop pair");
+    check(acb.buffer.cursor_up == acb.words.data() + 13 && acb.words[13] == 0xdeadbeefu, "incorrect marker span cursor advance");
+    check(dcb.words == acb.words, "ACB and DCB marker spans differ");
+
+    AgcDriver::QueueState queue;
+    const std::array<std::pair<std::size_t, std::size_t>, 3> pushes{{{0, 3}, {3, 4}, {7, 2}}};
+    for (const auto& [offset, words] : pushes) {
+        const std::span<const std::uint32_t> packet(dcb.words.data() + offset, words);
+        AgcDriver::Pm4::Validate(packet, 0);
+        AgcDriver::Pm4::Execute(packet, queue);
+    }
+    check(queue.markers.size() == 3 && queue.markers[0] == "frame" && queue.markers[1] == "abcdefgh" && queue.markers[2].empty(), "driver read the wrong marker span text");
+
+    const auto before = acb.words;
+    expectFailure([&] { sceAgcAcbPushMarkerSpan(&acb.buffer, nullptr, 1, 0); });
+    expectFailure([&] { sceAgcDcbSetMarkerSpan(&acb.buffer, nullptr, 4, 0); });
+    expectFailure([] { sceAgcDcbPushMarkerSpan(nullptr, "frame", 5, 0); });
+    expectFailure([] { sceAgcAcbSetMarkerSpan(nullptr, "frame", 5, 0); });
+    check(acb.words == before && acb.buffer.cursor_up == acb.words.data() + 13, "a rejected marker span modified the buffer");
 }
 
 void testWorkloads() {
@@ -826,6 +872,7 @@ int main(int argc, char** argv) {
         testClearState();
         testIndexedIndirectDraws();
         testMarkers();
+        testMarkerSpans();
         testWorkloads();
         testWorkloadStreams();
         testRegisteredWorkloadStreams();

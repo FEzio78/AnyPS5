@@ -988,7 +988,27 @@ std::shared_ptr<const SpecializedModule> specializeModule(const CompiledShaderAr
     return entry->module;
 }
 
+// Fork-only APS5_PROFILE_DRAW: where a materialization spends its time, reported on the result
+// memo line: the binding plan, the specialized module lookup, the image tables and Populate.
+struct MaterializeSteps {
+    std::atomic<std::uint64_t> plan{0}, module{0}, tables{0}, populate{0}, calls{0};
+};
+
+MaterializeSteps& materializeSteps() {
+    static MaterializeSteps steps;
+    return steps;
+}
+
 RecompileResult materializeResult(const CompiledVariant& variant, const RecompileRequest& request, const ResourceSnapshot& snapshot, bool registrationDefaults = false) {
+    static const bool profileSteps = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    auto stepLap = profileSteps ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    const auto step = [&](std::atomic<std::uint64_t>& total) {
+        if (!profileSteps) return;
+        const auto now = std::chrono::steady_clock::now();
+        total.fetch_add(static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(now - stepLap).count()), std::memory_order_relaxed);
+        stepLap = now;
+    };
+    if (profileSteps) materializeSteps().calls.fetch_add(1, std::memory_order_relaxed);
     RecompileResult result;
     const auto& artifact = variant.artifact;
     static_cast<CompiledShaderArtifact&>(result) = {
@@ -1019,6 +1039,7 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     };
     const auto plan = preparedBindingPlan(variant, snapshot, request.context.pixel ? std::span<const std::uint8_t>(request.context.pixel->targetExportMapping) : std::span<const std::uint8_t>{}, request.target.registrationModules);
     const DescriptorBindingPlan* bindingPlan = &plan->bindings;
+    step(materializeSteps().plan);
     std::shared_ptr<PreparedModuleEntry> entry;
     struct LocalModuleKeyStorage {};
     auto& moduleKey = HostThreadLocal<std::vector<std::uint32_t>, LocalModuleKeyStorage>();
@@ -1113,9 +1134,12 @@ RecompileResult materializeResult(const CompiledVariant& variant, const Recompil
     } else {
         result.spirv = artifact.spirv;
     }
+    step(materializeSteps().module);
     const auto tables = ResourceMaterializer::ResolveImageTables(variant.info.info, snapshot, artifact.variantId);
+    step(materializeSteps().tables);
     BindingAllocationResult bindings;
     DescriptorBindingBuilder{}.Populate(bindings, variant.bindings, *bindingPlan, variant.info.userDataBase, snapshot, partialThreads(request), &tables);
+    step(materializeSteps().populate);
     result.workgroupMemoryDwords = WorkgroupMemoryStrideDwords(variant.info.info);
     result.bindings = std::move(bindings.bindings);
     result.pushConstants = std::move(bindings.pushConstants);
@@ -1297,6 +1321,11 @@ void reportResultMemo() {
     const auto evictions = counters.evictions.exchange(0, std::memory_order_relaxed);
     const auto populate = counters.populateNanoseconds.exchange(0, std::memory_order_relaxed);
     std::fprintf(stderr, "[recompile] result memo (10 s): %llu hits, %llu misses (%.1f%% hits), Populate %.1f us per miss / %.1f ms in total, %llu evictions\n", static_cast<unsigned long long>(hits), static_cast<unsigned long long>(misses), hits + misses != 0 ? 100.0 * static_cast<double>(hits) / static_cast<double>(hits + misses) : 0.0, misses != 0 ? static_cast<double>(populate) / 1000.0 / static_cast<double>(misses) : 0.0, static_cast<double>(populate) / 1e6, static_cast<unsigned long long>(evictions));
+    auto& steps = materializeSteps();
+    const auto calls = steps.calls.exchange(0, std::memory_order_relaxed);
+    const auto perCall = [&](std::atomic<std::uint64_t>& total) { return calls != 0 ? static_cast<double>(total.exchange(0, std::memory_order_relaxed)) / 1000.0 / static_cast<double>(calls) : 0.0; };
+    const double planUs = perCall(steps.plan), moduleUs = perCall(steps.module), tablesUs = perCall(steps.tables), populateUs = perCall(steps.populate);
+    std::fprintf(stderr, "[recompile] materialize steps (10 s, %llu calls), us each: binding plan %.1f, module %.1f, image tables %.1f, populate %.1f\n", static_cast<unsigned long long>(calls), planUs, moduleUs, tablesUs, populateUs);
 }
 
 // Everything materializeResult reads besides the variant: the snapshot (the descriptor words, the

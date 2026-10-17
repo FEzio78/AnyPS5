@@ -1557,9 +1557,17 @@ struct ReusedTable {
     std::vector<ReusedTableElement> elements;
     std::vector<GuestMemory::UnchangedQuery> queries;
     std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    std::uint64_t wordsHash = 0;
 };
 
 constexpr std::size_t ReusedTableCount = 4;
+constexpr std::size_t StorageReuseTableCount = 16;
+
+std::uint64_t TableWordsHash(std::span<const std::uint32_t> words) {
+    std::uint64_t hash = 0xcbf29ce484222325ull ^ words.size();
+    for (const auto word : words) hash = (hash ^ word) * 0x100000001b3ull;
+    return hash;
+}
 
 std::vector<ReusedTable>& ReusedTables() {
     thread_local std::vector<ReusedTable>* slot = nullptr;
@@ -1587,9 +1595,28 @@ bool StorageViewsCurrent(const Context& context, const ReusedTable& table) {
     return true;
 }
 
+// A table remembered in an older collect epoch: CPU writes since then are stamped only once the
+// ranges are collected again, so every element range is collected before the generation test.
+bool CollectTableEpoch(ReusedTable& table, const TableState& state) {
+    if (table.state.epoch == state.epoch) return true;
+    for (const auto& query : table.queries) {
+        if (GuestMemory::CollectWrites(query.address, query.bytes) == 0) return false;
+    }
+    table.state.epoch = state.epoch;
+    return true;
+}
+
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
+    if (TableReuseStorage()) {
+        std::erase_if(tables, [&](const ReusedTable& table) { return table.state.unwatched != state.unwatched || table.state.allocations != state.allocations || table.state.depthSurfaces != state.depthSurfaces; });
+        const auto hash = TableWordsHash(binding.guestDescriptor);
+        for (auto& table : tables) {
+            if (table.wordsHash == hash && SameTable(table, device, binding)) return &table;
+        }
+        return nullptr;
+    }
     std::erase_if(tables, [&](const ReusedTable& table) { return table.state != state; });
     for (auto& table : tables) {
         if (SameTable(table, device, binding)) return &table;
@@ -1642,10 +1669,12 @@ void RememberTable(ReusedTable&& table, const ShaderRecompiler::DescriptorBindin
     auto& tables = ReusedTables();
     std::erase_if(tables, [&](const ReusedTable& entry) { return SameTable(entry, table.device, binding); });
     table.words = binding.guestDescriptor;
+    table.wordsHash = TableWordsHash(table.words);
     table.shapes = binding.imageShapes;
     table.depthCompare = binding.imageDepthCompare;
     tables.insert(tables.begin(), std::move(table));
-    if (tables.size() > ReusedTableCount) tables.resize(ReusedTableCount);
+    const auto capacity = TableReuseStorage() ? StorageReuseTableCount : ReusedTableCount;
+    if (tables.size() > capacity) tables.resize(capacity);
 }
 
 std::string HexText(std::uint64_t value) {
@@ -4518,7 +4547,7 @@ void ShaderResources::resolveImageTables() {
                 if (!TableCurrent(*reused)) ++why.notCurrent;
             }
         }
-        const bool current = reused != nullptr && TableCurrent(*reused) && StorageViewsCurrent(context, *reused);
+        const bool current = reused != nullptr && (!TableReuseStorage() || CollectTableEpoch(*reused, state)) && TableCurrent(*reused) && StorageViewsCurrent(context, *reused);
         const bool texturesKept = current && CachedTableTextures(*reused, cached);
         if (BuildProfiled() && current && !texturesKept) ++TableReuseBlocks().texturesGone;
         if (texturesKept) {

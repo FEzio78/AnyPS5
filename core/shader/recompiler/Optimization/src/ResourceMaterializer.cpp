@@ -6,6 +6,7 @@
 #include "RdnaDecoder/RdnaImageOpDecoder.hpp"
 #include "SpirvBackend/SpirvBufferFormat.hpp"
 #include "ImageTableAbi.hpp"
+#include "ThreadOwned.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -23,6 +24,7 @@
 #include <set>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 #include <stdexcept>
 #include <string>
 #include <tuple>
@@ -1032,25 +1034,49 @@ DecodeMemo& decodeMemo() {
 }
 
 constexpr std::uint32_t DecodeMemoEntries = 1u << 20u;
+constexpr std::size_t ThreadDecodeMemoEntries = std::size_t{1} << 18u;
 constexpr std::uint32_t DecodeFailed = 0x80000000u;
 
 std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const ImageResource> modes, const DescriptorValue& words, std::uint64_t memoKey, std::uint32_t resource) {
     DecodeMemoKey key{memoKey, resource, words.dwords};
+    thread_local std::unordered_map<DecodeMemoKey, std::uint32_t, DecodeMemoHash>* slot = nullptr;
+    auto& entries = ThreadOwned(slot);
     if (memoKey != 0u) {
-        auto& memo = decodeMemo();
-        std::lock_guard lock(memo.mutex);
-        if (const auto found = memo.entries.find(key); found != memo.entries.end()) return found->second;
+        if (const auto found = entries.find(key); found != entries.end()) return found->second;
     }
     const auto match = ResourceMaterializer::TryRuntimeImageMode(image, words, modes);
     const auto value = match.mode.has_value() ? *match.mode : DecodeFailed | static_cast<std::uint32_t>(match.reason);
     if (memoKey != 0u) {
-        auto& memo = decodeMemo();
-        std::lock_guard lock(memo.mutex);
-        if (memo.entries.size() >= DecodeMemoEntries) memo.entries.clear();
-        memo.entries.emplace(key, value);
+        if (entries.size() >= ThreadDecodeMemoEntries) entries.clear();
+        entries.emplace(key, value);
     }
     return value;
 }
+
+}
+
+namespace {
+
+struct TableTupleHash {
+    static std::uint64_t mixWords(std::uint64_t hash, const std::array<std::uint32_t, 8>& words) {
+        for (const auto word : words) hash = (hash ^ word) * 0x100000001b3ull;
+        return hash;
+    }
+    std::size_t operator()(const std::tuple<std::array<std::uint32_t, 8>, RdnaImageDimension, bool, DescriptorBindingKind>& key) const noexcept {
+        auto hash = mixWords(0xcbf29ce484222325ull, std::get<0>(key));
+        hash = (hash ^ static_cast<std::uint64_t>(std::get<1>(key))) * 0x100000001b3ull;
+        hash = (hash ^ (std::get<2>(key) ? 1u : 0u)) * 0x100000001b3ull;
+        hash = (hash ^ static_cast<std::uint64_t>(std::get<3>(key))) * 0x100000001b3ull;
+        return static_cast<std::size_t>(hash ^ (hash >> 32u));
+    }
+    std::size_t operator()(const std::tuple<std::uint32_t, ImageTableAbi::PoisonReason, std::array<std::uint32_t, 8>, std::uint32_t>& key) const noexcept {
+        auto hash = (0xcbf29ce484222325ull ^ std::get<0>(key)) * 0x100000001b3ull;
+        hash = (hash ^ static_cast<std::uint64_t>(std::get<1>(key))) * 0x100000001b3ull;
+        hash = mixWords(hash, std::get<2>(key));
+        hash = (hash ^ std::get<3>(key)) * 0x100000001b3ull;
+        return static_cast<std::size_t>(hash ^ (hash >> 32u));
+    }
+};
 
 }
 
@@ -1072,8 +1098,8 @@ static ResolvedImageTables resolveImageTablesFresh(const ShaderInfo& info, const
     out.map[Abi::HeaderVersion] = Abi::Version;
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideSnapshot});
     out.poison.push_back({{}, 0u, NoTable, PoisonReason::OutsideDomain});
-    std::map<std::tuple<std::uint32_t, PoisonReason, std::array<std::uint32_t, 8>, std::uint32_t>, std::uint32_t> poisonIndex;
-    std::set<std::uint32_t> expected;
+    std::unordered_map<std::tuple<std::uint32_t, PoisonReason, std::array<std::uint32_t, 8>, std::uint32_t>, std::uint32_t, TableTupleHash> poisonIndex;
+    std::unordered_set<std::uint32_t> expected;
     const auto poison = [&](std::uint32_t resource, PoisonReason reason, const DescriptorValue* words) {
         const auto value = words != nullptr ? *words : DescriptorValue{};
         const auto [found, inserted] = poisonIndex.try_emplace({resource, reason, value.dwords, value.dwordCount}, static_cast<std::uint32_t>(out.poison.size()));
@@ -1081,7 +1107,7 @@ static ResolvedImageTables resolveImageTablesFresh(const ShaderInfo& info, const
         expected.insert(found->second);
         return Abi::PoisonCode(found->second);
     };
-    std::map<std::tuple<std::array<std::uint32_t, 8>, RdnaImageDimension, bool, DescriptorBindingKind>, std::uint32_t> elementIndex;
+    std::unordered_map<std::tuple<std::array<std::uint32_t, 8>, RdnaImageDimension, bool, DescriptorBindingKind>, std::uint32_t, TableTupleHash> elementIndex;
     std::vector<std::uint32_t> directSamplers(info.images.size(), 0u);
     std::vector<bool> reducingSampler(info.images.size(), false);
     for (const auto& pair : info.sampledPairs) {

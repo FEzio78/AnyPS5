@@ -17,6 +17,7 @@
 #include <cstring>
 #include <limits>
 #include <map>
+#include <memory>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -1051,7 +1052,7 @@ std::uint32_t decodeTableEntry(const ImageResource& image, std::span<const Image
 
 }
 
-ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey) {
+static ResolvedImageTables resolveImageTablesFresh(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey) {
     namespace Abi = ImageTableAbi;
     ResolvedImageTables out;
     std::uint32_t count = 0;
@@ -1209,6 +1210,154 @@ ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& i
     out.map[Abi::HeaderSamplerFaults] = static_cast<std::uint32_t>(out.map.size());
     out.map.resize(out.map.size() + out.samplers.size() / Abi::SamplerEntryElements, 0u);
     out.faults = static_cast<std::uint32_t>(expected.size() + static_cast<std::size_t>(std::count(outside.begin(), outside.end(), true)));
+    return out;
+}
+
+namespace {
+
+// Fork-only: resolved image tables by everything the resolution reads except each table's base and
+// size, which only fill the table headers and are patched into a cached result. A bindless table
+// rarely changes between frames while its memory moves, and resolving one of Demon's Souls' tables
+// element by element took 22-35 us per materialization (APS5_PROFILE_DRAW materialize steps), most
+// of the result memo's Populate time. APS5_NO_TABLE_CACHE=1 resolves every time;
+// APS5_VERIFY_TABLE_CACHE=1 resolves every time as well and throws when a cached result differs.
+struct TableCacheEntry {
+    std::vector<std::uint32_t> key;
+    ResolvedImageTables tables;
+};
+
+struct TableCache {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::shared_ptr<const TableCacheEntry>> entries;
+    std::atomic<std::uint64_t> hits{0}, misses{0}, collisions{0};
+    std::atomic<std::int64_t> lastReport{0};
+};
+
+TableCache& tableCache() {
+    static auto* cache = new TableCache;
+    return *cache;
+}
+
+constexpr std::size_t TableCacheEntries = 4096;
+
+void appendTableKey(std::vector<std::uint32_t>& key, const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey) {
+    const auto& tables = snapshot.tables;
+    key.push_back(static_cast<std::uint32_t>(memoKey));
+    key.push_back(static_cast<std::uint32_t>(memoKey >> 32u));
+    key.push_back(static_cast<std::uint32_t>(tables.tables.size()));
+    for (const auto& column : tables.tables) {
+        key.push_back(column.records);
+        key.push_back(column.keys);
+        key.push_back(column.fault);
+        key.push_back(column.outside ? 1u : 0u);
+        key.push_back(static_cast<std::uint32_t>(column.codes.size()));
+        key.insert(key.end(), column.codes.begin(), column.codes.end());
+    }
+    key.push_back(static_cast<std::uint32_t>(tables.words.size()));
+    for (const auto& words : tables.words) {
+        key.push_back(words.dwordCount | (static_cast<std::uint32_t>(words.availableDwordMask) << 16u));
+        key.insert(key.end(), words.dwords.begin(), words.dwords.end());
+    }
+    key.push_back(static_cast<std::uint32_t>(info.sampledPairs.size()));
+    for (const auto& pair : info.sampledPairs) {
+        if (pair.sampler >= info.samplers.size() || info.samplers[pair.sampler].table != NoTable || pair.sampler >= snapshot.samplers.size()) {
+            key.push_back(0xffffffffu);
+            continue;
+        }
+        const auto& words = snapshot.samplers[pair.sampler].dwords;
+        key.push_back(pair.sampler);
+        key.push_back(words[0]);
+        key.push_back(words[2]);
+    }
+}
+
+std::uint64_t hashTableKey(std::span<const std::uint32_t> key) {
+    std::uint64_t hash = 0x9e3779b97f4a7c15ull ^ key.size();
+    for (const auto word : key) hash = (hash ^ word) * 0x100000001b3ull;
+    return hash;
+}
+
+void patchTableHeaders(ResolvedImageTables& out, const ResourceSnapshot& snapshot) {
+    namespace Abi = ImageTableAbi;
+    const auto& tables = snapshot.tables.tables;
+    for (std::uint32_t table = 0; table < tables.size(); ++table) {
+        const auto header = Abi::TableHeader(table);
+        if (header + Abi::TableBaseHigh >= out.map.size()) continue;
+        out.map[header + Abi::TableSizeLow] = static_cast<std::uint32_t>(tables[table].size);
+        out.map[header + Abi::TableSizeHigh] = static_cast<std::uint32_t>(tables[table].size >> 32u);
+        out.map[header + Abi::TableBaseLow] = static_cast<std::uint32_t>(tables[table].base);
+        out.map[header + Abi::TableBaseHigh] = static_cast<std::uint32_t>(tables[table].base >> 32u);
+    }
+}
+
+bool sameTables(const ResolvedImageTables& a, const ResolvedImageTables& b) {
+    if (a.map != b.map || a.faults != b.faults || a.elements.size() != b.elements.size() || a.samplers.size() != b.samplers.size() || a.poison.size() != b.poison.size()) return false;
+    for (std::size_t i = 0; i < a.elements.size(); ++i) {
+        const auto& x = a.elements[i];
+        const auto& y = b.elements[i];
+        if (x.words != y.words || x.dimension != y.dimension || x.depthCompare != y.depthCompare || x.kind != y.kind || x.samplers != y.samplers) return false;
+    }
+    for (std::size_t i = 0; i < a.samplers.size(); ++i) {
+        if (a.samplers[i].words != b.samplers[i].words || a.samplers[i].compare != b.samplers[i].compare || a.samplers[i].point != b.samplers[i].point) return false;
+    }
+    for (std::size_t i = 0; i < a.poison.size(); ++i) {
+        if (a.poison[i].words != b.poison[i].words || a.poison[i].dwordCount != b.poison[i].dwordCount || a.poison[i].resource != b.poison[i].resource || a.poison[i].reason != b.poison[i].reason) return false;
+    }
+    return true;
+}
+
+void reportTableCache(TableCache& cache) {
+    static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
+    if (!profile) return;
+    const auto now = std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+    auto last = cache.lastReport.load(std::memory_order_relaxed);
+    if (now - last < 10 || !cache.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    std::size_t entries = 0;
+    {
+        std::lock_guard lock(cache.mutex);
+        entries = cache.entries.size();
+    }
+    std::fprintf(stderr, "[table-cache] (10 s) %llu hits, %llu misses, %llu hash collisions, %zu entries\n", static_cast<unsigned long long>(cache.hits.exchange(0)), static_cast<unsigned long long>(cache.misses.exchange(0)), static_cast<unsigned long long>(cache.collisions.exchange(0)), entries);
+}
+
+}
+
+ResolvedImageTables ResourceMaterializer::ResolveImageTables(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint64_t memoKey) {
+    static const bool disabled = std::getenv("APS5_NO_TABLE_CACHE") != nullptr;
+    static const bool verify = std::getenv("APS5_VERIFY_TABLE_CACHE") != nullptr;
+    if (disabled || memoKey == 0u || snapshot.tables.tables.empty()) return resolveImageTablesFresh(info, snapshot, memoKey);
+    auto& cache = tableCache();
+    std::vector<std::uint32_t> key;
+    appendTableKey(key, info, snapshot, memoKey);
+    const auto hash = hashTableKey(key);
+    std::shared_ptr<const TableCacheEntry> found;
+    {
+        std::lock_guard lock(cache.mutex);
+        if (const auto it = cache.entries.find(hash); it != cache.entries.end()) found = it->second;
+    }
+    if (found != nullptr && found->key == key) {
+        cache.hits.fetch_add(1, std::memory_order_relaxed);
+        auto out = found->tables;
+        patchTableHeaders(out, snapshot);
+        if (verify) {
+            const auto fresh = resolveImageTablesFresh(info, snapshot, memoKey);
+            if (!sameTables(out, fresh)) throw std::runtime_error("APS5_VERIFY_TABLE_CACHE: a cached image table resolution differs from a fresh one");
+        }
+        reportTableCache(cache);
+        return out;
+    }
+    if (found != nullptr) cache.collisions.fetch_add(1, std::memory_order_relaxed);
+    cache.misses.fetch_add(1, std::memory_order_relaxed);
+    auto out = resolveImageTablesFresh(info, snapshot, memoKey);
+    auto entry = std::make_shared<TableCacheEntry>();
+    entry->key = std::move(key);
+    entry->tables = out;
+    {
+        std::lock_guard lock(cache.mutex);
+        if (cache.entries.size() >= TableCacheEntries) cache.entries.clear();
+        cache.entries[hash] = std::move(entry);
+    }
+    reportTableCache(cache);
     return out;
 }
 

@@ -621,7 +621,7 @@ template <typename TEntry, std::size_t Size>
 RdnaOpcode lookupVectorOpcode(const TEntry (&table)[Size], std::uint32_t encoding, const char* notSupportedReason) {
     const auto* entry = findVectorOpcodeEntry(table, encoding);
     if (entry == nullptr) {
-        throw std::invalid_argument(notSupportedReason);
+        throw std::invalid_argument(std::string(notSupportedReason) + " (opcode 0x" + [&] { char text[16]; std::snprintf(text, sizeof(text), "%x", encoding); return std::string(text); }() + ")");
     }
     return entry->opcode;
 }

@@ -8,6 +8,7 @@
 #include <algorithm>
 #include <array>
 #include <bit>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -565,6 +566,13 @@ private:
             }
             if (zeroTail) {
                 words = 4u;
+            } else {
+                static std::atomic<int> reported{0};
+                if (reported.fetch_add(1) < 20) {
+                    std::string tail;
+                    for (std::uint32_t dword = 4u; dword < 8u; dword++) tail += " " + std::string(IrOpcodeName(handle.Argument(dword)->Resolve()->Opcode()));
+                    std::fprintf(stderr, "[texture-desc] a 128-bit image handle's dwords 4-7 are not constant zero:%s\n", tail.c_str());
+                }
             }
         }
         IrValue* heapHandle = nullptr;

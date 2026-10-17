@@ -1,4 +1,9 @@
 #include <atomic>
+#include <cstring>
+#include <string>
+#ifdef _WIN32
+#include <windows.h>
+#endif
 #include <cstdio>
 #include "prx/libSceAgcDriver/Graphics/include/GuestTextureResource.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Context.hpp"
@@ -192,7 +197,24 @@ GuestTextureResource DecodeTextureResource(std::span<const std::uint32_t> words)
             Require(baseArray <= depth, "guest 2D array texture descriptor has a base array past its last array slice");
             if (depth >= 1024u) {
                 static std::atomic<int> reported{0};
-                if (reported.fetch_add(1) < 40) std::fprintf(stderr, "[texture-desc] 2D array 0x%llx %ux%u with %u slices (base %u): words %08x %08x %08x %08x %08x %08x %08x %08x\n", static_cast<unsigned long long>(baseAddress), width, height, depth + 1u, baseArray, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+                if (reported.fetch_add(1) < 40) {
+                    std::fprintf(stderr, "[texture-desc] 2D array 0x%llx %ux%u with %u slices (base %u): words %08x %08x %08x %08x %08x %08x %08x %08x\n", static_cast<unsigned long long>(baseAddress), width, height, depth + 1u, baseArray, words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7]);
+#ifdef _WIN32
+                    void* frames[1]{__builtin_return_address(0)};
+                    const USHORT count = 1;
+                    std::string text = "[texture-desc]   stack:";
+                    for (USHORT i = 0; i < count; ++i) {
+                        HMODULE module = nullptr;
+                        char name[MAX_PATH] = "?";
+                        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, static_cast<LPCSTR>(frames[i]), &module) && module != nullptr) GetModuleFileNameA(module, name, sizeof(name));
+                        const char* leaf = std::strrchr(name, '\\');
+                        char item[96];
+                        std::snprintf(item, sizeof(item), " %s+0x%llx", leaf != nullptr ? leaf + 1 : name, static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(frames[i]) - reinterpret_cast<std::uintptr_t>(module)));
+                        text += item;
+                    }
+                    std::fprintf(stderr, "%s\n", text.c_str());
+#endif
+                }
             }
             break;
         case TextureDimension::k1DArray:

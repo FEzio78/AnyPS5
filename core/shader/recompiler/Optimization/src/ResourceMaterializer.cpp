@@ -120,6 +120,13 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
     }
 }
 
+void reportLargeArrayWords(const DescriptorValue& value, const char* where, std::uint64_t base, std::uint32_t stride, std::uint32_t offset, std::uint32_t dwords, std::uint32_t index) {
+    if (value.dwordCount != 8u || ((value.dwords[3] >> 28u) & 0xfu) != 0xdu || (value.dwords[4] & 0x1fffu) < 1024u) return;
+    static std::atomic<int> reported{0};
+    if (reported.fetch_add(1) >= 40) return;
+    std::fprintf(stderr, "[texture-desc] %s (base 0x%llx stride 0x%x offset 0x%x, %u dwords) index %u holds a 2D array of %u slices: %08x %08x %08x %08x %08x %08x %08x %08x\n", where, static_cast<unsigned long long>(base), stride, offset, dwords, index, (value.dwords[4] & 0x1fffu) + 1u, value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+}
+
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
     const auto type = rawImageType(descriptor);
     const auto format = rawImageFormat(descriptor);
@@ -607,6 +614,7 @@ private:
                     past = std::max(past, *address + sizeof(std::uint32_t));
                 }
                 if (records.states[record] != RecordState::Read) continue;
+                if (!column.sampler) reportLargeArrayWords(value, "indirect image table column", pointer, column.stride, column.indirectImmediate, column.dwordCount, record);
                 records.words[record] = WordsIndex(value);
                 tables.ranges.emplace_back(first, past - first);
             }
@@ -707,6 +715,7 @@ private:
                 }
                 ++next;
             }
+            if (!column.sampler) reportLargeArrayWords(value, "image table column", records.base, column.stride, column.offset, column.dwordCount, record);
             records.words[record] = WordsIndex(value);
         }
         if (column.address && low < high) tables.ranges.emplace_back(low, high - low);
@@ -841,6 +850,7 @@ void materializeSnapshot(const IrResourcePlan& plan, const SrtRuntime& runtime, 
         if (!validImageDescriptor(descriptor, image.r128) && !nullImageDescriptor(image, descriptor)) {
             throw std::runtime_error("runtime image descriptor is invalid");
         }
+        reportLargeArrayWords(descriptor, image.r128 ? "direct 128-bit image" : "direct image", 0, 0, 0, 8u, i);
         snapshot.images[i] = descriptor;
     }
 

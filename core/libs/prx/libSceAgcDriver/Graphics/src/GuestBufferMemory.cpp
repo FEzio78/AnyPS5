@@ -34,6 +34,7 @@
 #include <list>
 #include <map>
 #include <mutex>
+#include <unordered_map>
 #include <set>
 #include <thread>
 #include <stop_token>
@@ -3449,6 +3450,55 @@ void traceStaged(std::uint64_t begin, std::uint64_t end, bool atomic) {
     std::fprintf(stderr, "[staging] 0x%llx+0x%llx (%.1f KiB)%s\n", static_cast<unsigned long long>(begin), static_cast<unsigned long long>(end - begin), (end - begin) / 1024.0, atomic ? " atomic" : "");
 }
 
+// Fork-only APS5_PROFILE_DRAW: a staged region staged again, by whether the CPU wrote it since its
+// previous staging (write-watch generations), to size what a resident device copy could skip.
+struct StagingReuse {
+    std::mutex mutex;
+    std::unordered_map<std::uint64_t, std::pair<std::uint64_t, std::uint64_t>> last;
+    std::atomic<std::uint64_t> first{0}, written{0}, unchanged{0}, unwatched{0};
+    std::atomic<std::uint64_t> firstBytes{0}, writtenBytes{0}, unchangedBytes{0}, unwatchedBytes{0};
+};
+
+StagingReuse& stagingReuse() {
+    static auto* reuse = new StagingReuse;
+    return *reuse;
+}
+
+void noteStagingReuse(std::uint64_t address, std::uint64_t bytes) {
+    auto& reuse = stagingReuse();
+    if (!GuestMemory::Watched(address, static_cast<std::size_t>(bytes))) {
+        reuse.unwatched.fetch_add(1, std::memory_order_relaxed);
+        reuse.unwatchedBytes.fetch_add(bytes, std::memory_order_relaxed);
+        return;
+    }
+    const auto generation = GuestMemory::CollectWrites(address, static_cast<std::size_t>(bytes));
+    std::pair<std::uint64_t, std::uint64_t> previous{0, 0};
+    {
+        std::lock_guard lock(reuse.mutex);
+        auto& entry = reuse.last[address];
+        previous = entry;
+        entry = {bytes, generation};
+        if (reuse.last.size() > (1u << 20u)) reuse.last.clear();
+    }
+    if (previous.first != bytes || previous.second == 0 || generation == 0) {
+        reuse.first.fetch_add(1, std::memory_order_relaxed);
+        reuse.firstBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else if (GuestMemory::WrittenSince(address, static_cast<std::size_t>(bytes), previous.second)) {
+        reuse.written.fetch_add(1, std::memory_order_relaxed);
+        reuse.writtenBytes.fetch_add(bytes, std::memory_order_relaxed);
+    } else {
+        reuse.unchanged.fetch_add(1, std::memory_order_relaxed);
+        reuse.unchangedBytes.fetch_add(bytes, std::memory_order_relaxed);
+    }
+}
+
+void reportStagingReuse() {
+    auto& reuse = stagingReuse();
+    const auto mib = [](std::atomic<std::uint64_t>& bytes) { return static_cast<double>(bytes.exchange(0, std::memory_order_relaxed)) / 1048576.0; };
+    const auto firstMib = mib(reuse.firstBytes), writtenMib = mib(reuse.writtenBytes), unchangedMib = mib(reuse.unchangedBytes), unwatchedMib = mib(reuse.unwatchedBytes);
+    AgcDriver::ProfilePrint_nid_no_patch("[staging-reuse] (10 s) staged regions by CPU writes since their previous staging: unchanged %llu (%.0f MiB), written %llu (%.0f MiB), first staging %llu (%.0f MiB), unwatched %llu (%.0f MiB)\n", static_cast<unsigned long long>(reuse.unchanged.exchange(0, std::memory_order_relaxed)), unchangedMib, static_cast<unsigned long long>(reuse.written.exchange(0, std::memory_order_relaxed)), writtenMib, static_cast<unsigned long long>(reuse.first.exchange(0, std::memory_order_relaxed)), firstMib, static_cast<unsigned long long>(reuse.unwatched.exchange(0, std::memory_order_relaxed)), unwatchedMib);
+}
+
 void reportStaging() {
     auto& stats = Copies();
     const auto nowMs = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
@@ -3463,6 +3513,7 @@ void reportStaging() {
     lastStaged = staged;
     lastIn = in;
     lastOut = out;
+    reportStagingReuse();
 }
 
 }
@@ -4089,6 +4140,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
                 Copies().staged.fetch_add(1, std::memory_order_relaxed);
                 Copies().stagedInBytes.fetch_add(bytes, std::memory_order_relaxed);
                 if (region->atomic) Copies().stagedAtomic.fetch_add(1, std::memory_order_relaxed);
+                noteStagingReuse(region->begin, bytes);
             }
         }
     }

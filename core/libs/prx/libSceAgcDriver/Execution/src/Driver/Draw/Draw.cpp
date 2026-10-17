@@ -1,6 +1,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrep.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawProgramTrace.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -142,7 +143,20 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     };
     auto drawParameters = Pm4::ResolveDraw(packet, queue);
     const bool pipelined = DrawPipeline::Active();
-    if (pipelined && drawParameters.indirect) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    if (pipelined && drawParameters.indirect && !DrawPrepThread()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
+    // APS5_PARALLEL_PREP: a preparation reads an indirect draw's records once no earlier preparation
+    // and no queued commit may still write them; it records under its turn (lockForDraw).
+    const auto awaitIndirectArguments = [&] {
+        if (!DrawPrepThread() || !drawParameters.indirect) return;
+        const auto ready = [](std::uint64_t address, std::uint64_t bytes) {
+            if (address == 0 || bytes == 0) return;
+            AwaitDrawPrepHazard(address, static_cast<std::size_t>(bytes));
+            auto& pipeline = DrawPipeline::Queue0();
+            if (pipeline.Busy() && pipeline.Overlaps(address, static_cast<std::size_t>(bytes))) pipeline.Drain(DrawPipeline::DrainReason::Indirect);
+        };
+        ready(drawParameters.indirect->arguments, drawParameters.indirect->RangeBytes());
+        if (drawParameters.indirect->countIndirect) ready(drawParameters.indirect->countAddress, 4);
+    };
     bool traceIndirect = false;
     if (const auto verdict = precheckDraw(queue, submission, packet, drawParameters, rejected, traceIndirect)) return *verdict;
     phaseTiming.Phase(DrawRowPrecheck);
@@ -295,6 +309,11 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     auto pixel = decode->pixel;
     std::vector<DrawProgram> programs = decode->programs;
     for (const auto& patch : userPatches) programs[patch.program].userData[patch.index] = patch.value;
+    if (DrawPrepThread()) {
+        // APS5_PARALLEL_PREP: later preparations capture only once they know what this draw writes.
+        const bool writesMemory = std::any_of(programs.begin(), programs.end(), [](const DrawProgram& program) { return program.snapshot == nullptr || ProgramWritesMemory(*program.snapshot, program.codeOffset) || (program.tailContinuation != nullptr && ProgramWritesMemory(*program.tailContinuation, 0)); });
+        DeclareDrawPrep(writesMemory, drawWriteRanges(graphics, {}));
+    }
     if (const auto skipped = SkippedShader(); skipped != 0 && std::any_of(programs.begin(), programs.end(), [skipped](const DrawProgram& program) { return program.binary.codeAddress == skipped; })) return drawn();
     const auto setMeshIndexBuffer = [&](const Pm4::DrawParameters& parameters) {
         if (!graphics.stages.mesh) return;
@@ -368,6 +387,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         mix(indirect.startInstanceLocation);
         mix(indirect.drawIndexEnabled ? indirect.drawIndexLocation : 0x280u);
         if (baseInstanceSgpr < 0 && CpuIndirectKnown(prepatchKey)) {
+            awaitIndirectArguments();
             recordQueuedLabelsBeforeRead(submission.queue);
             prepatched = Pm4::ReadDrawArguments(indirect, 0);
             const auto patch = [&](std::uint32_t location, std::uint32_t value) {
@@ -640,6 +660,8 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
     timing.Mark("post_compile_prepare");
     const auto lockForDraw = [&] {
         if (gpuLock.owns_lock()) return;
+        ServeDrawPrepTurn();
+        if (DrawPrepThread() && DrawPipeline::Queue0().Busy()) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Indirect);
         phaseTiming.Phase(DrawRowVectors);
         GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Draw);
         gpuLock.lock();
@@ -667,6 +689,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             }
             programResults[i] = &results[resultIndex[i]];
         }
+        awaitIndirectArguments();
         recordQueuedLabelsBeforeRead(submission.queue);
         const auto readStart = std::chrono::steady_clock::now();
         const auto count = std::min(indirect.countIndirect ? Pm4::ReadDrawCount(indirect) : indirect.count, indirect.count);
@@ -773,6 +796,7 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
             commitDraw(localDevice, commitQueue, decode->state, drawParameters, stages, snapshots, recipe, recipeStages, drawKey);
         };
         auto held = std::make_shared<decltype(commit)>(std::move(commit));
+        ServeDrawPrepTurn();
         DrawPipeline::Queue0().Enqueue([held] { (*held)(); }, std::move(writes));
         phaseTiming.Phase(DrawRowLockWait);
         timing.Mark("draw_enqueued");

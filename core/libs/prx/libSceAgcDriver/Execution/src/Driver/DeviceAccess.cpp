@@ -33,6 +33,10 @@ void DeviceUseGate::lock_shared() {
     }
 }
 
+void DeviceUseGate::add_shared() {
+    state.fetch_add(1, std::memory_order_acquire);
+}
+
 void DeviceUseGate::unlock_shared() {
     if (state.fetch_sub(1, std::memory_order_release) == (Replacing | 1)) WakeAll(state);
 }

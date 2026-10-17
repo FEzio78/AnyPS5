@@ -3,6 +3,7 @@
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
+#include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPrep.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/SynchronizationStatistics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -32,6 +33,27 @@ bool keepsDrawPipeline(std::span<const std::uint32_t> packet, std::uint32_t head
         case 0x15: return orderedFills();
         case 0x63: case 0x64: case 0x9f:
             return packet.size() >= 5 && !DrawPipeline::Queue0().Overlaps(packet[1] | (static_cast<std::uint64_t>(packet[2]) << 32u), static_cast<std::size_t>(packet[4]) * 8);
+        case 0x10: {
+            const auto operation = (header >> 2u) & 0x3fu;
+            return operation == 0 || operation == 0x09 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
+        }
+        default: return false;
+    }
+}
+
+// APS5_PARALLEL_PREP: packets that only change the queue state (each preparation holds its own copy)
+// and direct draws leave the preparation pool running; every other packet waits for it.
+bool directPrepOnly() {
+    static const bool direct = std::getenv("APS5_PARALLEL_PREP_DIRECT") != nullptr;
+    return direct;
+}
+
+bool keepsDrawPrep(std::uint32_t header, std::uint32_t opcode, bool predicated) {
+    if (header == FlipPacketHeader || header == RenderingWaitPacketHeader) return false;
+    if (Pm4::DrawOpcode(opcode)) return !predicated && !(directPrepOnly() && Pm4::IndirectDrawOpcode(opcode));
+    if (Pm4::IndirectRegisterOpcode(opcode)) return true;
+    switch (opcode) {
+        case 0x11: case 0x12: case 0x13: case 0x26: case 0x2a: case 0x2f: case 0x69: case 0x76: case 0x79: case 0x7a: case 0x81: return true;
         case 0x10: {
             const auto operation = (header >> 2u) & 0x3fu;
             return operation == 0 || operation == 0x09 || operation == 0x0b || operation == 0x0c || operation == 0x1a;
@@ -85,6 +107,17 @@ void Driver::execute(const Submission& submission) {
             }
         }
     } pipelineDrain{pipelined};
+    const bool prepared = pipelined && DrawPrepThreads() != 0;
+    struct PrepDrain {
+        bool prepared;
+        ~PrepDrain() {
+            if (!prepared || std::uncaught_exceptions() == 0) return;
+            try {
+                DrainDrawPrep();
+            } catch (...) {
+            }
+        }
+    } prepDrain{prepared};
     static const bool orderedCompletion = std::getenv("APS5_PIPELINE_DRAIN_SUBMISSIONS") == nullptr && orderedWaits;
     if (pipelined && (submission.suspend || !orderedCompletion)) DrawPipeline::Queue0().Drain(DrawPipeline::DrainReason::Submission);
     if (submission.suspend) {
@@ -177,6 +210,7 @@ void Driver::execute(const Submission& submission) {
         PerformanceContext timingContext(submission.queue == 0 ? pendingFrameTiming.get() : FrameTiming::Async());
         PerformanceTimer timing("Driver.Packet");
         const bool predicated = Pm4::Predicated(header) && queue.predication.operation != 0;
+        if (prepared && !keepsDrawPrep(header, opcode, predicated)) DrainDrawPrep();
         if (pipelined && !predicated && header != FlipPacketHeader && header != RenderingWaitPacketHeader && (enqueueLabelPacket(packet, opcode, submission.queue) || enqueueDmaPacket(packet, opcode, submission.queue, queue))) {
             traceLabel(packet, submission.queue);
             recent.Record(cursor);
@@ -345,7 +379,30 @@ void Driver::execute(const Submission& submission) {
                     next += nextCount;
                 }
             }
+        } else if (drawPacket && prepared && !predicated && !(directPrepOnly() && Pm4::IndirectDrawOpcode(opcode)) && deferredLabels().labels.empty()) {
+            landPendingWaits(submission.queue);
+            // The worker extends its device use to the preparation and the pool thread releases it
+            // (DeviceUseGate is a counter, not a thread-owned lock).
+            require(deviceUse.owns_lock(), "a draw handed to the preparation pool without the device use");
+            deviceReplacement.add_shared();
+            auto state = std::make_shared<QueueState>(queue);
+            const auto epoch = GuestMemory::ThreadCollectEpoch();
+            SubmitDrawPrep([this, state, packet, &submission, epoch, opcode] {
+                struct DeviceRelease {
+                    DeviceUseGate& gate;
+                    ~DeviceRelease() { gate.unlock_shared(); }
+                } release{deviceReplacement};
+                onWorkerThread() = true;
+                GuestMemory::AdoptCollectEpoch(epoch);
+                GuestMemory::SetCurrentPacket(opcode, submission.queue);
+                std::string rejected;
+                if (draw(*state, packet, submission, rejected) == DrawVerdict::Rejected) throw std::runtime_error(rejected);
+            });
         } else if (drawPacket) {
+            if (prepared) {
+                NoteDrawPrepKept(predicated ? 0 : Pm4::IndirectDrawOpcode(opcode) ? 1 : 2);
+                DrainDrawPrep();
+            }
             landPendingWaits(submission.queue);
             bool drawn = false;
             timed(&WorkerProfile::drawMs, [&] {
@@ -405,6 +462,7 @@ void Driver::execute(const Submission& submission) {
         else timing.Finish();
         cursor = nextCursor;
     }
+    if (prepared) DrainDrawPrep();
 
     PerformanceContext endContext(submission.queue == 0 ? frameTiming() : FrameTiming::Async());
     PerformanceTimer endTiming("Driver.EndSubmission");

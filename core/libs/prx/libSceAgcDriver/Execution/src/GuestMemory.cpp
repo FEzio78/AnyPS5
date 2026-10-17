@@ -1272,6 +1272,10 @@ void BumpCollectEpoch() {
     collectEpochBumps.fetch_add(1, std::memory_order_relaxed);
 }
 
+void AdoptCollectEpoch(std::uint64_t epoch) {
+    HostThreadSlot<std::uint64_t, CollectEpochSlot>::Set(epoch);
+}
+
 std::uint64_t ThreadCollectEpoch() {
     return collectMemoEnabled() ? HostThreadSlot<std::uint64_t, CollectEpochSlot>::Get() : 0;
 }

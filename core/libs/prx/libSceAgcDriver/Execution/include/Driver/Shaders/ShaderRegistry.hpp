@@ -87,6 +87,7 @@ struct ShaderSnapshot {
     std::shared_ptr<const RegisteredShaderState> registeredState;
     std::shared_ptr<std::atomic<std::uint8_t>> workgroupUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<std::uint8_t>> positionVectorUse = std::make_shared<std::atomic<std::uint8_t>>(0u);
+    std::shared_ptr<std::atomic<std::uint8_t>> memoryWrites = std::make_shared<std::atomic<std::uint8_t>>(0u);
     std::shared_ptr<std::atomic<bool>> rawGraphicsNoted = std::make_shared<std::atomic<bool>>(false);
     std::optional<std::uint32_t> userDataTailRegister;
 };
@@ -101,6 +102,9 @@ bool RawGraphicsDrawnIn(std::uint64_t begin, std::uint64_t end);
 bool ProgramUsesWorkgroup(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 // The PA_CL_VS_OUT_CNTL position export bits a vertex program is compiled with: none for a program
 // without pos1..pos3 exports, so its artifact does not depend on them.
+// Whether a program from codeOffset may store to memory (buffer, image, flat or scalar stores, atomics,
+// GDS ordered counts or an indirect jump that could reach one); cached on the snapshot for offset 0.
+bool ProgramWritesMemory(const ShaderSnapshot& snapshot, std::size_t codeOffset);
 std::uint32_t PositionExportLayout(const ShaderSnapshot* snapshot, std::size_t codeOffset, std::span<const std::uint32_t> code, std::uint32_t paClVsOutCntl, const ShaderSnapshot* continuation = nullptr);
 bool VertexWorkgroupRequired(const QueueState& queue, const ShaderRegistry& registry);
 

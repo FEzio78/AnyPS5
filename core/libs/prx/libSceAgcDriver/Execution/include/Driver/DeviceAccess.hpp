@@ -28,6 +28,9 @@ class DeviceUseGate {
 public:
     void lock_shared();
     void unlock_shared();
+    // One more shared use for a caller that holds one already (a draw preparation the worker hands to
+    // the pool, APS5_PARALLEL_PREP): it never waits for a replacement, which waits for it instead.
+    void add_shared();
     void lock();
     void unlock();
 

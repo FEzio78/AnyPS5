@@ -62,6 +62,9 @@ extern "C" std::uint32_t* APS5_VABI sceAgcDcbSetIndexIndirectArgs(CommandBuffer*
 extern "C" std::uint32_t APS5_VABI sceAgcDcbSetIndexIndirectArgsGetSize();
 extern "C" std::uint32_t* APS5_VABI sceAgcSetNop(CommandBuffer* buf, std::uint32_t sizeDw);
 extern "C" int APS5_VABI sceAgcDebugRaiseException(std::uint32_t exceptionId);
+extern "C" std::uint32_t* APS5_VABI sceAgcDcbAcquireMem(CommandBuffer* buf, std::uint8_t engine, std::uint32_t cbDbOp, std::uint32_t gcrControl, const volatile void* base, std::uint64_t sizeBytes, std::uint32_t pollCycles);
+extern "C" std::uint32_t* APS5_VABI sceAgcAcbAcquireMem(CommandBuffer* buf, std::uint32_t gcrControl, const volatile void* base, std::uint64_t sizeBytes, std::uint32_t pollCycles);
+extern "C" int APS5_VABI sceAgcAcquireMemSetEngine(std::uint32_t* cmd, std::uint8_t engine);
 extern "C" std::uint32_t* APS5_VABI sceAgcAcbAtomicGds_0900(CommandBuffer* buf, std::uint32_t control, std::uint32_t mode, std::uint32_t gdsOp, std::uint32_t src, std::uint16_t offset, std::uint16_t index, std::uint32_t mask, std::uint32_t data, std::uint64_t compareData, std::uint64_t extraData);
 
 namespace {
@@ -671,6 +674,25 @@ void testMemory() {
     check(storage.words == beforeMask, "invalid mask patch modified packet memory");
 }
 
+void testAcquireMemSetEngine() {
+    Storage storage;
+    Storage reference;
+    auto* packet = sceAgcDcbAcquireMem(&storage.buffer, 0, 0x2200, 0x1234, reinterpret_cast<const void*>(0x10000), 0x1000, 400);
+    sceAgcDcbAcquireMem(&reference.buffer, 1, 0x2200, 0x1234, reinterpret_cast<const void*>(0x10000), 0x1000, 400);
+    check(sceAgcAcquireMemSetEngine(packet, 1) == 0, "acquire memory engine patch failed");
+    check(storage.words == reference.words, "engine patch differs from an acquire memory packet built for that engine");
+    check(sceAgcAcquireMemSetEngine(packet, 0) == 0 && packet[1] == 0x2200u, "engine patch did not clear bit 31");
+    auto* compute = sceAgcAcbAcquireMem(&storage.buffer, 0x1234, nullptr, 0xffffffffffffffffull, 0);
+    check(sceAgcAcquireMemSetEngine(compute, 0) == 0 && compute[1] == 0, "engine patch of a compute acquire memory packet");
+    const auto before = storage.words;
+    expectFailure([&] { sceAgcAcquireMemSetEngine(packet, 2); });
+    expectFailure([] { sceAgcAcquireMemSetEngine(nullptr, 1); });
+    auto* nop = Agc::Command::WriteNop(&storage.buffer, 8, __func__);
+    const auto withNop = storage.words;
+    expectFailure([&] { sceAgcAcquireMemSetEngine(nop, 1); });
+    check(storage.words == withNop && std::equal(before.begin(), before.begin() + 16, storage.words.begin()), "a rejected engine patch modified packet memory");
+}
+
 struct AtomicGdsAllocation {
     Storage storage;
     std::uint32_t capacity = 15;
@@ -885,6 +907,7 @@ int main(int argc, char** argv) {
         testRegisterRange();
         testPacketPayloadAddress();
         testMemory();
+        testAcquireMemSetEngine();
         testAtomicGds();
         testDebugRaiseException();
         testDefaults();

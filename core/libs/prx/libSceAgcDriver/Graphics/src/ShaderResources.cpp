@@ -1539,6 +1539,7 @@ TableState CurrentTableState() {
 struct ReusedTableElement {
     TextureKey key{};
     std::weak_ptr<Texture> texture;
+    const StorageTexture* storage = nullptr;
     GuestTextureResource resource{};
     std::uint64_t guestBytes = 0;
     bool firstLayer = false;
@@ -1569,6 +1570,23 @@ bool SameTable(const ReusedTable& table, VkDevice device, const ShaderRecompiler
     return table.device == device && table.words == binding.guestDescriptor && table.shapes == binding.imageShapes && table.depthCompare == binding.imageDepthCompare;
 }
 
+// Fork-only APS5_TABLE_REUSE_STORAGE=1: a remembered table may hold views of storage images (Demon's
+// Souls' tables nearly all do, so none was ever reused). Such an element is current while its storage
+// image is still the cached one and the guest memory under it is unchanged since that image's
+// generation, the test the stage-A fast path applies to a storage view (ShaderResources::fastTexture);
+// its range is left out of the pending-results test, since its pending results are what it shows.
+bool TableReuseStorage() {
+    static const bool enabled = std::getenv("APS5_TABLE_REUSE_STORAGE") != nullptr;
+    return enabled;
+}
+
+bool StorageViewsCurrent(const Context& context, const ReusedTable& table) {
+    for (const auto& element : table.elements) {
+        if (element.storage != nullptr && !StorageImageCached(context, element.storage)) return false;
+    }
+    return true;
+}
+
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
@@ -1593,14 +1611,27 @@ bool CachedTableTextures(const ReusedTable& table, std::vector<std::shared_ptr<T
     std::lock_guard lock(cache.mutex);
     std::vector<std::list<CachedTexture>::iterator> entries;
     entries.reserve(table.queries.size());
+    std::vector<std::shared_ptr<Texture>> views;
     for (const auto& element : table.elements) {
         if (element.rejected) continue;
+        if (element.storage != nullptr) {
+            auto view = element.texture.lock();
+            if (view == nullptr) return false;
+            views.push_back(std::move(view));
+            entries.push_back(cache.entries.end());
+            continue;
+        }
         const auto it = findTexture(cache, element.key);
         if (it == cache.entries.end() || it->texture != element.texture.lock()) return false;
         entries.push_back(it);
     }
     cached.reserve(entries.size());
+    auto view = views.begin();
     for (const auto it : entries) {
+        if (it == cache.entries.end()) {
+            cached.push_back(std::move(*view++));
+            continue;
+        }
         cached.push_back(it->texture);
         touchTexture(cache, it);
     }
@@ -4487,7 +4518,7 @@ void ShaderResources::resolveImageTables() {
                 if (!TableCurrent(*reused)) ++why.notCurrent;
             }
         }
-        const bool current = reused != nullptr && TableCurrent(*reused);
+        const bool current = reused != nullptr && TableCurrent(*reused) && StorageViewsCurrent(context, *reused);
         const bool texturesKept = current && CachedTableTextures(*reused, cached);
         if (BuildProfiled() && current && !texturesKept) ++TableReuseBlocks().texturesGone;
         if (texturesKept) {
@@ -4537,7 +4568,7 @@ void ShaderResources::resolveImageTables() {
                 throw;
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
-                if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
+                if (reusable) fresh.elements.push_back({{}, {}, nullptr, {}, 0, false, true, error.what()});
                 continue;
             }
             CompletePendingCpuWrites(context, resource.baseAddress, static_cast<std::size_t>(guestBytes));
@@ -4555,13 +4586,14 @@ void ShaderResources::resolveImageTables() {
                 throw;
             } catch (const std::runtime_error& error) {
                 table.map[faults + element] = rejectTableElement(table, words, error.what());
-                if (reusable) fresh.elements.push_back({{}, {}, {}, 0, false, true, error.what()});
+                if (reusable) fresh.elements.push_back({{}, {}, nullptr, {}, 0, false, true, error.what()});
                 continue;
             }
             if (reusable) {
                 const auto& log = lookupLog();
                 const auto* looked = log.empty() ? nullptr : &log.back();
-                reusable = looked != nullptr && looked->object == texture.get() && looked->source == nullptr && looked->generation != 0 && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
+                const bool storageView = TableReuseStorage() && looked != nullptr && looked->object == texture.get() && looked->source != nullptr && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0;
+                reusable = storageView || (looked != nullptr && looked->object == texture.get() && looked->source == nullptr && looked->generation != 0 && looked->keys == DccKeys::Uncompressed && resource.dccAddress == 0);
                 // Fork-only APS5_PROFILE_DRAW: the first reason a table could not be remembered.
                 if (!reusable && BuildProfiled()) {
                     auto& why = TableReuseBlocks();
@@ -4572,9 +4604,9 @@ void ShaderResources::resolveImageTables() {
                     else ++why.dcc;
                 }
                 if (reusable) {
-                    fresh.elements.push_back({MakeTextureKey(context.device, words, components, depthCompare), texture, resource, guestBytes, firstLayer, false, {}});
-                    fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), looked->generation});
-                    fresh.ranges.emplace_back(resource.baseAddress, resource.baseAddress + guestBytes);
+                    fresh.elements.push_back({MakeTextureKey(context.device, words, components, depthCompare), texture, storageView ? looked->source : nullptr, resource, guestBytes, firstLayer, false, {}});
+                    fresh.queries.push_back({resource.baseAddress, static_cast<std::size_t>(guestBytes), storageView ? looked->source->Generation() : looked->generation});
+                    if (!storageView) fresh.ranges.emplace_back(resource.baseAddress, resource.baseAddress + guestBytes);
                 }
             }
             bind(element, words, std::move(texture), resource, guestBytes, firstLayer);

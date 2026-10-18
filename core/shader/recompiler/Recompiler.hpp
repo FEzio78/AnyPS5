@@ -548,6 +548,8 @@ public:
     friend bool operator==(const SharedSpirv& left, const SharedSpirv& right) { return std::ranges::equal(left.Words(), right.Words()); }
     // Fork-only diagnostic: how many SharedSpirv objects share these words (0: none held).
     [[nodiscard]] long Holders() const { return holder ? holder.use_count() : 0; }
+    // Fork-only diagnostic: the words are a view another owner holds (a mapped cache file), not a vector.
+    [[nodiscard]] bool Viewed() const { return holder != nullptr && holder->owner != nullptr; }
 
 private:
     struct Holder {

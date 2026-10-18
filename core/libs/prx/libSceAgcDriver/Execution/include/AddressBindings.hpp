@@ -181,6 +181,24 @@ inline void ReportVkMemoryLocked(MemoryTrace& trace) {
         const double arenaMiB = static_cast<double>(GuestMemory::ArenaCommittedBytes()) / 1048576.0;
         std::fprintf(stderr, "[vk-memory] process private %.0f MiB: guest arena committed %.0f MiB, the rest %.0f MiB (driver heap, Vulkan system memory, loader)\n", privateMiB, arenaMiB, privateMiB - arenaMiB);
     }
+    // Fork-only APS5_MIMALLOC_STATS=1: every 5 minutes, mimalloc's own statistics (what the
+    // allocator that serves malloc and new holds, against the process private bytes above).
+    static const bool mimallocStats = std::getenv("APS5_MIMALLOC_STATS") != nullptr;
+    static auto lastMimallocStats = std::chrono::steady_clock::time_point{};
+    if (mimallocStats && now - lastMimallocStats >= std::chrono::minutes(5)) {
+        lastMimallocStats = now;
+        using OutputFn = void (*)(const char*, void*);
+        using StatsPrintFn = void (*)(OutputFn, void*);
+        static const auto statsPrint = [] {
+            const HMODULE module = GetModuleHandleA("mimalloc.dll");
+            return module != nullptr ? reinterpret_cast<StatsPrintFn>(reinterpret_cast<void*>(GetProcAddress(module, "mi_stats_print_out"))) : nullptr;
+        }();
+        if (statsPrint != nullptr) {
+            std::fprintf(stderr, "[mimalloc-stats] begin\n");
+            statsPrint([](const char* text, void*) { std::fputs(text, stderr); }, nullptr);
+            std::fprintf(stderr, "[mimalloc-stats] end\n");
+        }
+    }
     // Where "the rest" lives: committed bytes of each Win32 heap (the CRT's malloc is the process
     // heap; drivers create their own), and private committed memory outside every heap
     // (VirtualAlloc'd regions, the guest arena among them).

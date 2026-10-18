@@ -201,6 +201,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/TraceFile.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ThreadPriority.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/GuestMemory.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/AllocationSites.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ShaderMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/BdaFeatures.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SubgroupClock.cpp
@@ -277,6 +278,10 @@ add_library(libSceAgcDriver SHARED EXCLUDE_FROM_ALL
         ${agcDriverSources}
 )
 add_dependencies(libSceAgcDriver agc_trace_revision)
+if(MINGW)
+    # The library's own operator new and delete (Execution/src/AllocationSites.cpp) serve its code only.
+    target_link_options(libSceAgcDriver PRIVATE "LINKER:--exclude-symbols=_Znwy" "LINKER:--exclude-symbols=_Znay" "LINKER:--exclude-symbols=_ZdlPv" "LINKER:--exclude-symbols=_ZdaPv" "LINKER:--exclude-symbols=_ZdlPvy" "LINKER:--exclude-symbols=_ZdaPvy")
+endif()
 
 target_include_directories(libSceAgcDriver PRIVATE
         ${LIBS_INCLUDE_DIR}

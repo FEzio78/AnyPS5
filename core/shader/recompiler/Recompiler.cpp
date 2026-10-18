@@ -319,6 +319,10 @@ struct EmissionFailure {
     std::exception_ptr failure;
 };
 
+// Fork-only diagnostic: specialized modules built (each a full copy of its variant's SPIR-V, kept
+// by the binding plan and registration module maps, which never evict) and binding plans made.
+std::atomic<std::uint64_t> specializedModulesBuilt{0}, specializedModuleWords{0}, bindingPlansMade{0};
+
 struct SourceEntry : std::enable_shared_from_this<SourceEntry> {
     std::mutex mutex;
     // The code the entry was built for: the key carries only a hash of it, so a candidate entry is
@@ -435,7 +439,7 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
         auto last = lastReport.load();
         if (now - last >= 30 && lastReport.compare_exchange_strong(last, now)) {
             std::size_t entries = 0, programs = 0, variants = 0, memo = 0;
-            std::uint64_t codeWords = 0, variantWords = 0, memoWords = 0, onlyCachedWords = 0;
+            std::uint64_t codeWords = 0, variantWords = 0, memoWords = 0, onlyCachedWords = 0, ownedWords = 0, memoOwnedWords = 0;
             std::unordered_set<const void*> seen;
             const auto words = [&](const SharedSpirv& spirv) -> std::uint64_t {
                 const auto* data = spirv.Words().data();
@@ -453,15 +457,21 @@ std::shared_ptr<SourceEntry> getSource(const RecompileRequest& request, ShaderPr
                         if (variant == nullptr) continue;
                         const auto counted = words(variant->artifact.spirv);
                         variantWords += counted;
+                        if (!variant->artifact.spirv.Viewed()) ownedWords += counted;
                         long internal = 1;
                         for (const auto& kept : entry->memo) if (kept.result != nullptr && kept.result->spirv.Words().data() == variant->artifact.spirv.Words().data()) ++internal;
                         if (variant->artifact.spirv.Holders() <= internal) onlyCachedWords += counted;
                     }
                     memo += entry->memo.size();
-                    for (const auto& kept : entry->memo) if (kept.result != nullptr) memoWords += words(kept.result->spirv);
+                    for (const auto& kept : entry->memo) {
+                        if (kept.result == nullptr) continue;
+                        const auto counted = words(kept.result->spirv);
+                        memoWords += counted;
+                        if (!kept.result->spirv.Viewed()) memoOwnedWords += counted;
+                    }
                 }
             }
-            std::fprintf(stderr, "[recompile-memory] %zu source entries (%.0f MiB of guest code), %zu holding an IR program, %zu variants (%.0f MiB of SPIR-V, %.0f MiB held by nothing but this cache), %zu memoized results (%.0f MiB of further SPIR-V)\n", entries, static_cast<double>(codeWords) * 4.0 / 1048576.0, programs, variants, static_cast<double>(variantWords) * 4.0 / 1048576.0, static_cast<double>(onlyCachedWords) * 4.0 / 1048576.0, memo, static_cast<double>(memoWords) * 4.0 / 1048576.0);
+            std::fprintf(stderr, "[recompile-memory] %zu source entries (%.0f MiB of guest code), %zu holding an IR program, %zu variants (%.0f MiB of SPIR-V, %.0f MiB held by nothing but this cache), %zu memoized results (%.0f MiB of further SPIR-V); in vectors (not mapped): %.0f MiB of variants, %.0f MiB of memoized results; specialized modules built %llu (%.0f MiB), binding plans %llu\n", entries, static_cast<double>(codeWords) * 4.0 / 1048576.0, programs, variants, static_cast<double>(variantWords) * 4.0 / 1048576.0, static_cast<double>(onlyCachedWords) * 4.0 / 1048576.0, memo, static_cast<double>(memoWords) * 4.0 / 1048576.0, static_cast<double>(ownedWords) * 4.0 / 1048576.0, static_cast<double>(memoOwnedWords) * 4.0 / 1048576.0, static_cast<unsigned long long>(specializedModulesBuilt.load()), static_cast<double>(specializedModuleWords.load()) * 4.0 / 1048576.0, static_cast<unsigned long long>(bindingPlansMade.load()));
         }
     }
     std::shared_ptr<SourceEntry> source;
@@ -851,6 +861,8 @@ std::shared_ptr<const SpecializedModule> buildSpecializedModule(const CompiledSh
         }
         cursor += count;
     }
+    specializedModulesBuilt.fetch_add(1, std::memory_order_relaxed);
+    specializedModuleWords.fetch_add(materialized.size(), std::memory_order_relaxed);
     module->spirv = std::move(materialized);
     module->specializationId = constants.empty() ? 0u : nextVariantId();
     return module;
@@ -946,6 +958,7 @@ std::shared_ptr<PreparedBindingPlan> preparedBindingPlan(const CompiledVariant& 
     if (plan == nullptr) {
         std::unique_lock lock(mutex);
         const auto found = plans.find(key);
+        if (found == plans.end()) bindingPlansMade.fetch_add(1, std::memory_order_relaxed);
         plan = found != plans.end() ? found->second : plans.emplace(key, std::make_shared<PreparedBindingPlan>()).first->second;
     }
     std::call_once(plan->ready, [&] {

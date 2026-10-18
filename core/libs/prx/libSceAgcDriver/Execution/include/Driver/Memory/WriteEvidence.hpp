@@ -11,6 +11,9 @@
 
 namespace AgcDriver::DriverDetail {
 
+// The program whose capture runs on this thread (APS5_TRACE_CAPSYNC names it in [capsync] program lines).
+std::uint64_t& CaptureProgram();
+
 inline constexpr std::size_t WrittenBufferRing = 4096;
 
 inline constexpr std::size_t DwordEvidenceEntries = 65536;

@@ -214,6 +214,11 @@ ShaderMemory::PendingWrite Driver::classifyPendingWrite(std::uint64_t address, s
     return validateSkipVerify() ? Policy::VerifyRaw : Policy::Raw;
 }
 
+std::uint64_t& CaptureProgram() {
+    thread_local std::uint64_t program = 0;
+    return program;
+}
+
 ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std::size_t bytes, std::span<std::byte> known) {
     if (DrawPipeline::Active()) {
         auto& pipeline = DrawPipeline::Queue0();
@@ -222,7 +227,9 @@ ShaderMemory::PendingWrite Driver::queryPendingWrite(std::uint64_t address, std:
     std::uint64_t ValidateCounters::*reason = nullptr;
     PendingView pending;
     pending.Load();
-    return Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    const auto policy = Get().classifyPendingWrite(address, bytes, reason, pending, known);
+    if (policy == ShaderMemory::PendingWrite::Sync && traceCapSync() && bytes <= 64) std::fprintf(stderr, "[capsync] program 0x%llx reads 0x%llx+0x%zx over a pending GPU write\n", static_cast<unsigned long long>(CaptureProgram()), static_cast<unsigned long long>(address), bytes);
+    return policy;
 }
 
 }

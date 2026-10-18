@@ -120,11 +120,17 @@ RdnaImageDimension descriptorDimension(const DescriptorValue& descriptor, RdnaIm
     }
 }
 
-void reportLargeArrayWords(const DescriptorValue& value, const char* where, std::uint64_t base, std::uint32_t stride, std::uint32_t offset, std::uint32_t dwords, std::uint32_t index) {
+void reportLargeArrayWords(const DescriptorValue& value, const char* where, std::uint64_t base, std::uint32_t stride, std::uint32_t offset, std::uint32_t dwords, std::uint32_t index, std::uint64_t live = 0) {
     if (value.dwordCount != 8u || ((value.dwords[3] >> 28u) & 0xfu) != 0xdu || (value.dwords[4] & 0x1fffu) < 1024u) return;
+    if (value.dwords[2] == 0xcafebabeu || value.dwords[3] == 0xdeadbeefu || (value.dwords[0] | value.dwords[1]) == 0u) return;
+    const bool tailIsHead = ((value.dwords[7] >> 28u) & 0xfu) >= 8u && ((value.dwords[5] >> 20u) & 0x1ffu) != 0u && value.dwords[6] != 0u && (value.dwords[5] & 0xfffffu) == 0u;
+    if (!tailIsHead) return;
     static std::atomic<int> reported{0};
     if (reported.fetch_add(1) >= 40) return;
     std::fprintf(stderr, "[texture-desc] %s (base 0x%llx stride 0x%x offset 0x%x, %u dwords) index %u holds a 2D array of %u slices: %08x %08x %08x %08x %08x %08x %08x %08x\n", where, static_cast<unsigned long long>(base), stride, offset, dwords, index, (value.dwords[4] & 0x1fffu) + 1u, value.dwords[0], value.dwords[1], value.dwords[2], value.dwords[3], value.dwords[4], value.dwords[5], value.dwords[6], value.dwords[7]);
+    if (live == 0 || (live & 3u) != 0u) return;
+    const auto* words = reinterpret_cast<const volatile std::uint32_t*>(live);
+    std::fprintf(stderr, "[texture-desc]   live at 0x%llx: %08x %08x %08x %08x %08x %08x %08x %08x, then %08x %08x %08x %08x\n", static_cast<unsigned long long>(live), words[0], words[1], words[2], words[3], words[4], words[5], words[6], words[7], words[8], words[9], words[10], words[11]);
 }
 
 bool validImageDescriptor(const DescriptorValue& descriptor, bool r128) {
@@ -715,7 +721,7 @@ private:
                 }
                 ++next;
             }
-            if (!column.sampler) reportLargeArrayWords(value, "image table column", records.base, column.stride, column.offset, column.dwordCount, record);
+            if (!column.sampler) reportLargeArrayWords(value, "image table column", records.base, column.stride, column.offset, column.dwordCount, record, locate(column.addend + record * column.stride, column.offset).value_or(0));
             records.words[record] = WordsIndex(value);
         }
         if (column.address && low < high) tables.ranges.emplace_back(low, high - low);

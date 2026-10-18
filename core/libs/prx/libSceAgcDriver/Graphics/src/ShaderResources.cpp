@@ -1606,6 +1606,16 @@ bool CollectTableEpoch(ReusedTable& table, const TableState& state) {
     return true;
 }
 
+// Fork-only: a table element read as a 2D image through a 2D array descriptor reads only the base
+// slice, so a vast array (over 256 MiB, one mip chain per slice, no readable DCC) is resolved as that
+// slice alone. A table resolves every key its domain allows, past the records the title wrote, and
+// such keys can land on bytes that decode as a 1793-slice array (Demon's Souls: ~10 GB, out of
+// device memory). APS5_NO_FIRST_LAYER_SLICE=1 resolves the whole array as before.
+bool FirstLayerSlice() {
+    static const bool enabled = std::getenv("APS5_NO_FIRST_LAYER_SLICE") == nullptr;
+    return enabled;
+}
+
 ReusedTable* FindReusedTable(VkDevice device, const ShaderRecompiler::DescriptorBinding& binding, const TableState& state) {
     if (state.epoch == 0) return nullptr;
     auto& tables = ReusedTables();
@@ -4572,7 +4582,8 @@ void ShaderResources::resolveImageTables() {
         bool reusable = state.epoch != 0;
         if (!reusable && BuildProfiled()) ++TableReuseBlocks().noEpoch;
         for (std::uint32_t element = 0; element < binding.count; ++element) {
-            const auto words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+            std::span<const std::uint32_t> words = std::span<const std::uint32_t>(binding.guestDescriptor).subspan(static_cast<std::size_t>(element) * 8u, 8u);
+            std::array<std::uint32_t, 8> sliceWords{};
             const auto absolute = static_cast<std::uint64_t>(table.elementBase) + element;
             if (absolute >= context.imageTableCapacity) {
                 table.map[faults + element] = rejectTableElement(table, words, capacityMessage());
@@ -4587,6 +4598,23 @@ void ShaderResources::resolveImageTables() {
                 resource = DecodeTextureResource(words);
                 const auto shape = binding.imageShapes.at(element);
                 firstLayer = shape == ShaderRecompiler::DescriptorImageShape::Image2D && resource.dimension == TextureDimension::k2DArray;
+                if (firstLayer && FirstLayerSlice()) {
+                    const auto whole = DescribeSurface(resource);
+                    const bool dccUnused = resource.dccAddress == 0 || !GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), 1);
+                    if (whole.guestBytes >= (256ull << 20u) && !whole.thick && whole.layerBytes != 0 && dccUnused) {
+                        const auto address = resource.baseAddress + whole.GuestLayerOffset(resource.baseArray);
+                        std::copy(words.begin(), words.end(), sliceWords.begin());
+                        sliceWords[0] = static_cast<std::uint32_t>(address >> 8u);
+                        sliceWords[1] = (sliceWords[1] & ~0xffu) | static_cast<std::uint32_t>((address >> 40u) & 0xffu);
+                        sliceWords[3] = (sliceWords[3] & 0x0fffffffu) | (9u << 28u);
+                        sliceWords[4] &= ~0x1fff1fffu;
+                        static std::atomic<int> reported{0};
+                        if (reported.fetch_add(1) < 20) std::fprintf(stderr, "[image-table] element %u: a 2D read of 0x%llx %ux%u with %u slices takes slice %u alone (0x%llx of 0x%llx bytes)\n", element, static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.depthOrLastArray + 1u, resource.baseArray, static_cast<unsigned long long>(whole.layerBytes), static_cast<unsigned long long>(whole.guestBytes));
+                        words = sliceWords;
+                        resource = DecodeTextureResource(words);
+                        firstLayer = false;
+                    }
+                }
                 if (!firstLayer && !MatchesGuestDimension(shape, resource.dimension)) throw std::runtime_error("AGC graphics: guest texture dimension disagrees with the table entry's image shape (shape " + std::to_string(static_cast<int>(shape)) + ", dimension " + std::to_string(static_cast<int>(resource.dimension)) + ")");
                 const auto geometry = DescribeSurface(resource);
                 guestBytes = geometry.guestBytes;

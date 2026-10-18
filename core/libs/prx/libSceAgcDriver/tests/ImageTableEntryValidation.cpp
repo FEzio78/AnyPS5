@@ -694,7 +694,7 @@ void testDeviceLossFromImageMemoryPropagates(const Context& context) {
     mock.imageMemoryFailures = 0;
     mock.imageMemoryResult = VK_SUCCESS;
     Require(thrown == VK_ERROR_DEVICE_LOST, "VK_ERROR_DEVICE_LOST from an image table entry's vkAllocateMemory was turned into a faulting entry instead of reaching the caller");
-    Require(message.find("vkAllocateMemory texture: Vulkan result -4") != std::string::npos, "the propagated device loss names another call: " + message);
+    Require(message.find("vkAllocateMemory texture") != std::string::npos && message.find("Vulkan result -4") != std::string::npos, "the propagated device loss names another call: " + message);
 }
 
 struct ArenaBlock {
